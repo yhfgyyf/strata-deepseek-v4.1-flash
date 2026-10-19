@@ -1,0 +1,21 @@
+{
+  "engine": "./build/strata-deepseek41",
+  "model": "/path/to/DeepSeek-V4.1-Flash-GSQ-RCO-3.0bit.gguf",
+  "tokenizer": "/path/to/tokenizer.json",
+  "integrity": "/path/to/integrity.txt",
+  "context": 32768,
+  "chunk": 8192,
+  "slots": 1,
+  "work_mib": 6720,
+  "state_mib": 1024,
+  "gpu_headroom_mib": 700,
+  "host": "127.0.0.1",
+  "port": 30011,
+  "alias": "deepseek-v4.1",
+  "sampling": {
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0,
+    "seed": 1234
+  }
+}

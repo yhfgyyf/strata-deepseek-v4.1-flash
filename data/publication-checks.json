@@ -1,0 +1,44 @@
+{
+  "date": "2026-10-20",
+  "timezone": "Asia/Taipei",
+  "passed": true,
+  "native_build": {
+    "platform": "Linux x86_64",
+    "compiler": "GCC 11.4.0",
+    "cmake": "3.27.8",
+    "cuda": "13.2.51",
+    "target_architecture": "120, plus a separate 120a indexer object",
+    "targets": [
+      "strata-deepseek41",
+      "strata-deepseek41-experimental",
+      "strata-deepseek41-inspect"
+    ],
+    "binary_sha256": {
+      "strata-deepseek41": "e30259417e0ad610bd55d5eaab9d565c48d14337b2475f96d4836d285997aa18",
+      "strata-deepseek41-experimental": "78e31561e87dfd2ed1281d359f45b4e25db3e674e53910624b534b268fefdddb",
+      "strata-deepseek41-inspect": "fbaa94315e91da29b208e43c4a3191fc0b2afda0f179167d76dc473f6850c3c1"
+    }
+  },
+  "ggml_revision": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "ggml_upstream_files_matching": 1376,
+  "native_cpu_tests": 6,
+  "python_api_config_tests": 69,
+  "python_ast_files": 56,
+  "core_arithmetic_sources_changed_for_publication": false,
+  "fresh_gpu_inference_run": false,
+  "fresh_performance_measurement": false,
+  "fresh_profiler_run": false,
+  "source_manifest_sha256": "38f22151afc88516413a41941ed2dcbd6717c98f75a10a39bdfd79f5d4102ba0",
+  "initial_packaging_check_corrections": [
+    "Closed a Python argument-list bracket before packaging.",
+    "Resolved the macOS temporary-directory symlink in the path test.",
+    "Corrected two absent unittest module names; all actually selected tests passed after correcting the command."
+  ],
+  "whitespace_check": {
+    "passed_for_new_and_modified_files": true,
+    "preserved_inherited_exceptions": [
+      "serve/deepseek41_LICENSE: original CRLF",
+      "src/kernels/cuda/deepseek41_cache.cu: original final blank line"
+    ]
+  }
+}

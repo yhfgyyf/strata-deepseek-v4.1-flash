@@ -1,0 +1,17 @@
+{
+  "engine": "../build/strata-deepseek41-experimental",
+  "model": "/path/to/DeepSeek-V4.1-Flash-GSQ-RCO-3.0bit.gguf",
+  "draft": "/path/to/draft-q2_k-q4.gguf",
+  "mmproj": "/path/to/DeepSeek-V4.1-Flash-mmproj-BF16.gguf",
+  "tokenizer": "/path/to/tokenizer.json",
+  "integrity": "/path/to/integrity.txt",
+  "profile": "/path/to/frozen-startup.strp",
+  "heat": "/path/to/frozen-heat.txt",
+  "costs": "../data/dspark-costs-rtxpro6000.txt",
+  "draft_input_vocab": "/path/to/draft-vocab-final.bin",
+  "draft_output_vocab": "/path/to/draft-vocab-90000.bin",
+  "host": "127.0.0.1",
+  "port": 30011,
+  "alias": "deepseek-v4.1",
+  "log": "../runtime/engine.log"
+}
