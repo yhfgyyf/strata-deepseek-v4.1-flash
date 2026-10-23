@@ -13,7 +13,7 @@ Each length ran in a separate process with one warmup and three formal requests,
 | 131072 | 32768 | 4221 | 6037.613 ± 40.617 | 35.048 ± 0.026 | 34.990 |
 | 524288 | 32768 | 4221 | 4499.192 ± 3.861 | 42.216 ± 0.038 | 42.091 |
 
-**Highest formal prefill: 6080.745399 tok/s**, case K128/M1, 131072 tokens / 21.555252094 seconds. Decode in that same request was 35.075439 tok/s. The four groups' highest decode was 42.250250 tok/s (K512/M3; use the CSV's full precision). The About historical decode peak of approximately 56 tok/s is from the older model and configuration described below; it was not obtained together with the 6081 prefill figure.
+**Highest formal prefill: 6080.745399 tok/s**, case K128/M1, 131072 tokens / 21.555252094 seconds. Decode in that same request was 35.075439 tok/s. The four groups' highest decode was 42.250250 tok/s (K512/M3; use the CSV's full precision). The About `decode ~56 tok/s` figure is from the older model and configuration described below; it was not obtained together with the 6081 prefill figure.
 
 [All 12 formal measurements](../data/performance-20261023.csv) and [derived summary/provenance](../data/performance-summary-20261023.json) are included. Raw prompts, outputs, token arrays, logits and traces remain private.
 
@@ -25,6 +25,23 @@ Each length ran in a separate process with one warmup and three formal requests,
 - All runs retained original DSpark, 5-token adaptive verification, Graph mask 2, mixed-format/BF16 contracts, online adaptive residency, 40 registered host blocks and 100% huge-page coverage. Sampled links were Gen5×16; no external CUDA compute processes were observed during measurements.
 - The benchmark used its saved calibrated ranking and heat. The automatic launcher instead offers a complete, uncalibrated ranking and zero heat when no calibrated pair is supplied. It has CPU/configuration coverage, not a fresh full-model or performance qualification.
 - No Nsight was requested for this sweep. There is no matching new timeline/Top10 or new bottleneck attribution for these four lengths. Historical operator/request diagnostics remain separate in the research archive.
+
+## Host-memory transfer measurements
+
+The README's bandwidth figures come from an October 21 isolated UD-IQ3_XXS H2D test on the same i7-14700KF / RTX PRO 6000 / DDR5-4800 machine, with CUDA 13.2, driver 595.104.02 and sampled PCIe 5.0 ×16 links. All variants used the same contiguous expert arena, payload, binary, transfer order and GPU ring. The two variables were the number of CUDA registration ranges and the CPU page size; block pinning means registering parts of that arena, not allocating separate arenas.
+
+| Registration | Actual CPU pages | H2D GB/s |
+|---|---|---:|
+| One range | 4 KiB | 23.952108 |
+| 40 ranges | 4 KiB | 23.915125 |
+| One range | 100% 2 MiB | 24.258977 |
+| 40 ranges | 100% 2 MiB | **45.104124** |
+
+Each value is the mean of two process medians, with three timed full transfers after a warmup in each process. Decimal GB/s uses actual copied bytes divided by wall time, including layer submission/synchronization; model loading and registration are excluded. The combined configuration improved measured bandwidth by **88.31%** versus one range with small pages. Neither individual change alone produced a comparable gain, and the result does not establish the GPU/IOMMU mapping mechanism.
+
+This was a bandwidth-only run without payload byte validation or full-model requests; earlier readback anomalies remain unresolved. Background host I/O was observed and the sequence included a service-restoration interval, although repeated process medians differed by less than 0.05%. No matched prefill/decode A/B or request timeline was collected for this comparison. Faster transfers can benefit transfer-limited inference, but the 88.31% figure must not be reported as a tokens/s gain or generalized to other PCIe generations, drivers or memory layouts.
+
+Server CPUs with AVX-512, sufficient RAM and high memory bandwidth are a separate candidate for MoE decode execution. AVX-512 support alone does not establish an efficient kernel for the actual quantization/activation contract. Such a path needs its own numerical and end-to-end checks, including NUMA placement and CPU/GPU scheduling. The supplied launcher uses GPU experts; no server-CPU decode throughput is claimed here.
 
 ## 1M capacity and multimodal function
 

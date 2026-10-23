@@ -19,6 +19,13 @@ Both variants are from **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**. Download all
 | **UD-IQ3_XXS** | [UD-IQ3_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [Model files — select UD-IQ3_XXS](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-iq3-xxs.json](examples/rtxpro6000.ud-iq3-xxs.json) |
 | **UD-Q2_K_XL** | [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [Model files — select UD-Q2_K_XL](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-q2-k-xl.json](examples/rtxpro6000.ud-q2-k-xl.json) |
 
+| Model | Total weights (GB) | Main model excluding Engram (GB) | Engram (GB) |
+|---|---:|---:|---:|
+| **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
+| **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
+
+Sizes use decimal **GB = 1,000,000,000 bytes**, from the recorded GGUF file sizes: total = all seven shards, main model = shards 1–6, Engram = shard 7. They include GGUF metadata and exclude the separate DSpark (**7.977 GB**) and vision (**0.972 GB**) files. These are disk download sizes, not RAM or VRAM requirements; Engram is SSD-backed with a bounded host cache. [File sizes and hashes](data/models-1017.json).
+
 Use `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` and, for images, `mmproj-BF16.gguf` from the same repository: [Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files). The DSpark file retains its released mixed MXFP4/Q8/BF16 storage; its filename does not mean every tensor is Q8. Runtime dequantization and vocabulary-row selection leave the downloaded files unchanged.
 
 The two mirrors' 14 main shards and two sidecars had matching sizes and SHA256 on October 23, 2026; the loader accepts the recorded content identities in [models-1017.json](data/models-1017.json). Also obtain the matching [official tokenizer.json](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/tokenizer.json). Model files and the tokenizer are downloaded separately. [Detailed asset requirements](docs/INSTALL.md#model-assets).
@@ -48,6 +55,14 @@ October 23 measurements below use one request, one warmup plus three formal runs
 | 524,288 | 32,768 | 4221 | 4,499.192 ± 3.861 | 42.216 ± 0.038 |
 
 Prefill uses native prompt time; decode includes DSpark generation and excludes the separately recorded final drain. These are not client TTFT measurements. The 32K chunk benchmark reserves more workspace and fewer resident experts than the 8K starter. The benchmark also uses a calibrated ranking/heat snapshot; the automatic starter metadata is uncalibrated and has not been separately benchmarked. The rebuilt release binaries have no new GPU performance measurement. [All 12 formal runs](data/performance-20261023.csv) · [conditions, historical results and limits](docs/PERFORMANCE.md).
+
+## Expert profile and memory transfers
+
+The calibrated startup profile was refined using expert-routing statistics from a broader mix of coding, agent and general-reasoning prompts: DeepSWE, SWE-bench Pro and Verified, R2E-Gym, LongSWE, LiveCodeBench, BigCodeBench, ProgramBench, Terminal-Bench, BFCL and HLE. These observations inform the initial expert ranking and heat, followed by online adaptive residency. This is prompt-based residency calibration, not a task-success evaluation. The automatic starter remains uncalibrated; supply a matching `profile` and `heat` pair to reuse a calibrated setup.
+
+**Block-pinned memory + huge pages on PCIe 5.0** substantially improves expert-transfer bandwidth on the tested machine. Expert RAM uses 40 CUDA-registered blocks with 100% 2 MiB huge-page coverage. An isolated H2D comparison measured **23.952 → 45.104 GB/s (+88.31%)** versus one registration with 4 KiB pages. Faster expert uploads reduce transfer cost and can improve both prefill and decode speed when transfers limit execution. This measured gain is specific to the tested PCIe 5.0 ×16 setup; it is a bandwidth result, not an equal percentage increase in tokens/s or a claim for other PCIe generations. [Measurement scope](docs/PERFORMANCE.md#host-memory-transfer-measurements).
+
+On a server with **AVX-512, ample RAM and high memory bandwidth**, it is also worth testing **CPU execution of MoE experts during decode**, while keeping attention and other suitable work on the GPU. Results depend on the actual quantized CPU kernels, memory channels and NUMA placement, and CPU/GPU scheduling. This needs a separately configured and validated path: the supplied launcher uses GPU expert execution, and this release has no performance qualification for that server configuration.
 
 ## Build and launch
 
