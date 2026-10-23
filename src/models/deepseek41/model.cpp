@@ -1,4 +1,6 @@
 #include "strata/models/deepseek41/model.hpp"
+#include "strata/models/deepseek41/iq3xxs_digests.hpp"
+#include "strata/models/deepseek41/q2k_xl_digests.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -17,7 +19,7 @@ const MetaValue& meta(const GgufFile& f, const std::string& key) {
 }
 uint64_t integer(const GgufFile& f, const std::string& key) {
     const auto& v = meta(f, key);
-    if (v.type != MetaType::U32 && v.type != MetaType::U64 && v.type != MetaType::I32)
+    if (v.type != MetaType::U16 && v.type != MetaType::U32 && v.type != MetaType::U64 && v.type != MetaType::I32)
         throw std::runtime_error("DeepSeek: expected integer metadata " + key);
     return v.u;
 }
@@ -157,10 +159,40 @@ HotAllocation allocate_hot_experts(const std::array<uint64_t, 40>& sizes,
 }
 
 Model::Model(const std::string& main, const std::string& draft, const std::string& vision) {
-    main_ = std::make_unique<GgufFile>(main);
+    open_main(main, false);
     load_main();
     if (!draft.empty()) { draft_ = std::make_unique<GgufFile>(draft); load_draft(); }
     if (!vision.empty()) { vision_ = std::make_unique<GgufFile>(vision); load_vision(); }
+}
+
+void Model::open_main(const std::string& path, bool operator_only) {
+    const auto paths = gguf_split_paths(path, !operator_only);
+    main_ = std::make_unique<GgufFile>(paths.front());
+    ple_engram_ = main_->get("deepseek41.ple.layers") != nullptr;
+    if (paths.size() > 1) {
+        equal(*main_, "split.no", 0);
+        equal(*main_, "split.count", paths.size());
+    }
+    for (size_t i = 1; i < paths.size(); ++i) {
+        if (!std::filesystem::exists(paths[i])) {
+            if (!operator_only || !ple_engram_ || i + 1 != paths.size())
+                throw std::runtime_error("DeepSeek: missing non-Engram shard " + paths[i]);
+            main_complete_ = false;
+            continue;
+        }
+        auto shard = std::make_unique<GgufFile>(paths[i]);
+        equal(*shard, "split.no", i);
+        equal(*shard, "split.count", paths.size());
+        equal(*shard, "split.tensors.count", integer(*main_, "split.tensors.count"));
+        main_shards_.push_back(std::move(shard));
+    }
+}
+
+std::unique_ptr<Model> Model::operator_weights_only(const std::string& path) {
+    auto model = std::unique_ptr<Model>(new Model);
+    model->open_main(path, true);
+    model->load_main();
+    return model;
 }
 
 void Model::load_main() {
@@ -179,15 +211,23 @@ void Model::load_main() {
         {"attention.indexer.top_k",512}, {"attention.indexer.candidate_source_layer",20},
         {"attention.indexer.candidate_top_k_blocks",2048}, {"attention.indexer.candidate_block_size",8},
         {"hyper_connection.count",4}, {"hyper_connection.sinkhorn_iterations",20},
-        {"engram.ngram_size",4}, {"engram.head_count",8}, {"engram.head_dim",256},
         {"engram.compressed_vocab_size",99092}}) equal(f, p + key, expected);
+    equal(f, p + (ple_engram_ ? "ple.ngram_size" : "engram.ngram_size"), 4);
+    equal(f, p + (ple_engram_ ? "ple.heads_per_ngram" : "engram.head_count"), 8);
+    equal(f, p + (ple_engram_ ? "embedding_length_per_layer_input" : "engram.head_dim"), 256);
     array_equal(f, p + "attention.kv_source_layers", {2,8,14,20});
-    array_equal(f, p + "attention.index_source_layers", {2,8,14,20,24,28,32,36});
-    array_equal(f, p + "engram.layers", {1,14});
+    array_equal(f, p + (ple_engram_ ? "attention.indexer.source_layers" : "attention.index_source_layers"), {2,8,14,20,24,28,32,36});
+    array_equal(f, p + (ple_engram_ ? "ple.layers" : "engram.layers"), {1,14});
     std::vector<uint64_t> ratios;
     for (const auto& l : ownership_) ratios.push_back(l.compression);
-    array_equal(f, p + "attention.compress_ratios", ratios);
-    if (meta(f, p + "attention.q_norm").u || !meta(f, p + "hyper_connection.single_pass").u ||
+    const auto actual_ratios = array(f, p + "attention.compress_ratios");
+    if (ple_engram_ && actual_ratios.size() == 43) ratios.insert(ratios.end(), 3, 0);
+    if (actual_ratios != ratios) throw std::runtime_error("DeepSeek: unsupported compression ratios");
+    // The PLE converter's DeepSeek41 graph explicitly omits per-head Q norm
+    // and implements single-pass mHC (llama.cpp PR30817, b72050d).
+    const auto* qnorm = f.get(p + "attention.q_norm");
+    const auto* single = f.get(p + "hyper_connection.single_pass");
+    if ((!ple_engram_ && (!qnorm || !single)) || (qnorm && qnorm->u) || (single && !single->u) ||
         !meta(f, p + "expert_weights_norm").u)
         throw std::runtime_error("DeepSeek: unsupported norm or mHC semantics");
     geometry_.norm_eps = number(f, p + "attention.layer_norm_rms_epsilon");
@@ -211,29 +251,39 @@ void Model::load_main() {
             throw std::runtime_error("DeepSeek: unsupported SwiGLU clamp");
     }
     validate_file(f, tensors_, false, false);
-    const auto& token = tensors_.at("engram_token_map.weight");
     token_map_.resize(geometry_.vocab);
-    std::memcpy(token_map_.data(), token.data, token.bytes);
+    if (ple_engram_) {
+        const auto ids = array(f, p + "engram.token_map");
+        if (ids.size() != token_map_.size()) throw std::runtime_error("DeepSeek: Engram token map size");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] >= 99092) throw std::runtime_error("DeepSeek: Engram token map out of range");
+            token_map_[i] = static_cast<int32_t>(ids[i]);
+        }
+    } else {
+        const auto& token = tensors_.at("engram_token_map.weight");
+        std::memcpy(token_map_.data(), token.data, token.bytes);
+    }
     for (int32_t id : token_map_)
         if (id < 0 || id >= 99092) throw std::runtime_error("DeepSeek: Engram token map out of range");
-    const auto multipliers = array(f, p + "engram.multipliers");
-    const auto primes = array(f, p + "engram.primes");
-    const auto offsets = array(f, p + "engram.offsets");
-    const auto rows = array(f, p + "engram.num_embeddings");
+    const auto multipliers = array(f, p + (ple_engram_ ? "ple.layer_multipliers" : "engram.multipliers"));
+    const auto primes = array(f, p + (ple_engram_ ? "ple.head_vocab_sizes" : "engram.primes"));
+    const auto offsets = array(f, p + (ple_engram_ ? "ple.head_offsets" : "engram.offsets"));
+    const auto rows = ple_engram_ ? std::vector<uint64_t>{384006168,384016682} : array(f, p + "engram.num_embeddings");
     if (multipliers.size() != 8 || primes.size() != 48 || offsets.size() != 48 || rows.size() != 2)
         throw std::runtime_error("DeepSeek: invalid Engram hash metadata lengths");
     for (uint64_t multiplier : multipliers)
         if (!multiplier || !(multiplier & 1) || multiplier > uint64_t(INT64_MAX) / 99091)
             throw std::runtime_error("DeepSeek: invalid Engram multiplier");
     for (int e = 0; e < 2; ++e) {
-        uint64_t end = 0;
+        const uint64_t base = ple_engram_ && e ? rows[0] : 0;
+        uint64_t end = base;
         for (int h = 0; h < 24; ++h) {
             const int index = e * 24 + h;
             if (!primes[index] || offsets[index] != end)
                 throw std::runtime_error("DeepSeek: invalid Engram hash bucket");
             end = checked_add(end, primes[index]);
         }
-        if (end != rows[e] || tensor(block(e ? 14 : 1, "engram_embd.weight")).info->shape[1] != rows[e])
+        if (end - base != rows[e] || (!ple_engram_ && tensor(block(e ? 14 : 1, "engram_embd.weight")).info->shape[1] != rows[e]))
             throw std::runtime_error("DeepSeek: Engram hash buckets exceed table");
     }
     if (integer(f, p + "engram.pad_token_id") >= token_map_.size())
@@ -251,20 +301,43 @@ void Model::load_draft() {
         {"expert_feed_forward_length",2304}, {"hyper_connection.count",4}, {"block_size",5}})
         equal(f, p + key, expected);
     array_equal(f, p + "attention.compress_ratios", {0,0,0});
-    // Store these raw IDs. Their capture mapping is established by the P8 tensor oracle, never by subtracting one.
-    array_equal(f, p + "target_layers", {38,39,40});
+    const auto targets = array(f, p + "target_layers");
+    draft_shared_embeddings_ = targets == std::vector<uint64_t>{37,38,39};
+    if (draft_shared_embeddings_) {
+        // The 1017 converter writes attention-input layer IDs directly and
+        // omits the target's shared embedding/head. Both formats capture 37..39.
+        if (!main_ || !ple_engram_)
+            throw std::runtime_error("DeepSeek: 1017 DSpark requires its PLE main model");
+    } else {
+        array_equal(f, p + "target_layers", {38,39,40});
+        if (main_ && ple_engram_)
+            throw std::runtime_error("DeepSeek: legacy DSpark does not match the PLE main model");
+    }
     validate_file(f, draft_tensors_, true, false);
 }
 
 void Model::load_vision() {
     const auto& f = *vision_;
-    if (meta(f, "general.architecture").s != "clip" || meta(f, "clip.projector_type").s != "deepseek4v")
-        throw std::runtime_error("DeepSeek: mmproj must be the deepseek4v vision encoder");
+    const auto& projector = meta(f, "clip.projector_type").s;
+    if (meta(f, "general.architecture").s != "clip" || (projector != "deepseek4v" && projector != "deepseek41v"))
+        throw std::runtime_error("DeepSeek: unsupported vision encoder");
+    if (main_ && (projector == "deepseek41v") != ple_engram_)
+        throw std::runtime_error("DeepSeek: vision checkpoint does not match the main model");
     for (const auto& [key, expected] : std::vector<std::pair<std::string, uint64_t>>{
         {"block_count",32}, {"embedding_length",1024}, {"feed_forward_length",2816},
         {"attention.head_count",16}, {"patch_size",14}, {"projection_dim",5120}, {"projector.scale_factor",3}})
         equal(f, "clip.vision." + key, expected);
     validate_file(f, vision_tensors_, false, true);
+}
+std::string Model::checkpoint_identity() const {
+    if (!main_ || !main_complete_) throw std::runtime_error("DeepSeek: complete main checkpoint required");
+    if (!ple_engram_) return "11f46543370256ef616b6e458b6950e148625b5f8b7545173d124445d3393c53";
+    std::string identity;
+    for (const auto* sha : engram_type()==13 ? q2k_xl_sha256 : iq3xxs_sha256) {
+        if (!identity.empty()) identity += ':';
+        identity += sha;
+    }
+    return identity;
 }
 std::unique_ptr<Model> Model::vision_only(const std::string& path) {
     auto model=std::unique_ptr<Model>(new Model());
@@ -276,27 +349,54 @@ std::unique_ptr<Model> Model::draft_only(const std::string& path) {
 }
 
 void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool vision) {
-    const uint64_t available = f.file_size() - f.data_start();
-    for (const auto& t : f.tensors()) {
+    const auto collect = [&](const GgufFile& shard) {
+    const uint64_t available = shard.file_size() >= shard.data_start() ? shard.file_size() - shard.data_start() : 0;
+    std::vector<const TensorInfo*> ordered;
+    for (const auto& t : shard.tensors()) {
         const uint64_t bytes = tensor_payload_bytes(t);
-        if (!bytes || t.offset > available || bytes > available - t.offset || t.offset % f.alignment())
+        if (!bytes || t.offset > available || bytes > available - t.offset || t.offset % shard.alignment())
             throw std::runtime_error("DeepSeek: invalid tensor span/type/alignment: " + t.name);
-        views.emplace(t.name, TensorView{&t, f.tensor_data(t), bytes,
-            bytes / (t.elements() / t.shape[0]), TensorRole::dense});
+        if (!views.emplace(t.name, TensorView{&t, shard.tensor_data(t), bytes,
+            bytes / (t.elements() / t.shape[0]), TensorRole::dense, &shard}).second)
+            throw std::runtime_error("DeepSeek: duplicate tensor " + t.name);
+        ordered.push_back(&t);
     }
     // Overlapping tensors are never valid role slices, even if each individually fits the file.
-    std::vector<const TensorView*> ordered;
-    for (const auto& [name, v] : views) { (void) name; ordered.push_back(&v); }
-    std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) { return a->info->offset < b->info->offset; });
+    std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) { return a->offset < b->offset; });
     for (size_t i = 1; i < ordered.size(); ++i)
-        if (ordered[i - 1]->bytes > ordered[i]->info->offset - ordered[i - 1]->info->offset)
-            throw std::runtime_error("DeepSeek: overlapping tensor " + ordered[i]->info->name);
+        if (tensor_payload_bytes(*ordered[i - 1]) > ordered[i]->offset - ordered[i - 1]->offset)
+            throw std::runtime_error("DeepSeek: overlapping tensor " + ordered[i]->name);
+    };
+    collect(f);
+    if (draft && draft_shared_embeddings_) {
+        for (const char* name : {"token_embd.weight", "output.weight"}) {
+            if (views.count(name)) throw std::runtime_error("DeepSeek: 1017 draft duplicates shared target weights");
+            views.emplace(name, tensor(name));
+        }
+    }
+    if (!draft && !vision) {
+        for (const auto& shard : main_shards_) collect(*shard);
+        if (!main_shards_.empty() &&
+            views.size() + (main_complete_ ? 0 : 1) != integer(f, "split.tensors.count"))
+            throw std::runtime_error("DeepSeek: incomplete split tensor directory");
+    }
     std::set<std::string> consumed;
     auto require = [&](const std::string& name, std::vector<uint64_t> shape, uint32_t type,
                        TensorRole role = TensorRole::dense) {
         auto it = views.find(name);
         if (it == views.end()) throw std::runtime_error("DeepSeek: missing tensor " + name);
-        if (it->second.info->shape != shape || (it->second.info->type != type && !(draft&&type==8&&it->second.info->type==2)))
+        const bool bf16_dense = !draft && !vision && ple_engram_ && type==8 && it->second.info->type==30 &&
+            (name.find("indexer.")!=std::string::npos || name.find("attn_compressor_")!=std::string::npos);
+        const bool bf16_markov = draft && draft_shared_embeddings_ && type==8 && it->second.info->type==30 &&
+            (name=="markov_w1.weight" || name=="markov_w2.weight");
+        const auto suffix=name.substr(name.find('.',4)+1);
+        const bool q6_dense=ple_engram_ && !vision && type==8 && it->second.info->type==14 &&
+            (name=="output.weight" || (!draft && (suffix=="attn_q_a.weight" || suffix=="attn_q_b.weight" ||
+             suffix=="attn_kv.weight" || suffix=="attn_output_a.weight" || suffix=="attn_output_b.weight" ||
+             suffix=="ffn_gate_shexp.weight" || suffix=="ffn_up_shexp.weight" || suffix=="ffn_down_shexp.weight")));
+        const bool q5_engram=!draft && !vision && ple_engram_ && type==14 && it->second.info->type==13 &&
+            name=="per_layer_token_embd.weight";
+        if (it->second.info->shape != shape || (it->second.info->type != type && !bf16_dense && !bf16_markov && !q6_dense && !q5_engram && !(draft&&type==8&&it->second.info->type==2)))
             throw std::runtime_error("DeepSeek: tensor shape/type mismatch: " + name);
         it->second.role = role;
         consumed.insert(name);
@@ -327,11 +427,16 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
         const int layers = draft ? 3 : 40;
         const uint64_t experts = draft ? 128 : 384;
         for (int l = 0; l < layers; ++l) {
-            const uint32_t type = draft ? views.at(block(l,"ffn_gate_exps.weight")).info->type : l < 14 ? 11 : 10;
+            const uint32_t type = draft || ple_engram_ ? views.at(block(l,"ffn_gate_exps.weight")).info->type : l < 14 ? 11 : 10;
             if(draft&&type!=39&&type!=10&&type!=11&&type!=42)throw std::runtime_error("DeepSeek: unsupported draft expert type");
+            if(!draft && type!=10 && type!=11 && type!=16 && type!=17 && type!=18 && type!=21 && type!=22)
+                throw std::runtime_error("DeepSeek: unsupported main Gate/Up type");
             for (const char* name : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
                 require(block(l, name), {5120,2304,experts}, type, TensorRole::routed_expert);
-            require(block(l, "ffn_down_exps.weight"), {2304,5120,experts}, type, TensorRole::routed_expert);
+            const uint32_t down_type = !draft && ple_engram_ ? views.at(block(l,"ffn_down_exps.weight")).info->type : type;
+            if(!draft && down_type!=10 && down_type!=11 && down_type!=16 && down_type!=18 && down_type!=21 && down_type!=39)
+                throw std::runtime_error("DeepSeek: unsupported main Down type");
+            require(block(l, "ffn_down_exps.weight"), {2304,5120,experts}, down_type, TensorRole::routed_expert);
             require(block(l, "attn_sinks.weight"), {64}, 0);
             require(block(l, "attn_kv_a_norm.weight"), {512}, 0);
             require(block(l, "attn_q_a_norm.weight"), {1280}, 0);
@@ -367,16 +472,27 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
                 require(block(l, "indexer.attn_q_b.weight"), {1280,4096}, 8);
             }
             if (!draft && (l == 1 || l == 14)) {
+                if (ple_engram_) {
+                    require(block(l, "engram_gate.weight"), {5120,4}, 0);
+                    require(block(l, "engram_kv.weight"), {6144,25600}, 14);
+                } else {
                 require(block(l, "engram_embd.weight"), {256,l == 1 ? 384006168u : 384016682u}, 8, TensorRole::engram);
                 require(block(l, "engram_q.weight"), {5120,4}, 0);
                 require(block(l, "engram_k.weight"), {5120,4}, 0);
                 require(block(l, "engram_wkv.weight"), {6144,25600}, 8);
+                }
             }
         }
         require("token_embd.weight", {5120,129280}, 8);
         require("output.weight", {5120,129280}, 8);
         require("output_norm.weight", {5120}, 0);
-        if (!draft) require("engram_token_map.weight", {129280}, 26, TensorRole::token_map);
+        if (!draft) {
+            if (ple_engram_) {
+                if (main_complete_) require("per_layer_token_embd.weight", {256,768022850}, 14, TensorRole::engram);
+                else if (views.count("per_layer_token_embd.weight"))
+                    throw std::runtime_error("DeepSeek: missing shard is not the Engram table");
+            } else require("engram_token_map.weight", {129280}, 26, TensorRole::token_map);
+        }
         else {
             require("enc.output_norm.weight", {5120}, 0, TensorRole::draft_head);
             require("fc.weight", {15360,5120}, 8, TensorRole::draft_head);
@@ -411,8 +527,9 @@ ExpertSlice Model::expert(int layer, int id, bool draft) const {
     const auto& up = tensor(block(layer, "ffn_up_exps.weight"), draft);
     const auto& down = tensor(block(layer, "ffn_down_exps.weight"), draft);
     const uint64_t stride = gate.bytes / count;
-    return {gate.data + stride * id, up.data + stride * id, down.data + stride * id,
-            gate.info->type, gate.row_bytes, down.row_bytes, stride, stride * 3};
+    const uint64_t down_stride = down.bytes / count;
+    return {gate.data + stride * id, up.data + stride * id, down.data + down_stride * id,
+            gate.info->type, down.info->type, gate.row_bytes, down.row_bytes, stride, stride * 2 + down_stride};
 }
 std::array<uint64_t, 40> Model::expert_bytes() const {
     std::array<uint64_t, 40> sizes{};
@@ -420,18 +537,23 @@ std::array<uint64_t, 40> Model::expert_bytes() const {
     return sizes;
 }
 void Model::write_inventory(std::ostream& out) const {
-    out << "{\"architecture\":\"deepseek41\",\"geometry\":{\"layers\":40,\"hidden\":5120,\"heads\":64},\"files\":[";
+    out << "{\"architecture\":\"deepseek41\",\"main_complete\":" << (main_complete_?"true":"false")
+        << ",\"geometry\":{\"layers\":40,\"hidden\":5120,\"heads\":64},\"files\":[";
     bool first_file = true;
-    for (int kind = 0; kind < 3; ++kind) {
-        const auto* f = kind == 2 ? vision_.get() : kind == 1 ? draft_.get() : main_.get();
+    std::vector<std::pair<const GgufFile*,const Views*>> files{{main_.get(),&tensors_}};
+    for(const auto& shard:main_shards_)files.push_back({shard.get(),&tensors_});
+    files.push_back({draft_.get(),&draft_tensors_});
+    files.push_back({vision_.get(),&vision_tensors_});
+    for (const auto& [f,collection] : files) {
         if (!f) continue;
         if (!first_file) out << ',';
         first_file = false;
-        const auto& views = kind == 2 ? vision_tensors_ : kind == 1 ? draft_tensors_ : tensors_;
+        const auto& views = *collection;
         out << "{\"path\":" << json_string(f->path()) << ",\"bytes\":" << f->file_size()
             << ",\"data_start\":" << f->data_start() << ",\"tensors\":[";
         bool first = true;
         for (const auto& [name, v] : views) {
+            if(v.file!=f)continue;
             if (!first) out << ',';
             first = false;
             out << "{\"name\":" << json_string(name) << ",\"role\":" << json_string(role_name(v.role))

@@ -11,9 +11,11 @@ __global__ void delay(unsigned long long clocks){const auto start=clock64();whil
 __global__ void checksum(const uint8_t* bytes,uint64_t n,unsigned long long* out){unsigned long long sum=0;for(uint64_t i=0;i<n;++i)sum+=bytes[i];*out=sum;}
 void need(bool value,const char* why){if(!value)throw std::runtime_error(why);}
 uint8_t value(d::ExpertKey key){return 1+(key.first*17+key.second)%251;}
-void run(bool grouped,bool aligned,bool pinned,bool huge=false){
+void run(bool grouped,bool aligned,bool pinned,bool huge=false,bool mixed=false){
     constexpr auto no_ram=strata::core::detail::kNoCacheComplement;
     std::array<uint64_t,40> sizes{};for(int l=0;l<40;++l)sizes[l]=l<14?768:512;
+    std::array<int,40> layouts{};
+    if(mixed)for(int l=0;l<40;++l){layouts[l]=l%8;sizes[l]=layouts[l]%3?512:768;}
     std::vector<d::ExpertKey> hot;std::vector<int64_t> slot_sizes;
     for(int e=0;e<2;++e)for(int l=0;l<40;++l){hot.emplace_back(l,e);slot_sizes.push_back(sizes[l]);}
     strata::core::ExpertCache cache;std::string error;
@@ -31,11 +33,11 @@ void run(bool grouped,bool aligned,bool pinned,bool huge=false){
     if(pinned){pinned_owner=std::make_unique<d::Pinned>(bytes,false,huge);std::memcpy(pinned_owner->data,ram.data(),bytes);}
     auto* host=pinned?pinned_owner->data:ram.data();
     const auto original=hot;constexpr uint64_t budget=128*1024;
-    d::AdaptiveCache adaptive(cache,hot,offsets,host,sizes,budget,false,grouped,pinned,huge);
+    d::AdaptiveCache adaptive(cache,hot,offsets,host,sizes,budget,false,grouped,pinned,huge,mixed?&layouts:nullptr);
     d::PrefetchBlockBenchmark::aligned(adaptive,aligned);
     const auto initial=strata::models::deepseek41::PrefetchBlockBenchmark::snapshot(adaptive);
     const auto initial_ram=ram;
-    need(!cache.replace_checked(0,0,14,383,0,sizes[14]),"cross-size slot publication accepted");
+    need(!cache.replace_checked(0,0,mixed?1:14,383,0,sizes[mixed?1:14]),"cross-size slot publication accepted");
     need(!cache.replace_checked(0,0,0,1,0,sizes[0]),"duplicate resident publication accepted");
     strata::core::DeviceArena result_arena(2*hot.size()*sizeof(unsigned long long));
     auto* result=static_cast<unsigned long long*>(result_arena.alloc(2*hot.size()*sizeof(unsigned long long)));
@@ -104,4 +106,4 @@ void run(bool grouped,bool aligned,bool pinned,bool huge=false){
     std::cout<<(grouped?"grouped ":"same-layer ")<<"adaptive mixed-size exchange: live readers, CPU fallback, ready publication, full RAM/GPU payloads, byte cap, prompt drain and cross-request learning passed\n";
 }
 }
-int main(){try{for(bool grouped:{false,true})for(bool aligned:{false,true})for(bool pinned:{false,true})run(grouped,aligned,pinned);run(true,true,true,true);return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{for(bool grouped:{false,true})for(bool aligned:{false,true})for(bool pinned:{false,true})run(grouped,aligned,pinned);run(true,true,true,true);run(true,true,true,false,true);return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

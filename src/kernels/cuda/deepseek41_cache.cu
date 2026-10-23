@@ -150,28 +150,55 @@ __global__ void pack_index_kernel(const float* keys, uint8_t* packed, float* fak
   }
 }
 }
+template<bool GLOBAL>
+__global__ void pack_rows_kernel(const __nv_bfloat16* input,const int64_t* slots,int64_t stride,CacheLayout c){
+ constexpr int group=GLOBAL?16:32,groups=512/group;
+ const int token=blockIdx.x,lane=threadIdx.x%group,warp=threadIdx.x/group;
+ const int64_t slot=slots[token];if(slot<0)return;
+ const int64_t off=slot/c.page_size*c.page_stride+(slot%c.page_size)*c.row_stride;
+ if(off<0||off>c.bytes-(GLOBAL?288:528))return;uint8_t* out=c.data+off;
+ for(int g=warp;g<groups;g+=256/group){
+  const int d=g*group+lane;float x=__bfloat162float(input[int64_t(token)*stride+d]),m=fabsf(x);
+  for(int delta=group/2;delta;delta>>=1)m=fmaxf(m,__shfl_down_sync(0xffffffff,m,delta,group));m=__shfl_sync(0xffffffff,m,0,group);
+  if constexpr(GLOBAL){
+   __nv_fp8_e4m3 s(fmaxf(m,6.f*0x1p-9f)/6.f);float scale=float(s);
+   uint8_t v=fp4_bits(__fdiv_rn(x,scale)),peer=__shfl_xor_sync(0xffffffff,v,1,group);
+   if(!(lane&1))out[d/2]=v|(peer<<4);if(!lane)out[256+g]=s.__x;
+  }else{
+   float scale=ceil_pow2(fmaxf(m,1e-4f)/448.f);__nv_fp8_e4m3 v(fmaxf(-448.f,fminf(448.f,__fdiv_rn(x,scale))));out[d]=v.__x;
+   if(!lane)out[512+g]=(__float_as_uint(scale)>>23)&255;
+  }
+ }
+}
+
 cudaError_t pack_swa_gpu(const uint16_t* kv,const int64_t* slots,int tokens,int64_t stride,
                         CacheLayout c,cudaStream_t stream) {
   if (!kv || !slots || tokens < 1 || stride < 512 || !cache_valid(c,528)) return cudaErrorInvalidValue;
-  pack_swa_kernel<int64_t><<<dim3(tokens,16),32,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),
+  if(tokens>=128)pack_rows_kernel<false><<<tokens,256,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),slots,stride,c);
+  else pack_swa_kernel<int64_t><<<dim3(tokens,16),32,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),
     slots,c.data,tokens,stride,c.bytes,c.page_size,c.page_stride,c.row_stride);
   return cudaGetLastError();
 }
 cudaError_t pack_global_gpu(const uint16_t* kv,const int64_t* slots,int tokens,int64_t stride,
                            CacheLayout c,cudaStream_t stream) {
   if (!kv || !slots || tokens < 1 || stride < 512 || !cache_valid(c,288)) return cudaErrorInvalidValue;
-  pack_global_kernel<int64_t><<<dim3(tokens,32),32,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),
+  if(tokens>=32)pack_rows_kernel<true><<<tokens,256,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),slots,stride,c);
+  else pack_global_kernel<int64_t><<<dim3(tokens,32),32,0,stream>>>(reinterpret_cast<const __nv_bfloat16*>(kv),
     slots,c.data,tokens,stride,c.bytes,c.page_size,c.page_stride,c.row_stride);
   return cudaGetLastError();
 }
+#include "deepseek41_index_fast.cuh"
+
 cudaError_t pack_index_gpu(const float* keys,uint8_t* out,int rows,cudaStream_t stream) {
   if (!keys || !out || rows < 1) return cudaErrorInvalidValue;
-  pack_index_kernel<<<dim3(rows,4),32,0,stream>>>(keys,out,nullptr);
+  if(rows>=4096)index_vectorized::quant_rows<false><<<(rows+7)/8,256,0,stream>>>(keys,out,nullptr,rows);
+  else pack_index_kernel<<<dim3(rows,4),32,0,stream>>>(keys,out,nullptr);
   return cudaGetLastError();
 }
 cudaError_t fake_quant_index_gpu(float* keys,int rows,cudaStream_t stream) {
   if (!keys || rows < 1) return cudaErrorInvalidValue;
-  pack_index_kernel<<<dim3(rows,4),32,0,stream>>>(keys,nullptr,keys);
+  if(rows>=4096)index_vectorized::quant_rows<true><<<(rows+7)/8,256,0,stream>>>(keys,nullptr,keys,rows);
+  else pack_index_kernel<<<dim3(rows,4),32,0,stream>>>(keys,nullptr,keys);
   return cudaGetLastError();
 }
 } // namespace strata::models::deepseek41

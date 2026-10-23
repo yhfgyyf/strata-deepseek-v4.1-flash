@@ -138,7 +138,10 @@ void ExpertPipeline::run(){
                 if(!direct.source)fill(i,host_.data+offset);
                 else {source=direct.source;payload=direct.bytes;}
                 { std::lock_guard<std::mutex> lock(mutex_);if(stopped_)return; }
-                gpu_check(cudaMemcpyAsync(device_+offset,source,payload,cudaMemcpyHostToDevice,upload_));
+                const std::string label=direct.trace_layer<0?"":"ds41.expert.h2d.layer."+std::to_string(direct.trace_layer)+
+                    ".expert."+std::to_string(direct.trace_expert)+".generation."+std::to_string(generation)+".sequence."+std::to_string(i);
+                {prefill::LedgerScope trace(direct.trace_layer>=0,label.c_str());
+                 gpu_check(cudaMemcpyAsync(device_+offset,source,payload,cudaMemcpyHostToDevice,upload_));}
                 gpu_check(cudaEventRecord(slot.copied.value,upload_));
                 { std::lock_guard<std::mutex> lock(mutex_);
                   slot.generation=generation;slot.sequence=i;slot.issued=true;slot.returned=false;
@@ -220,7 +223,7 @@ void Runtime::Impl::begin_expert_prefetch(int first,int last,ExecutionStats& sta
             if(!source)throw std::runtime_error("expert prefetch needs stable pinned cold weights");
             const uint64_t bytes=experts->format(layer).bytes;
             prefetch_positions[layer][expert]=jobs.size();
-            jobs.push_back({source,bytes});prefetch_sizes.push_back(bytes);
+            jobs.push_back({source,bytes,options.trace?layer:-1,expert});prefetch_sizes.push_back(bytes);
             stats.h2d_expert_bytes+=bytes;stats.direct_expert_bytes+=bytes;stats.prefetch_expert_bytes+=bytes;
         }
     }

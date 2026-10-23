@@ -23,7 +23,8 @@ uint64_t AdaptiveCache::staging_bytes(const std::array<uint64_t,40>& sizes,uint6
     return 2*capacity*stride;
 }
 AdaptiveCache::AdaptiveCache(core::ExpertCache& cache,std::vector<ExpertKey>& hot,std::vector<uint64_t>& offsets,
-                             uint8_t* ram,const std::array<uint64_t,40>& sizes,uint64_t budget,bool trace,bool grouped,bool pinned_ram,bool huge_pinned)
+                             uint8_t* ram,const std::array<uint64_t,40>& sizes,uint64_t budget,bool trace,bool grouped,bool pinned_ram,bool huge_pinned,
+                             const std::array<int,40>* layout_groups)
     :cache_(cache),hot_(hot),offsets_(offsets),ram_(ram),sizes_(sizes),budget_(budget),stride_(largest(sizes)),
      capacity_(std::min<uint64_t>(96,budget/2/stride_)),trace_(trace),grouped_(grouped),pinned_ram_(pinned_ram),
      staging_(std::make_unique<Pinned>(staging_bytes(sizes,budget),false,huge_pinned)),heat_(keys),previous_(keys),learned_(keys),
@@ -31,10 +32,17 @@ AdaptiveCache::AdaptiveCache(core::ExpertCache& cache,std::vector<ExpertKey>& ho
     if(!ram_||offsets_.size()!=keys||hot_.size()!=static_cast<size_t>(cache_.slots()))throw std::invalid_argument("adaptive cache ownership");
     if(!staging_->pinned)throw std::runtime_error("adaptive overlap requires pinned exchange buffers");
     for(size_t i=0;i<hot_.size();++i){const auto [l,e]=hot_[i];if(cache_.slot_of(l,e)!=static_cast<int>(i))throw std::invalid_argument("adaptive cache slot order");}
+    for(int l=0;l<40;++l)groups_[l]=layout_groups?layout_groups->at(l):adaptive_group(l);
     rotation_eligible_=pinned_ram_;
-    for(int l=0;l<40;++l)if(sizes[l]!=sizes[l<14?0:14]){
-        rotation_eligible_=false;
-        if(grouped_)throw std::invalid_argument("adaptive format-group sizes differ");
+    for(int l=0;l<40;++l){
+        if(groups_[l]<0||groups_[l]>=40)throw std::invalid_argument("adaptive format group ID");
+        // Two bounded spare pools retain the existing Q2/Q3 zero-copy rotation.
+        // More layouts use direct pinned H2D and a host commit within the same budget.
+        if(groups_[l]>=2)rotation_eligible_=false;
+        for(int j=0;j<l;++j)if(groups_[j]==groups_[l]&&sizes[j]!=sizes[l]){
+            rotation_eligible_=false;
+            if(grouped_)throw std::invalid_argument("adaptive format-group sizes differ");
+        }
     }
     for(int k=0;k<keys;++k)if(offsets_[k]!=no_ram)sources_[k]=ram_+offsets_[k];
     for(int g=0;g<2;++g)for(size_t i=0;i<capacity_;++i)
@@ -55,20 +63,20 @@ void AdaptiveCache::validate(const Swap& s)const{
        generations_[s.slot]!=s.generation||sizes_[s.in.first]!=s.bytes||sizes_[s.out.first]!=s.bytes||
        offsets_[adaptive_index(s.in)]!=s.offset||offsets_[adaptive_index(s.out)]!=no_ram||
        sources_[adaptive_index(s.in)]!=s.source||sources_[adaptive_index(s.out)]||
-       (s.rotate&&spares_[adaptive_group(s.in.first)].at(s.spare)!=s.saved)||
-       (grouped_?adaptive_group(s.in.first)!=adaptive_group(s.out.first):s.in.first!=s.out.first))
+       (s.rotate&&spares_[groups_[s.in.first]].at(s.spare)!=s.saved)||
+       (grouped_?groups_[s.in.first]!=groups_[s.out.first]:s.in.first!=s.out.first))
         throw std::logic_error("adaptive stale exchange ownership/generation");
 }
 void AdaptiveCache::choose(cudaStream_t readers,ExecutionStats& stats){
     std::vector<int32_t> slots(keys);
     for(int k=0;k<keys;++k)slots[k]=cache_.slot_of(k/384,k%384);
-    swaps_.clear();std::array<size_t,2> spare{};
-    for(const auto& choice:choose_adaptive_exchanges(sizes_,heat_,slots,offsets_,grouped_,capacity_,budget_)){
+    swaps_.clear();std::array<size_t,40> spare{};
+    for(const auto& choice:choose_adaptive_exchanges(sizes_,heat_,slots,offsets_,grouped_,capacity_,budget_,&groups_)){
         Swap s;static_cast<AdaptiveExchange&>(s)=choice;
         s.generation=generations_.at(s.slot);s.source=sources_.at(adaptive_index(s.in));
         s.direct=aligned_&&pinned_ram_;s.rotate=aligned_&&rotation_eligible_;
-        s.spare=spare[adaptive_group(s.in.first)]++;
-        s.saved=s.rotate?spares_[adaptive_group(s.in.first)].at(s.spare):saved(swaps_.size());
+        s.spare=spare[groups_[s.in.first]]++;
+        s.saved=s.rotate?spares_[groups_[s.in.first]].at(s.spare):saved(swaps_.size());
         validate(s);swaps_.push_back(s);
     }
     since_pick_=0;
@@ -155,7 +163,7 @@ void AdaptiveCache::commit_owners(){
             throw std::logic_error("adaptive RAM ownership publication rejected");
         sources_[out]=s.rotate?s.saved:s.source;sources_[in]=nullptr;
         if(s.rotate){
-            auto& spare=spares_[adaptive_group(s.in.first)].at(s.spare);
+            auto& spare=spares_[groups_[s.in.first]].at(s.spare);
             if(spare!=s.saved)throw std::logic_error("adaptive spare generation changed");
             spare=s.source;++rotated_;avoided_commit_+=s.bytes;
         }

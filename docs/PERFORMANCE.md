@@ -1,53 +1,46 @@
 # Performance and validation
 
-## Measurement conditions
+## October 23: UD-Q2_K_XL with original DSpark
 
-The two published tables derive from October 19, 2026 measurements on one RTX PRO 6000 Blackwell 96GB, i7-14700KF and 192GB DDR5-4800. Main model: DeepSeek-V4.1-Flash-GSQ-RCO-3.0bit.gguf; draft: the tested Q2_K/Q4 derivative. CUDA 13.2, driver 595.104.02.
+The current performance table is derived from the frozen 21-item cumulative baseline, source manifest SHA256 `e0370fb6588f5ee93b8a7aa10e0afb1336e9437fa859fcd08207f89b3d1d768c`. It uses Unsloth DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL and the original 1017 DSpark file, on i7-14700KF, one RTX PRO 6000 Blackwell 96GB and 192GB DDR5-4800. CUDA 13.2 / driver 595.104.02, one request, no profiler.
 
-Both studies used one 16,180-token coding input, concurrency 1, fixed chunk 8192, greedy sampling / seed 1234, natural EOS with a maximum of 512, and 5,792 GPU-resident experts. The configured context ceiling was 1,048,576; the table does not validate that full context length. Cold-prefix requests reset the same initial expert membership, slots, heat and raw-cache state. Model loading and per-arm warmup were excluded. Each study used three A/B/A triples with interleaved controls.
+Each length ran in a separate process with one warmup and three formal requests, exactly 512 output tokens, greedy sampling, reset initial expert/adaptation state and no prefix reuse. The input repeats/truncates one LongSWE token stream to each length. Loading and warmup are excluded. These are synthetic length tests, not natural long-document quality evaluations.
 
-Main MoE fusion mode 2, fast scores and expert expansion, format-group adaptive residency, 40 registered host segments and 100% 2 MiB page coverage were retained. The current shared-pair study enabled 5-token adaptive verification in both arms and toggled only shared Gate/Up pairing. The earlier confidence study toggled adaptive verification while keeping its other settings fixed.
+| Input | Chunk | Initial residents | Prefill tok/s, mean ± sample SD | Decode tok/s, mean ± sample SD | Decode including drain, mean |
+|---:|---:|---:|---:|---:|---:|
+| 8192 | 8192 | 5571 | 3619.978 ± 11.526 | 34.312 ± 0.027 | 34.239 |
+| 32768 | 32768 | 4221 | 5769.141 ± 25.338 | 34.936 ± 0.010 | 34.787 |
+| 131072 | 32768 | 4221 | 6037.613 ± 40.617 | 35.048 ± 0.026 | 34.990 |
+| 524288 | 32768 | 4221 | 4499.192 ± 3.861 | 42.216 ± 0.038 | 42.091 |
 
-## Current cumulative experiment
+**Highest formal prefill: 6080.745399 tok/s**, case K128/M1, 131072 tokens / 21.555252094 seconds. Decode in that same request was 35.075439 tok/s. The four groups' highest decode was 42.250250 tok/s (K512/M3; use the CSV's full precision). The About historical decode peak of approximately 56 tok/s is from the older model and configuration described below; it was not obtained together with the 6081 prefill figure.
 
-| Round | A0 decode | B decode | A1 decode | B prefill | Output tokens, each arm |
-|---|---:|---:|---:|---:|---:|
-| 1 | 49.169 | 49.208 | 49.218 | 3611.406 | 445 |
-| 2 | 49.195 | 48.881 | 48.859 | 3610.493 | 445 |
-| 3 | 49.833 | 50.472 | 50.288 | 3615.252 | 512 |
+[All 12 formal measurements](../data/performance-20261023.csv) and [derived summary/provenance](../data/performance-summary-20261023.json) are included. Raw prompts, outputs, token arrays, logits and traces remain private.
 
-Rates are tokens/s. Candidate B means: **3612.384 prefill / 49.520 decode**. All three local A/B/A triples matched outputs, prefill logits and acceptance trajectories internally. Round 3 differed from the initial reference, and a separate trace process differed again. No warmup was included in these means; no failed-consistency round was silently removed.
+## Configuration and timing boundaries
 
-The paired shared-projection decode change was **+0.184%**, sample standard deviation **0.576 percentage points**: no material whole-request speedup was established. Its isolated projection benefit and numerical checks justified experimental adoption. This is not a claim that the current implementation is generally faster than the earlier row below.
+- Prefill = input tokens / Runtime native `prefill_ms`. The CSV separately preserves request-side prefill wall time; neither is HTTP client TTFT.
+- Decode = output tokens / generation wall time including draft and target verification. Final adaptive drain is recorded separately, with a second rate that includes it.
+- The 8192 chunk uses 6720 MiB workspace and 68664950784 expert bytes. The 32768 chunk uses 23823646720 workspace bytes and 51887734784 expert bytes. The combined budget stays fixed, but resident counts differ. Do not attribute the difference solely to input length.
+- All runs retained original DSpark, 5-token adaptive verification, Graph mask 2, mixed-format/BF16 contracts, online adaptive residency, 40 registered host blocks and 100% huge-page coverage. Sampled links were Gen5×16; no external CUDA compute processes were observed during measurements.
+- The benchmark used its saved calibrated ranking and heat. The automatic launcher instead offers a complete, uncalibrated ranking and zero heat when no calibrated pair is supplied. It has CPU/configuration coverage, not a fresh full-model or performance qualification.
+- No Nsight was requested for this sweep. There is no matching new timeline/Top10 or new bottleneck attribution for these four lengths. Historical operator/request diagnostics remain separate in the research archive.
 
-## Earlier adaptive verification experiment
+## 1M capacity and multimodal function
 
-Three candidate requests all produced 512 tokens; candidate means were **3413.186 prefill / 55.564 decode**. The six surrounding controls averaged 3432.222 / 52.080. The mean paired decode improvement was **6.690%**, while prefill changed −0.556%. This result belongs to the earlier process/build, before shared-pair integration. All nine timed requests matched outputs, but transient immutable-weight readback anomalies remained.
+The deployed Q2_K_XL service was configured for 1048576 context, chunk 8192, one slot and a 32768 default output cap. Actual 1M session state occupied 1000.523 MiB within the existing 1 GiB state budget. The calibrated startup retained 5571 experts and 40 blocks / 100% huge pages; short HTTP and client requests passed. This is capacity and functional evidence, not a complete 1M input or continuous 32K generation test.
 
-Both studies' 18 timed requests, including all controls, are in [performance-20261019.csv](../data/performance-20261019.csv); [performance-summary.json](../data/performance-summary.json) records candidate means and hashes of the private source summaries. Only derived measurements are distributed, not prompts, output text, token arrays, logits or raw traces.
+Both Unsloth quantizations have existing original-GGUF full-model execution evidence, and the IQ integration included original DSpark/BF16 vision API coverage. The new release shares the accepted runtime and one launcher, with variant-specific file hashes/budgets. This publication does not restart the running service or execute a new GPU request for either model. The newly packaged automatic metadata path is tested with CPU fixtures; its uncalibrated ranking has not been run as a new full-model benchmark. Image support means text + images, not audio/video qualification.
 
-## Timing definitions
+## Historical results
 
-- Prefill throughput: actual input token count divided by native prefill time.
-- Decode throughput: actual emitted output count divided by generate wall time, excluding the final drain. The CSV separately includes the rate with drain.
-- Request time: prefill wall time plus generation time. It is not an HTTP client TTFT or complete cold-start duration.
-- These are profiler-free experiment measurements. Separate diagnostic traces are not used as throughput samples.
-
-The shared prompt does not make different processes or different output lengths identical controls. Speculative acceptance, expert access and platform drift can change request speed. No general quality benchmark or representative production workload suite was completed.
-
-## Functional regression
-
-The later API regression used fixed chunk 8192, context 32768, one slot, 6720 MiB work and 1024 MiB state, with a 72,596,914,176-byte GPU expert budget. The original frozen profile admitted 5649 experts. This leaves room for image processing and differs from the 5792-resident timing configuration.
-
-All 38 HTTP cases met expectations: 29 real generations and nine expected HTTP 400 errors. Coverage included JSON and SSE on all three APIs, Unicode/code output, automatic tools and tool results, two image fixtures across all three APIs, thinking controls, malformed-input handling and a 13,037-token prompt crossing the 8192 chunk boundary. The supporting CPU checks comprised 75 tests in the original environment. Packaging checks are recorded separately in [source provenance](SOURCE_PROVENANCE.md).
-
-Actual memory coverage in that regression was 100% huge pages over 40 segments. Its isolated loader allowed a 99% minimum, but the published cumulative source retains the stricter 100% rule. The included portable starter removes machine-specific paths and preserves the arithmetic/settings of that regression, with the stricter admission rule. Fresh publication binaries have only build/CPU validation unless explicitly noted otherwise; they were not used for another full-model or performance run.
+The [October 19 snapshot](PERFORMANCE-20261019.md) records the earlier GSQ-RCO model and locally quantized DSpark, with all consistency warnings retained. Its approximately 56 tok/s peak decode (55.600490) and 55.564 mean belong to that historical configuration. They are not current Unsloth-model speed claims. The supported-model list now contains only the two Unsloth variants.
 
 ## Validation and limitations
 
-- Real-weight operator checks passed for the added scores, expansion, fusion, confidence and shared-pair paths within their recorded input/shape tolerances. The shared pair matched its original path bitwise.
-- Some same-process paired generation checks passed, but long-run/cross-process output or logits drift and intermittent weight-readback anomalies remain unresolved. A later successful read does not erase an earlier anomaly.
-- Functional API success does not establish broad model quality, production stability or equivalence to a high-precision checkpoint.
-- Adaptive verification in the included starter is greedy-only. The frozen cost table came from the tested 5792-resident configuration; its transfer to the 5649-resident functional profile has not been performance-qualified.
-- 7-token speculation was slower in its matched trials. CPU cold-expert overlap regressed decode and changed outputs. Neither is enabled by the supplied experimental starter.
-- The full private event timelines, phase-specific Top10 tables and raw traces remain in the local research archive. They are not part of this source distribution. No new profiling was performed for publication.
+- Accepted operator changes retain their recorded numerical/semantic gates and single-operation measurements. This publication copies their cumulative sources; it adds launch/metadata packaging rather than a new arithmetic or quantization method.
+- All four length groups produced identical output IDs across their three formal runs. The 32K group had a maximum prefill-logit relative L2 difference of 0.00176809541 (max absolute 0.0284321308); the other groups' prefill logits matched bitwise. All recorded logits were finite. Matching outputs are not a model-quality certification.
+- Historical same/cross-process output/logit drift and intermittent readback anomalies remain unresolved. Later successful checks do not erase those findings.
+- General task quality, full 1M input, continuous 32K output, long-running stability and other hardware/concurrency configurations have not been accepted.
+- The historical cost table and selected draft maps are retained; the adaptive starter is greedy-only. Changes in ranking, output language, cache behavior or residency can change acceptance and speed.
+- Publication verification consists of isolated Linux/CUDA builds, selected native CPU checks and Python API/configuration tests. Rebuilt binaries and the automatic starter do not acquire a GPU-performance claim from those checks. See [source provenance](SOURCE_PROVENANCE.md).

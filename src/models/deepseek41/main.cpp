@@ -136,6 +136,7 @@ int main(int argc,char** argv) {
             else if(a=="--logits")logits_path=next();else if(a=="--max-new")max_new=std::stoi(next());
             else if(a=="--prefix-save")prefix_save=next();else if(a=="--prefix-load")prefix_load=next();
             else if(a=="--draft-sha256")options.draft_sha256=next();
+            else if(a=="--vision-sha256")options.vision_sha256=next();
             else if(a=="--draft-vocab")options.draft_vocab=next();
             else if(a=="--draft-input-vocab")options.draft_input_vocab=next();
             else if(a=="--no-dspark-prefix-commit")options.dspark_prefix_commit=false;

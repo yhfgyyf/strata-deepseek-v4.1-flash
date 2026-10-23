@@ -21,7 +21,7 @@ private:
 // with a host-published (generation, sequence), including the initial generation.
 class ExpertPipeline {
 public:
-    struct Upload {const uint8_t* source;uint64_t bytes;};
+    struct Upload {const uint8_t* source;uint64_t bytes;int trace_layer=-1,trace_expert=-1;};
     ExpertPipeline(void* device,Pinned& host,uint64_t stride,int slots,cudaStream_t upload);
     ~ExpertPipeline();
     void start(uint64_t generation,size_t jobs,uint64_t bytes,std::function<void(size_t,uint8_t*)> fill,size_t active_slots = 0);

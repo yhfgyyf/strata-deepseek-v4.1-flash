@@ -291,7 +291,7 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, uint64_t array_limit = 128) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -341,10 +341,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
         // The raw PLE index needs all 128 shard positions. Large tokenizer
         // arrays still keep only a bounded sample.
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 128));
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, array_limit));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 128) v.items.push_back(std::move(e));
+            if (i < array_limit) v.items.push_back(std::move(e));
         }
         break;
     }
@@ -489,7 +489,11 @@ private:
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = c.str();
             MetaType t = (MetaType)c.read<uint32_t>();
-            meta_.emplace(std::move(key), read_value(c, t));
+            // This model data array replaces an I32 tensor in the PLE schema.
+            // Tokenizer arrays remain sampled; never truncate the Engram map.
+            const auto limit = key == "deepseek41.engram.token_map" ? uint64_t{129280} : uint64_t{128};
+            auto value = read_value(c, t, 0, limit);
+            meta_.emplace(std::move(key), std::move(value));
         }
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
@@ -513,7 +517,7 @@ private:
             if (a->u) align = a->u;
         alignment_ = align;
         data_start_ = (c.pos() + align - 1) / align * align;
-        if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
+        if (data_start_ > size_ && !tensors_.empty()) throw std::runtime_error("GGUF: data section starts past EOF");
     }
 
     std::string path_;

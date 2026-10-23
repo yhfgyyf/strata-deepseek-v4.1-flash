@@ -13,6 +13,16 @@ namespace strata::kernels {
 
 bool dequant_bf16_supported(int ggml_type) noexcept;
 
+/// Isolated Q6 comparison: 0 keeps group32, 1 enables wide, 2 also fuses requested BF16 rounding.
+/// Set before submitting work; the SM120 experimental baseline defaults to 2.
+void dequant_q6_set_mode(int mode);
+
+/// Try Q6 -> BF16-rounded values in FP32 storage. False means no work was launched.
+/// The caller retains its ordinary decode/round fallback for unsupported alignment or mode.
+bool dequant_q5_f32_bf16(const void* blocks, int64_t elements, float* out, void* stream);
+
+bool dequant_q6_f32_bf16(const void* blocks, int64_t elements, float* out, void* stream);
+
 /// `rows` rows of `cols` values starting at block row `row0` (so a caller can dequantize a slice of a tensor).
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream);

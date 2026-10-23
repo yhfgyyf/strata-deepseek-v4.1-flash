@@ -1,0 +1,9 @@
+{
+  "source": "Tokenizer-only Han/Latin/math/symbol selection, Unicode 14; no evaluation content used",
+  "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+  "input_count": 114801,
+  "output_count": 90000,
+  "input_sha256": "c95e7803d85ae74059422b3ac351aecff229d77a642f077697424fe36aa9e935",
+  "output_sha256": "ba800d716dba9f69d7b687690c5744d3ee1ac827428e188828e6aa49af78bd65",
+  "policy": "all added tokens, allowed atomic characters and byte fragments; fill by BPE merge rank within Han/Latin/math/symbol policy"
+}

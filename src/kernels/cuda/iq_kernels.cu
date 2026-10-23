@@ -10,6 +10,7 @@
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #define GGML_COMMON_DECL_CUDA
@@ -1664,6 +1665,7 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
 template<> __device__ __forceinline__ float cvt<float>(float v) { return v; }
 template<> __device__ __forceinline__ __half cvt<__half>(float v) { return __float2half(v); }
+template<> __device__ __forceinline__ __nv_bfloat16 cvt<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
 
 template<typename dst_t>
 __device__ void dq_iq2_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2905,6 +2907,15 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     if (n % 256 != 0 || !embed_type_supported(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst, nullptr);
     check("iq_dequant_f32");
+}
+
+void iq_dequant_bf16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+    if (n <= 0 || n % 256 != 0 || !embed_type_supported(t)) {
+        std::fprintf(stderr, "iq_dequant_bf16: bad arguments\n"); std::exit(1);
+    }
+    dequant_flat_kernel<__nv_bfloat16><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(
+        t, src, reinterpret_cast<__nv_bfloat16*>(dst), nullptr);
+    check("iq_dequant_bf16");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream,

@@ -41,15 +41,20 @@ void Session::Impl::eng(int layer,int count) {
     const auto& data=engram_ticket->wait();
     const double wait=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
     counters.engram_wait_ms+=wait;counters.engram_layer_wait_ms[which]+=wait;
-    gpu_check(cudaMemcpy2DAsync(work.engram_packed,24*272,data.data()+which*24*272,48*272,24*272,count,cudaMemcpyHostToDevice,runtime.stream.value));
-    gpu_check(dequant_gpu(work.engram_packed,8,work.engram_emb,int64_t(count)*6144,runtime.stream.value));runtime.round(work.engram_emb,int64_t(count)*6144);
+    const uint64_t row=runtime.model.engram_row_bytes();
+    if(data.size()!=uint64_t(count)*48*row)throw std::runtime_error("Engram packed batch size");
+    gpu_check(cudaMemcpy2DAsync(work.engram_packed,24*row,data.data()+which*24*row,48*row,24*row,count,cudaMemcpyHostToDevice,runtime.stream.value));
+    if(runtime.options.arithmetic==Arithmetic::production)
+        gpu_check(dequant_round_bf16_gpu(work.engram_packed,runtime.model.engram_type(),work.engram_emb,int64_t(count)*6144,runtime.stream.value));
+    else gpu_check(dequant_gpu(work.engram_packed,runtime.model.engram_type(),work.engram_emb,int64_t(count)*6144,runtime.stream.value));
     dump("engram_embd-"+std::to_string(layer),work.engram_emb,{count,6144});
     runtime.matmul(runtime.tensor(layer,"engram_wkv"),work.engram_emb,work.engram_kv,count,work);
     }
     if(engram_pipeline)dump("engram_embd-"+std::to_string(layer),work.engram_emb,{count,6144});
     dump("engram_kv-"+std::to_string(layer),work.engram_kv,{count,25600});
-    gpu_check(engram_gate_gpu(work.h,work.engram_kv,static_cast<const float*>(runtime.tensor(layer,"engram_q").data),
-        static_cast<const float*>(runtime.tensor(layer,"engram_k").data),work.image,count,5120,runtime.stream.value));runtime.round(work.h,int64_t(count)*20480);
+    const bool folded=runtime.model.ple_engram();
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?engram_gate_bf16_gpu:engram_gate_gpu)(work.h,work.engram_kv,static_cast<const float*>(runtime.tensor(layer,folded?"engram_gate":"engram_q").data),
+        folded?nullptr:static_cast<const float*>(runtime.tensor(layer,"engram_k").data),work.image,count,5120,runtime.stream.value));
     if(engram_pipeline)engram_pipeline->consume(which,batch_epoch,runtime.stream.value);
     dump("engram_out-"+std::to_string(layer),work.h,{count,4,5120});
 }
@@ -77,11 +82,10 @@ void Session::Impl::compression(int layer,int count,int64_t start,bool only) {
     } else gpu_check(cudaMemcpyAsync(work.latent,work.comp_raw,int64_t(count)*512*4,cudaMemcpyDeviceToDevice,stream));
     if(groups) {
         runtime.round(work.latent,int64_t(groups)*512);
-        gpu_check(rms_gpu(work.latent,static_cast<const float*>(runtime.tensor(layer,"attn_compressor_norm").data),work.latent,512,groups,runtime.model.geometry().norm_eps,stream));
-        runtime.round(work.latent,int64_t(groups)*512);
+        gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.latent,static_cast<const float*>(runtime.tensor(layer,"attn_compressor_norm").data),work.latent,512,groups,runtime.model.geometry().norm_eps,stream));
         // Index K consumes the unrotated latent. Each row has the first absolute position of its group.
         runtime.matmul(runtime.tensor(layer,"indexer.attn_k"),work.latent,work.index_k,groups,work);
-        gpu_check(rms_gpu(work.index_k,static_cast<const float*>(runtime.tensor(layer,"indexer.k_norm").data),work.index_k,128,groups,runtime.model.geometry().norm_eps,stream));runtime.round(work.index_k,int64_t(groups)*128);
+        gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.index_k,static_cast<const float*>(runtime.tensor(layer,"indexer.k_norm").data),work.index_k,128,groups,runtime.model.geometry().norm_eps,stream));
         gpu_check(rotate_strided_gpu(work.index_k,1,128,groups,(start/ratio)*ratio,ratio,runtime.model.geometry(),true,false,stream));runtime.round(work.index_k,int64_t(groups)*128);
         if(runtime.options.arithmetic==Arithmetic::f32)
             gpu_check(cudaMemcpyAsync(cache.index_values+cache.rows*128,work.index_k,int64_t(groups)*128*4,cudaMemcpyDeviceToDevice,stream));
@@ -100,6 +104,81 @@ void Session::Impl::compression(int layer,int count,int64_t start,bool only) {
     if(cache.rows!=cache.position/ratio)throw std::runtime_error("DeepSeek compressed row count");
     if(only)counters.kv_only_tokens+=count;
 }
+void Runtime::Impl::decode_segment(int part,int layer,int tokens,Workspace& w,bool eligible,const std::function<void()>& body) {
+    if(!(decode_segment_mask&(1u<<part)) || !eligible || tokens<1 || tokens>8 || (part==1 && tokens==1)){
+        if(decode_segment_mask&(1u<<part))++w.segment_fallbacks[part];
+        body();return;
+    }
+    auto& graph=w.decode_segments[part][layer][tokens-1];
+    auto& disabled=w.decode_segment_disabled[part][layer][tokens-1];
+    if(disabled){++w.segment_fallbacks[part];body();return;}
+    std::string error;
+    if(!graph.valid()){
+        constexpr uint64_t cache_limit=128ull<<20;
+        size_t before=0,total=0;gpu_check(cudaMemGetInfo(&before,&total));
+        if(before<options.gpu_headroom+(16ull<<20) || w.segment_cache_bytes>=cache_limit){
+            disabled=true;++w.segment_fallbacks[part];body();return;
+        }
+        const auto begin=std::chrono::steady_clock::now();
+        if(!graph.begin(stream.value,error))throw std::runtime_error("DeepSeek decode segment "+error);
+        try{body();}
+        catch(...){cudaGraph_t abandoned=nullptr;cudaStreamEndCapture(stream.value,&abandoned);if(abandoned)cudaGraphDestroy(abandoned);throw;}
+        if(!graph.end(stream.value,error))throw std::runtime_error("DeepSeek decode segment "+error);
+        size_t after=0;gpu_check(cudaMemGetInfo(&after,&total));
+        const uint64_t charged=before>after?before-after:0;
+        if(after<options.gpu_headroom || charged>cache_limit-w.segment_cache_bytes){
+            // Capture has not executed. Discard it before the one eager execution.
+            graph=core::CapturedGraph{};disabled=true;++w.segment_fallbacks[part];
+            gpu_check(cudaMemGetInfo(&after,&total));
+            if(after<options.gpu_headroom)throw std::runtime_error("DeepSeek graph headroom guard");
+            body();return;
+        }
+        w.segment_cache_bytes+=charged;w.segment_nodes[part]+=graph.nodes();++w.segment_captures[part];
+        w.segment_capture_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();
+    }
+    // A failed launch fails the request: never replay its writes through eager fallback.
+    if(!graph.launch(stream.value,error))throw std::runtime_error("DeepSeek decode segment "+error);
+    ++w.segment_replays[part];
+}
+void Session::Impl::attention_input(int layer,int count,const std::function<void()>& before_q) {
+    const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
+    auto mixes=[&](const char* stage,float* pre){
+        gpu_check(hc_project_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,5120,count,g.norm_eps,stream));
+        gpu_check(hc_split_gpu(work.mixes,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_scale").data),
+            static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_base").data),pre,work.post,work.comb,count,g.hc_eps,g.sinkhorn_iters,stream));
+    };
+    mixes("attn",work.attn_pre);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.pre,work.x,5120,count,stream));
+    dump("hc_attn_pre-"+std::to_string(layer),work.x,{count,5120});
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),work.x,5120,count,g.norm_eps,stream));
+    dump("attn_norm-"+std::to_string(layer),work.x,{count,5120});
+    if(before_q)before_q();
+    runtime.matmul(runtime.tensor(layer,"attn_q_a"),work.x,work.qr,count,work);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),work.qr,1280,count,g.norm_eps,stream));
+    dump("qr-"+std::to_string(layer),work.qr,{count,1280});
+    runtime.matmul(runtime.tensor(layer,"attn_q_b"),work.qr,work.q,count,work);
+}
+void Session::Impl::attention_output(int layer,int count,bool with_routes) {
+    const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
+    const auto& wo=runtime.tensor(layer,"attn_output_a");
+    for(int group=0;group<8;++group)runtime.matmul(wo,work.q+group*4096,work.o_low+group*1024,count,work,
+        1024,32768,8192,int64_t(group)*1024*4096);
+    runtime.matmul(runtime.tensor(layer,"attn_output_b"),work.o_low,work.branch,count,work);
+    dump("attn_out-"+std::to_string(layer),work.branch,{count,5120});
+    auto mixes=[&](const char* stage,float* pre){
+        gpu_check(hc_project_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,5120,count,g.norm_eps,stream));
+        gpu_check(hc_split_gpu(work.mixes,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_scale").data),
+            static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_base").data),pre,work.post,work.comb,count,g.hc_eps,g.sinkhorn_iters,stream));
+    };
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_post_bf16_gpu:hc_post_gpu)(work.h,work.branch,work.post,work.comb,work.h,5120,count,stream));
+    dump("hc_attn_post-"+std::to_string(layer),work.h,{count,4,5120});
+    mixes("ffn",work.pre);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.attn_pre,work.x,5120,count,stream));
+    dump("hc_ffn_pre-"+std::to_string(layer),work.x,{count,5120});
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,5120,count,g.norm_eps,stream));
+    dump("ffn_norm-"+std::to_string(layer),work.x,{count,5120});
+    if(with_routes)runtime.route(layer,count,work);
+}
 void Session::Impl::attention(int layer,int count,int64_t start) {
     const auto& g=runtime.model.geometry();const auto& own=runtime.model.ownership()[layer];
     const auto stream=runtime.stream.value;
@@ -107,14 +186,10 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
     if(swa.position<0){swa.position=start;swa.count=0;}
     if(swa.position!=start)throw std::runtime_error("DeepSeek local SWA watermark layer="+std::to_string(layer));
     const int previous=swa.count,total=previous+count;
-    runtime.matmul(runtime.tensor(layer,"attn_q_a"),work.x,work.qr,count,work);
-    gpu_check(rms_gpu(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),work.qr,1280,count,g.norm_eps,stream));runtime.round(work.qr,int64_t(count)*1280);
-    dump("qr-"+std::to_string(layer),work.qr,{count,1280});
-    runtime.matmul(runtime.tensor(layer,"attn_q_b"),work.qr,work.q,count,work);
     gpu_check(rotate_gpu(work.q,64,512,count,start,g,own.compression!=0,false,stream));runtime.round(work.q,int64_t(count)*32768);
     dump("q-"+std::to_string(layer),work.q,{count,64,512});
     runtime.matmul(runtime.tensor(layer,"attn_kv"),work.x,work.kv,count,work);
-    gpu_check(rms_gpu(work.kv,static_cast<const float*>(runtime.tensor(layer,"attn_kv_a_norm").data),work.kv,512,count,g.norm_eps,stream));runtime.round(work.kv,int64_t(count)*512);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.kv,static_cast<const float*>(runtime.tensor(layer,"attn_kv_a_norm").data),work.kv,512,count,g.norm_eps,stream));
     gpu_check(rotate_gpu(work.kv,1,512,count,start,g,own.compression!=0,false,stream));runtime.round(work.kv,int64_t(count)*512);
     dump("kv-"+std::to_string(layer),work.kv,{count,512});
     const int ring_begin=(start-previous)%128;
@@ -158,9 +233,12 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
                         compressed->index_values,compressed->index_packed,nullptr,work.scores,n,rows,at,own.compression,stream));
                     if(layer==20){
                         gpu_check(candidate_scores_gpu(work.scores,work.block_scores,n,rows,at,own.compression,stream));
-                        work.block_sort.temporary_bytes=work.block_sort_capacity;
-                        gpu_check(sort_index_gpu(work.block_scores,n,(rows+7)/8,work.block_sort,stream));
-                        gpu_check(candidate_blocks_gpu(work.block_sort,candidates,n,rows,stream));
+                        if((rows+7)/8<=2048)gpu_check(candidate_all_blocks_gpu(work.block_scores,candidates,n,(rows+7)/8,stream));
+                        else {
+                            work.block_sort.temporary_bytes=work.block_sort_capacity;
+                            gpu_check(sort_index_gpu(work.block_scores,n,(rows+7)/8,work.block_sort,stream));
+                            gpu_check(candidate_blocks_gpu(work.block_sort,candidates,n,rows,stream));
+                        }
                     }
                     work.sort.temporary_bytes=work.sort_capacity;
                     gpu_check(sort_index_gpu(work.scores,n,width,work.sort,stream));
@@ -192,8 +270,8 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
             for(int t=0;t<count;++t){p.q=work.q_bf+int64_t(t)*32768;p.output=work.out_bf+int64_t(t)*32768;
                 p.swa_slots=work.swa_slots+int64_t(t)*128;
                 p.global_slots=own.compression?work.global_slots+int64_t(t)*512:nullptr;
-                gpu_check(packed_attention_gpu(p,stream));}
-        }else gpu_check(packed_attention_gpu(p,stream));
+                gpu_check(packed_attention_cake_gpu(p,reinterpret_cast<int32_t*>(work.qr),size_t(count)*1280*4,stream));}
+        }else gpu_check(packed_attention_cake_gpu(p,reinterpret_cast<int32_t*>(work.qr),size_t(count)*1280*4,stream));
         gpu_check(bf16_to_float_gpu(work.out_bf,work.q,int64_t(count)*32768,stream));
     }
     // SWA is private to every layer, including readers of shared global/index storage.
@@ -204,11 +282,7 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
     swa.position=start+count;swa.count=keep;
     gpu_check(rotate_gpu(work.q,64,512,count,start,g,own.compression!=0,true,stream));runtime.round(work.q,int64_t(count)*32768);
     dump("attn_derope-"+std::to_string(layer),work.q,{count,64,512});
-    const auto& wo=runtime.tensor(layer,"attn_output_a");
-    for(int group=0;group<8;++group)runtime.matmul(wo,work.q+group*4096,work.o_low+group*1024,count,work,
-        1024,32768,8192,int64_t(group)*1024*4096);
-    runtime.matmul(runtime.tensor(layer,"attn_output_b"),work.o_low,work.branch,count,work);
-    dump("attn_out-"+std::to_string(layer),work.branch,{count,5120});
+
 }
 void Session::Impl::layers(int count,int64_t start,int first,int last,bool prefill,const BlockBenchmarkHooks* hooks) {
     const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
@@ -226,34 +300,23 @@ void Session::Impl::layers(int count,int64_t start,int first,int last,bool prefi
         check_cancel();
         if(layer==1||layer==14)eng(layer,count);
         capture_hidden(layer,count,start);
-        auto mixes=[&](const char* stage,float* pre){
-            gpu_check(hc_project_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,5120,count,g.norm_eps,stream));
-            gpu_check(hc_split_gpu(work.mixes,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_scale").data),
-                static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_base").data),pre,work.post,work.comb,count,g.hc_eps,g.sinkhorn_iters,stream));
-        };
-        mixes("attn",work.attn_pre);
-        gpu_check(hc_pre_gpu(work.h,work.pre,work.x,5120,count,stream));runtime.round(work.x,int64_t(count)*5120);
-        dump("hc_attn_pre-"+std::to_string(layer),work.x,{count,5120});
-        gpu_check(rms_gpu(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),work.x,5120,count,g.norm_eps,stream));runtime.round(work.x,int64_t(count)*5120);
-        dump("attn_norm-"+std::to_string(layer),work.x,{count,5120});
-        if(hooks && layer==first){
+        const bool graph_eligible=!prefill && count>=1 && count<=8 && !hooks && !capture.enabled() &&
+            runtime.options.arithmetic==Arithmetic::production && runtime.options.pcie_frac==1 &&
+            runtime.options.slots==1;
+        std::function<void()> before_q;
+        if(hooks && layer==first)before_q=[&]{
             hooks->attention_begin();
-            // The isolated comparison gives neither arm pre-timer expert DMA.
             if(lookahead)runtime.begin_expert_prefetch(first,last,counters);
-        }
+        };
+        runtime.decode_segment(0,layer,count,work,graph_eligible,[&]{attention_input(layer,count,before_q);});
         attention(layer,count,start);
-        gpu_check(hc_post_gpu(work.h,work.branch,work.post,work.comb,work.h,5120,count,stream));runtime.round(work.h,int64_t(count)*20480);
-        dump("hc_attn_post-"+std::to_string(layer),work.h,{count,4,5120});
-        mixes("ffn",work.pre);
-        gpu_check(hc_pre_gpu(work.h,work.attn_pre,work.x,5120,count,stream));runtime.round(work.x,int64_t(count)*5120);
-        dump("hc_ffn_pre-"+std::to_string(layer),work.x,{count,5120});
-        gpu_check(rms_gpu(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,5120,count,g.norm_eps,stream));runtime.round(work.x,int64_t(count)*5120);
-        dump("ffn_norm-"+std::to_string(layer),work.x,{count,5120});
+        const bool route_graph=graph_eligible && count>=2 && (runtime.decode_segment_mask&2);
+        runtime.decode_segment(1,layer,count,work,route_graph,[&]{attention_output(layer,count,route_graph);});
         runtime.moe(layer,count,work,counters,prefill?(ced&&layer>=20?1:0):2,
-            transaction_active&&transaction_routes_deferred&&!prefill?&transaction_routes[layer]:nullptr);
+            transaction_active&&transaction_routes_deferred&&!prefill?&transaction_routes[layer]:nullptr,route_graph);
         if(ced&&last_encoder_chunk&&layer<20)runtime.experts->encoder_layer_done(layer,stream,counters);
         dump("ffn_out-"+std::to_string(layer),work.branch,{count,5120});
-        gpu_check(hc_post_gpu(work.h,work.branch,work.post,work.comb,work.h,5120,count,stream));runtime.round(work.h,int64_t(count)*20480);
+        gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_post_bf16_gpu:hc_post_gpu)(work.h,work.branch,work.post,work.comb,work.h,5120,count,stream));
         dump("l_last-"+std::to_string(layer),work.h,{count,4,5120});
         if(hooks && layer==last-1)hooks->last_block_end();
         if(layer<20)counters.encoder_token_layers+=count;else counters.decoder_token_layers+=count;
@@ -264,9 +327,9 @@ void Session::Impl::layers(int count,int64_t start,int first,int last,bool prefi
 }
 std::vector<float> Session::Impl::logits(int count,bool all) {
     const auto stream=runtime.stream.value;const auto& g=runtime.model.geometry();
-    gpu_check(hc_pre_gpu(work.h,work.pre,work.x,5120,count,stream));runtime.round(work.x,int64_t(count)*5120);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.pre,work.x,5120,count,stream));
     dump("hc_out",work.x,{count,5120});
-    gpu_check(rms_gpu(work.x,static_cast<const float*>(runtime.weights->at("output_norm.weight").data),work.x,5120,count,g.norm_eps,stream));runtime.round(work.x,int64_t(count)*5120);
+    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.weights->at("output_norm.weight").data),work.x,5120,count,g.norm_eps,stream));
     dump("result_norm",work.x,{count,5120});
     const int rows=all||capture.enabled()?count:1;
     std::vector<float> result(int64_t(rows)*129280);

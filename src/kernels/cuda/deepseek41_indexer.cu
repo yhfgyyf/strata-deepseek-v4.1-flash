@@ -97,6 +97,24 @@ __global__ void candidate_blocks_kernel(const float* scores,const int* ids,int32
     }
     for(int i=threadIdx.x;i<2048;i+=blockDim.x)out[int64_t(token)*2048+i]=selected[i]==INT_MAX?-1:selected[i];
 }
+__global__ void all_candidates(const float* scores,int* out,int blocks){
+    const int token=blockIdx.x,lane=threadIdx.x%32,warp=threadIdx.x/32;
+    __shared__ int counts[64],offsets[64];
+    for(int i=threadIdx.x;i<2048;i+=256)out[token*2048+i]=-1;
+    for(int segment=warp;segment<64;segment+=8){
+        const int i=segment*32+lane;
+        const unsigned valid=__ballot_sync(0xffffffff,i<blocks&&scores[token*blocks+i]>-INFINITY);
+        if(!lane)counts[segment]=__popc(valid);
+    }
+    __syncthreads();
+    if(!threadIdx.x){int sum=0;for(int i=0;i<64;++i){offsets[i]=sum;sum+=counts[i];}}
+    __syncthreads();
+    for(int segment=warp;segment<64;segment+=8){
+        const int i=segment*32+lane;
+        const unsigned valid=__ballot_sync(0xffffffff,i<blocks&&scores[token*blocks+i]>-INFINITY);
+        if(valid&(1u<<lane))out[token*2048+offsets[segment]+__popc(valid&((1u<<lane)-1))]=i;
+    }
+}
 int grid(int64_t n){return std::min<int64_t>((n+255)/256,65535);}
 }
 cudaError_t index_scores_gpu(const float* q,const float* weights,const float* keys,const uint8_t* packed,const uint8_t* candidates,
@@ -133,6 +151,10 @@ cudaError_t candidate_mask_gpu(const IndexSortBuffers& b,uint8_t* selected,uint8
     status=cudaGetLastError();if(status!=cudaSuccess)return status;
     expand_blocks_kernel<<<grid(int64_t(tokens)*rows),256,0,stream>>>(selected,mask,rows,blocks,start,ratio,int64_t(tokens)*rows);
     return cudaGetLastError();
+}
+cudaError_t candidate_all_blocks_gpu(const float* scores,int32_t* out,int tokens,int blocks,cudaStream_t stream) {
+    if(!scores||!out||tokens<1||blocks<1||blocks>2048)return cudaErrorInvalidValue;
+    all_candidates<<<tokens,256,0,stream>>>(scores,out,blocks);return cudaGetLastError();
 }
 cudaError_t candidate_blocks_gpu(const IndexSortBuffers& b,int32_t* out,int tokens,int rows,cudaStream_t stream){
     if(!b.sorted_scores||!b.sorted_ids||!out||tokens<1||rows<1)return cudaErrorInvalidValue;

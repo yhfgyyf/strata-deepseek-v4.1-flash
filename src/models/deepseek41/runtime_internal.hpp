@@ -78,7 +78,8 @@ private:
 };
 void matrix_product(const Matrix& weight,const float* input,float* output,int tokens,cublasHandle_t blas,
                     cudaStream_t stream,uint16_t* bf_input,Arithmetic arithmetic,int rows = 0,
-                    int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true,bool verify_batch = false);
+                    int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true,bool verify_batch = false,
+                    int bf_scratch_cols = 0);
 struct VisionWork {
     float *patches,*h,*norm,*qkv,*q,*k,*v,*attention,*branch,*gate,*up,*activation,*aligned,*projected,*features,*span;
     explicit VisionWork(core::DeviceArena& arena){WorkspaceLayout layout(&arena);init(layout);}
@@ -184,7 +185,7 @@ private:
     std::array<std::vector<double>,3> route_counts_;
     std::array<uint64_t,3> resident_hits_{};
     std::vector<double> physical_counts_;
-    int fd_ = -1;
+    std::map<std::string,int> fds_;
 };
 struct Capture {
     std::filesystem::path root;
@@ -273,6 +274,12 @@ struct Workspace {
     int* host_ids = nullptr;
     int *host_group_rows = nullptr, *host_group_slots = nullptr;
     float* host_group_weights = nullptr;
+    // Graphs own only static weight/workspace addresses, never Session/KV state.
+    // Destruction precedes the arena and pinned host buffers they reference.
+    std::array<std::array<std::array<core::CapturedGraph,8>,40>,2> decode_segments;
+    std::array<std::array<std::array<bool,8>,40>,2> decode_segment_disabled{};
+    std::array<uint64_t,2> segment_captures{},segment_replays{},segment_fallbacks{},segment_nodes{};
+    uint64_t segment_cache_bytes=0,segment_capture_ns=0;
     Workspace(uint64_t budget, int tokens, int context,bool compact_logits = false,bool compact_workspace = false,bool dspark = false);
     static uint64_t bytes_needed(int tokens,const RuntimeOptions& options,bool vision=false);
     void extras(WorkspaceLayout& layout,const RuntimeOptions& options);
@@ -282,7 +289,7 @@ private:
 };
 class EngramPipeline {
 public:
-    EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace = false,bool huge_pinned = true);
+    EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace = false,bool huge_pinned = true,uint32_t packed_type = 8);
     ~EngramPipeline();
     void start(std::shared_ptr<EngramBatch> ticket,uint64_t sequence,int count,const Matrix& first,const Matrix& second);
     void wait(int table,uint64_t generation,uint64_t sequence,cudaStream_t consumer);
@@ -292,6 +299,8 @@ private:
     Workspace& work_;
     Arithmetic arithmetic_;
     bool trace_;
+    uint32_t packed_type_;
+    uint64_t row_bytes_;
     Stream stream_;
     std::array<Event,2> ready_,consumed_;
     Event copied_;
@@ -326,6 +335,7 @@ struct Runtime::Impl {
     std::unique_ptr<VisionWork> vision_work;
     std::unique_ptr<DraftWeights> draft_weights;
     std::unique_ptr<DraftWork> draft_work;
+    unsigned decode_segment_mask = 0; // Experimental bits: input=1, output/router=2.
     int active_sessions = 0;
     std::unique_ptr<core::DeviceArena> ring;
     std::unique_ptr<Pinned> host_ring;
@@ -349,8 +359,13 @@ struct Runtime::Impl {
     void matmul(const Matrix& weight,const float* x,float* out,int tokens,Workspace& work,
                 int rows = 0,int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true);
     void round(float* x,uint64_t n);
-    const Matrix& tensor(int layer,const std::string& suffix) const { return weights->at("blk." + std::to_string(layer) + "." + suffix + ".weight"); }
-    void moe(int layer,int tokens,Workspace& work,ExecutionStats& stats,int phase,std::vector<int>* deferred_routes=nullptr);
+    const Matrix& tensor(int layer,const std::string& suffix) const {
+        const auto name=model.ple_engram()&&suffix=="engram_wkv"?"engram_kv":suffix;
+        return weights->at("blk." + std::to_string(layer) + "." + name + ".weight");
+    }
+    void moe(int layer,int tokens,Workspace& work,ExecutionStats& stats,int phase,std::vector<int>* deferred_routes=nullptr,bool routes_ready=false);
+    void route(int layer,int tokens,Workspace& work);
+    void decode_segment(int part,int layer,int tokens,Workspace& work,bool eligible,const std::function<void()>& body);
     void begin_expert_prefetch(int first,int last,ExecutionStats& stats);
     void prune_expert_prefetch(int layer,const std::array<bool,384>& selected,ExecutionStats& stats);
     void retire_expert_prefetch(size_t until,ExecutionStats& stats);
@@ -412,6 +427,8 @@ struct Session::Impl {
     void compression(int layer,int count,int64_t start,bool only);
     void capture_partial(int layer,int count,int64_t start);
     void commit_routes(int keep);
+    void attention_input(int layer,int count,const std::function<void()>& before_q = {});
+    void attention_output(int layer,int count,bool with_routes);
     void attention(int layer,int count,int64_t start);
     void layers(int count,int64_t start,int first,int last,bool prefill = false,const BlockBenchmarkHooks* hooks = nullptr);
     std::vector<float> logits(int count,bool all = false);

@@ -18,6 +18,7 @@ void run(int producer_delay,int consumer_delay) {
     constexpr int slots=4,stride=4096,payload=4000,jobs=17; // > 4 wraps, non-full tail.
     strata::core::DeviceArena arena(slots*stride+256);auto* raw=static_cast<uint8_t*>(arena.alloc(slots*stride));
     auto* failures=static_cast<int*>(arena.alloc(256));d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     d::Pinned host(slots*stride);d::Stream upload,reader;
     d::ExpertPipeline pipeline(raw,host,stride,slots,upload.value);
     for(uint64_t generation=1;generation<=3;++generation) {
@@ -62,6 +63,7 @@ void raw_cache_reuse_and_prefill_fence(){
     constexpr int stride=4096,payload=4000;
     strata::core::DeviceArena arena(12*stride+256);auto* raw=static_cast<uint8_t*>(arena.alloc(12*stride));
     auto* failures=static_cast<int*>(arena.alloc(256));d::gpu_check(cudaMemset(raw,0xa5,12*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     d::Stream reader,overwrite;d::DecodeRawCache cache(raw+8*stride,stride,4,reader.value);
     auto put=[&](int key,uint8_t value){
         d::gpu_check(cudaMemsetAsync(raw,value,payload,reader.value));
@@ -93,6 +95,7 @@ void verification_cache_reserved_slots(){
     d::Stream upload,reader;d::ExpertPipeline pipeline(raw,scratch,stride,slots,upload.value);
     d::DecodeRawCache cache(raw+8*stride,stride,slots-8,reader.value);
     d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     uint64_t generation=0;
     for(bool direct:{false,true})for(int tokens:{1,2,5,6,8,0,8,1}){
         ++generation;const bool full_ring=tokens==0;const int jobs=full_ring?73:tokens*6;
@@ -145,6 +148,7 @@ void direct_variable_sources(){
     need(source.pinned && scratch.pinned,"direct source test needs pinned memory");
     d::Stream upload,reader;d::ExpertPipeline pipeline(raw,scratch,stride,slots,upload.value);
     d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     for(uint64_t generation=1;generation<=3;++generation){
         std::vector<d::ExpertPipeline::Upload> plan;
         for(int i=0;i<jobs;++i){
@@ -200,6 +204,7 @@ void discard_unissued_direct(){
     auto* failures=static_cast<int*>(arena.alloc(256));d::Pinned source(jobs*stride),scratch(slots*stride);
     d::Stream upload,reader;d::ExpertPipeline pipeline(raw,scratch,stride,slots,upload.value);
     d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     auto plan=[&](int generation){
         std::vector<d::ExpertPipeline::Upload> uploads;
         for(int i=0;i<jobs;++i){
@@ -255,6 +260,7 @@ void unused_reclaim_without_compute_dependency(){
     d::Stream upload,reader;d::Event delayed;
     d::ExpertPipeline pipeline(raw,scratch,stride,slots,upload.value);
     d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));
+    d::gpu_check(cudaStreamSynchronize(nullptr)); // Initialize before either nonblocking stream.
     // Warm the test kernel before the measured dependency check, including its
     // module load. A delayed unrelated compute stream must not hold raw slots.
     delay_reader<<<1,1,0,reader.value>>>(1);d::gpu_check(cudaGetLastError());d::gpu_check(cudaStreamSynchronize(reader.value));

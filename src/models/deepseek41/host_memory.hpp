@@ -6,6 +6,7 @@
 #include <thread>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,7 @@ struct HostMemoryInfo {
     uint64_t logical=0,mapped=0,huge_before=0,huge_after=0,attempted_huge=0;
     uint64_t registration_count=0,largest_registration=0;
     double allocation_ms=0,registration_ms=0;
+    unsigned required_huge_percent=100;
     const char* mode="ordinary";
     const char* fallback="none";
     void write(std::ostream& out)const {
@@ -33,9 +35,21 @@ struct HostMemoryInfo {
            <<",\"attempted_huge_bytes\":"<<attempted_huge
            <<",\"registration_count\":"<<registration_count<<",\"largest_registration_bytes\":"<<largest_registration
            <<",\"allocation_ms\":"<<allocation_ms<<",\"registration_ms\":"<<registration_ms
+           <<",\"required_huge_percent\":"<<required_huge_percent
            <<",\"mode\":\""<<mode<<"\",\"fallback\":\""<<fallback<<"\"}";
     }
 };
+inline unsigned block_huge_min_percent(){
+    const char* value=std::getenv("STRATA_DS41_BLOCK_HUGE_MIN_PERCENT");
+    if(!value || std::strcmp(value,"100")==0)return 100;
+    if(std::strcmp(value,"98")==0)return 98;
+    throw std::invalid_argument("DeepSeek block huge-page minimum must be 98 or 100");
+}
+inline bool host_huge_sufficient(uint64_t huge,uint64_t mapped,unsigned percent){
+    if(!mapped || huge>mapped || (percent!=98&&percent!=100))return false;
+    const auto required=(mapped/100)*percent+((mapped%100)*percent+99)/100;
+    return huge>=required;
+}
 inline double host_elapsed(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
 }
@@ -53,10 +67,11 @@ public:
 #endif
         reservation_=nullptr;data_=nullptr;reserved_=bytes_=0;
     }
-    bool allocate(uint64_t count,HostMemoryInfo& info){
+    bool allocate(uint64_t count,HostMemoryInfo& info,unsigned minimum_percent=100){
         if(data_)throw std::logic_error("host region already allocated");
         const auto start=std::chrono::steady_clock::now();
-        info.logical=count;
+        info.logical=count;info.required_huge_percent=minimum_percent;
+        if(minimum_percent!=98&&minimum_percent!=100)throw std::invalid_argument("DeepSeek huge-page minimum");
         if(!count || count>SIZE_MAX-4*page){info.fallback="size";return false;}
 #ifdef __linux__
         uint64_t pmd_size=0;
@@ -91,7 +106,7 @@ public:
             if(status&&error!=ENOMEM&&error!=EAGAIN)break;
         }
         info.allocation_ms=host_elapsed(start);
-        if(info.huge_before!=bytes_){info.attempted_huge=info.huge_before;info.huge_before=0;info.fallback="incomplete_thp";reset();return false;}
+        if(!host_huge_sufficient(info.huge_before,bytes_,minimum_percent)){info.attempted_huge=info.huge_before;info.huge_before=0;info.fallback="incomplete_thp";reset();return false;}
         return true;
 #else
         info.fallback="platform";return false;
@@ -144,7 +159,7 @@ private:
     bool registered_=false;
 };
 inline bool register_huge(HugeHostRegion& region,std::vector<std::unique_ptr<HostRegistration>>& registrations,
-                          uint64_t count,HostMemoryInfo& info,const std::vector<uint64_t>& boundaries={}){
+                          uint64_t count,HostMemoryInfo& info,const std::vector<uint64_t>& boundaries={},unsigned minimum_percent=100){
     if(!boundaries.empty()){
         if(boundaries.size()<2 || boundaries.front()!=0 || boundaries.back()!=count)
             throw std::invalid_argument("DeepSeek host registration boundaries");
@@ -152,7 +167,7 @@ inline bool register_huge(HugeHostRegion& region,std::vector<std::unique_ptr<Hos
             if(boundaries[i]<=boundaries[i-1] || boundaries[i]%HugeHostRegion::page)
                 throw std::invalid_argument("DeepSeek host registration alignment");
     }
-    if(!region.allocate(count,info))return false;
+    if(!region.allocate(count,info,minimum_percent))return false;
     const auto start=std::chrono::steady_clock::now();
     std::vector<std::unique_ptr<HostRegistration>> pending;
     try{
@@ -166,11 +181,12 @@ inline bool register_huge(HugeHostRegion& region,std::vector<std::unique_ptr<Hos
         info.registration_ms=host_elapsed(start);
         if(pending.size()==spans.size()-1){
             info.huge_after=region.huge_bytes();
-            if(info.huge_after==region.size()){
+            if(host_huge_sufficient(info.huge_after,region.size(),minimum_percent)){
                 for(const auto& owner:pending)info.largest_registration=std::max(info.largest_registration,owner->bytes);
                 info.registration_count=pending.size();
                 registrations=std::move(pending);
-                info.mode=boundaries.empty()?"registered_2m":"registered_2m_blocks";return true;
+                info.mode=info.huge_after==region.size()?(boundaries.empty()?"registered_2m":"registered_2m_blocks"):
+                    (boundaries.empty()?"registered_mixed_pages":"registered_blocks_mixed_pages");return true;
             }
             info.fallback="post_register_thp";
         }else info.fallback="registration";
@@ -184,10 +200,11 @@ public:
         if(get())throw std::logic_error("expert host arena already allocated");
         info.logical=count;
         if(prefer_huge){
-            if(register_huge(huge_,registrations_,count,info,boundaries))return;
+            const auto minimum=boundaries.empty()?100:block_huge_min_percent();
+            if(register_huge(huge_,registrations_,count,info,boundaries,minimum))return;
             if(!boundaries.empty()){
                 std::cerr<<"DeepSeek host_memory rejected ";info.write(std::cerr);std::cerr<<'\n';
-                throw std::runtime_error("DeepSeek block-pinned memory requires 100% huge-page registration");
+                throw std::runtime_error("DeepSeek block-pinned memory requires "+std::to_string(minimum)+"% huge-page registration");
             }
         }
         const auto start=std::chrono::steady_clock::now();

@@ -6,12 +6,14 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <type_traits>
+#include <atomic>
 
 namespace strata::kernels {
 namespace {
@@ -176,6 +178,67 @@ __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_b
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * ld + gi * 32);
 }
 
+// Q6-only port of Strata 9ae93f7b's wide8/dequant_wide_kernel (MIT).
+// A block is 210 bytes: read at two-byte alignment, never assume uint64 alignment.
+std::atomic<int> q6_mode{2};
+__device__ __forceinline__ uint64_t q6_ld8(const uint8_t* p) {
+    const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+    return uint64_t(q[0]) | (uint64_t(q[1]) << 16) | (uint64_t(q[2]) << 32) | (uint64_t(q[3]) << 48);
+}
+template <typename T, bool Rounded = false>
+__global__ void dequant_q6_wide_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0,
+                                     uint32_t rows, uint32_t groups_per_row, int64_t ld, T* __restrict__ out) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t g = i >> 2, r = g / groups_per_row, gi = g - r * groups_per_row;
+    if (r >= rows) return;
+    const int l0 = 8 * (i & 3), n = (gi % 8) / 4, qu = gi % 4;
+    const uint8_t* b = blocks + (row0 + int64_t(r)) * row_bytes + size_t(gi / 8) * 210;
+    const uint64_t ql = q6_ld8(b + 64 * n + ((qu & 1) ? 32 : 0) + l0);
+    const uint64_t qh = q6_ld8(b + 128 + 32 * n + l0);
+    const int8_t* scales = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
+    const float ds = h2f(b + 208) * float(scales[l0 / 16 + 2 * qu]);
+    __align__(16) T values[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int lo = int(ql >> (8 * k)) & 255, hi = int(qh >> (8 * k)) & 255;
+        const int q = (qu >= 2 ? lo >> 4 : lo & 15) | (((hi >> (2 * qu)) & 3) << 4);
+        const float value = ds * float(q - 32);
+        if constexpr (Rounded) put(values, k, __bfloat162float(__float2bfloat16_rn(value)));
+        else put(values, k, value);
+    }
+    uint4* dst = reinterpret_cast<uint4*>(out + int64_t(r) * ld + int64_t(gi) * 32 + l0);
+#pragma unroll
+    for (int k = 0; k < int(8 * sizeof(T) / 16); ++k)
+        dst[k] = reinterpret_cast<const uint4*>(values)[k];
+}
+
+// Q5_K Engram rows: eight contiguous outputs per thread, with the
+// same scale/minimum expression as the independent group32 implementation.
+template <typename T, bool Rounded = false>
+__global__ void dequant_q5_wide_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0,
+                                     uint32_t rows, uint32_t groups_per_row, int64_t ld, T* __restrict__ out) {
+    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    const uint32_t g=i>>2,r=g/groups_per_row,gi=g-r*groups_per_row;
+    if(r>=rows)return;
+    const int l0=8*(i&3),group=gi%8;
+    const uint8_t* b=blocks+(row0+int64_t(r))*row_bytes+size_t(gi/8)*176;
+    const uint64_t ql=q6_ld8(b+48+32*(group/2)+l0),qh=q6_ld8(b+16+l0);
+    int sc,mn;scale_min_k4(group,b+4,sc,mn);
+    const float ds=h2f(b)*float(sc),minimum=h2f(b+2)*float(mn);
+    __align__(16) T values[8];
+#pragma unroll
+    for(int k=0;k<8;++k){
+        const int lo=int(ql>>(8*k))&255,hi=int(qh>>(8*k))&255;
+        const int q=((lo>>(4*(group&1)))&15)|(((hi>>group)&1)<<4);
+        const float value=ds*float(q)-minimum;
+        if constexpr(Rounded)put(values,k,__bfloat162float(__float2bfloat16_rn(value)));
+        else put(values,k,value);
+    }
+    auto* dst=reinterpret_cast<uint4*>(out+int64_t(r)*ld+int64_t(gi)*32+l0);
+#pragma unroll
+    for(int k=0;k<int(8*sizeof(T)/16);++k)dst[k]=reinterpret_cast<const uint4*>(values)[k];
+}
+
 // Q8_0 to FP16 (the prompt path's dense Q8_0 weights before each cuBLAS GEMM): a thread per 8 outputs, one 16-byte
 // store each (dequant_kernel's thread wrote 32 halves one by one, 64 bytes apart from its neighbours': ~13% of the
 // card's bandwidth).  The same value per element: (float) q * d, rounded to FP16 by __float2half_rn.
@@ -229,6 +292,24 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
+    if (!std::is_same_v<T,H16> && type==13 && (reinterpret_cast<uintptr_t>(blocks)&1)==0 &&
+        (reinterpret_cast<uintptr_t>(out)&15)==0 && (uint64_t(ld)*sizeof(T))%16==0 && total<(1ll<<29)) {
+        dequant_q5_wide_kernel<T><<<unsigned((4*total+255)/256),256,0,st>>>(
+            p,row_bytes,row0,uint32_t(rows),uint32_t(gpr),ld,out);
+        const auto e=cudaGetLastError();
+        if(e!=cudaSuccess){std::fprintf(stderr,"dequant Q5 wide launch: %s\n",cudaGetErrorString(e));std::exit(1);}
+        return;
+    }
+    if (!std::is_same_v<T, H16> && type == 14 && q6_mode.load(std::memory_order_relaxed) >= 1 &&
+        (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
+        (reinterpret_cast<uintptr_t>(out) & 15) == 0 &&
+        (uint64_t(ld) * sizeof(T)) % 16 == 0 && total < (1ll << 29)) {
+        dequant_q6_wide_kernel<T><<<unsigned((4 * total + 255) / 256), 256, 0, st>>>(
+            p, row_bytes, row0, uint32_t(rows), uint32_t(gpr), ld, out);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "dequant Q6 wide launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
     if constexpr (sizeof(T) == 2 && !std::is_same_v<T, uint16_t>) {   // H16
         if (type == 8 && (uintptr_t) out % 16 == 0 && ld % 8 == 0 && (uintptr_t) p % 2 == 0 && row_bytes % 2 == 0) {
             const int64_t chunks = rows * (cols / 8);
@@ -259,6 +340,30 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 }
 
 }  // namespace
+
+void dequant_q6_set_mode(int mode) {
+    if (mode < 0 || mode > 2) { std::fprintf(stderr, "dequant Q6 mode must be 0, 1 or 2\n"); std::exit(1); }
+    q6_mode.store(mode, std::memory_order_relaxed);
+}
+
+bool dequant_q5_f32_bf16(const void* blocks,int64_t elements,float* out,void* stream) {
+    if(!blocks||!out||elements<=0||elements%256||(reinterpret_cast<uintptr_t>(blocks)&1)!=0||
+       (reinterpret_cast<uintptr_t>(out)&15)!=0||elements/32>=(1ll<<29))return false;
+    const int64_t groups=elements/32;
+    dequant_q5_wide_kernel<float,true><<<unsigned((4*groups+255)/256),256,0,(cudaStream_t)stream>>>(
+        static_cast<const uint8_t*>(blocks),elements/256*176,0,1,uint32_t(groups),elements,out);
+    return true;
+}
+
+bool dequant_q6_f32_bf16(const void* blocks, int64_t elements, float* out, void* stream) {
+    if (q6_mode.load(std::memory_order_relaxed) < 2 || !blocks || !out || elements <= 0 || elements % 256 ||
+        (reinterpret_cast<uintptr_t>(blocks) & 1) != 0 || (reinterpret_cast<uintptr_t>(out) & 15) != 0 ||
+        elements / 32 >= (1ll << 29)) return false;
+    const int64_t groups = elements / 32;
+    dequant_q6_wide_kernel<float, true><<<unsigned((4 * groups + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+        static_cast<const uint8_t*>(blocks), elements / 256 * 210, 0, 1, uint32_t(groups), elements, out);
+    return true;
+}
 
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;

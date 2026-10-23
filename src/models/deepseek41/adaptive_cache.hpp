@@ -11,7 +11,7 @@ public:
     static uint64_t staging_bytes(const std::array<uint64_t,40>& sizes,uint64_t budget);
     AdaptiveCache(core::ExpertCache& cache,std::vector<ExpertKey>& hot,std::vector<uint64_t>& offsets,
                   uint8_t* ram,const std::array<uint64_t,40>& sizes,uint64_t budget,bool trace,bool grouped=false,
-                  bool pinned_ram=false,bool huge_pinned=false);
+                  bool pinned_ram=false,bool huge_pinned=false,const std::array<int,40>* layout_groups=nullptr);
     ~AdaptiveCache();
     bool resident(int layer,int expert)const;
     const uint8_t* cpu(int layer,int expert)const;
@@ -39,6 +39,7 @@ private:
     std::vector<uint64_t>& offsets_;
     uint8_t* ram_;
     std::array<uint64_t,40> sizes_;
+    std::array<int,40> groups_;
     uint64_t budget_,stride_,capacity_,rows_=0,since_pick_=0,batches_=0,published_=0;
     bool trace_,grouped_,pinned_ram_,rotation_eligible_=false,aligned_=true;
     uint64_t windows_=0,direct_bytes_=0,rotated_=0,avoided_prepare_=0,avoided_commit_=0;

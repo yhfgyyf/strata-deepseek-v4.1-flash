@@ -32,6 +32,11 @@ cudaError_t pack_global_gpu(const uint16_t* kv, const int64_t* slots, int tokens
 cudaError_t pack_index_gpu(const float* keys, uint8_t* packed, int rows, cudaStream_t stream);
 cudaError_t fake_quant_index_gpu(float* queries, int rows, cudaStream_t stream);
 cudaError_t packed_attention_gpu(const PackedAttention& params, cudaStream_t stream);
+// SM120 main-model path: reuses dead Q-low-rank scratch, original partial/LSE arena.
+cudaError_t packed_attention_cake_gpu(const PackedAttention& params, int32_t* scratch,
+                                      size_t scratch_bytes, cudaStream_t stream);
+// DSpark uses one split per query to fit its original eight-row partial arena.
+cudaError_t packed_attention_cake_draft_gpu(const PackedAttention& p,int32_t* scratch,size_t bytes,cudaStream_t stream);
 cudaError_t float_attention_gpu(const float* q, const float* swa, const float* global,
                                const int64_t* swa_slots, const int64_t* global_slots, const float* sinks,
                                float* out, int tokens, int heads, int swa_topk, int global_topk,

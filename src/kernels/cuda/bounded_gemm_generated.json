@@ -1,0 +1,43 @@
+{
+  "generator_sha256": "8e2c9fd4276383ae1ebb4b0c95d891cc4a0e87d60bc0d0e39d5f047a68b93e27",
+  "kernels": [
+    {
+      "variant": 0,
+      "projection": 0,
+      "m": 64,
+      "n": 128,
+      "k": 32,
+      "warps": 4,
+      "stages": 3,
+      "shared": 24576,
+      "name": "bounded_grouped_bf16",
+      "cubin_bytes": 44240,
+      "sha256": "8fbe10d08061279ac072603032344b5ecc0fdc406f00fea9ceabe2a852c450d9",
+      "compiler": "3.6.0",
+      "target": "sm120",
+      "gpu_executed": false,
+      "original_sha256": "49b5bfd755cf1fc9273f4f755e10009409c5742731382a184e0ccffb4297b9c2",
+      "debug_paths_sanitized": true
+    },
+    {
+      "variant": 0,
+      "projection": 1,
+      "m": 64,
+      "n": 128,
+      "k": 32,
+      "warps": 4,
+      "stages": 3,
+      "shared": 24576,
+      "name": "bounded_grouped_bf16",
+      "cubin_bytes": 44240,
+      "sha256": "cde015ad3aa867129a6bc7bdf3ddcf28ed749b883b67c4bbb15202c50ec5a40c",
+      "compiler": "3.6.0",
+      "target": "sm120",
+      "gpu_executed": false,
+      "original_sha256": "5557ee87472c33e0dedabd309dd111473585c1eb42547229d7135a33e3ebf466",
+      "debug_paths_sanitized": true
+    }
+  ],
+  "original_generator_sha256": "9724b579afaee09fdb837ba181fb501d3a4416e769bb0a2c24bcfdbda446a2ea",
+  "packaging": "Only non-allocated debug path strings were sanitized; all non-debug ELF sections are byte-identical."
+}

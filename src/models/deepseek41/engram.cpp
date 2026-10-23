@@ -22,7 +22,7 @@
 
 namespace strata::models::deepseek41 {
 namespace {
-constexpr uint64_t page_bytes = 4096, row_bytes = 272;
+constexpr uint64_t page_bytes = 4096;
 #if defined(__linux__)
 struct NativeAio {
     int fd=-1;aio_context_t context=0;
@@ -38,11 +38,14 @@ struct NativeAio {
 EngramHashSpec read_spec(const Model& m) {
     EngramHashSpec s;
     auto copy = [&](const char* key, auto& out) {
-        const auto* v = m.file().get(std::string("deepseek41.engram.") + key);
+        const auto* v = m.file().get(std::string("deepseek41.") + key);
         if (!v || v->items.size() != out.size()) throw std::runtime_error("Engram metadata array");
         for (size_t i = 0; i < out.size(); ++i) out[i] = v->items[i].u;
     };
-    copy("multipliers", s.multipliers); copy("primes", s.primes); copy("offsets", s.offsets);
+    copy(m.ple_engram()?"ple.layer_multipliers":"engram.multipliers", s.multipliers);
+    copy(m.ple_engram()?"ple.head_vocab_sizes":"engram.primes", s.primes);
+    copy(m.ple_engram()?"ple.head_offsets":"engram.offsets", s.offsets);
+    if(m.ple_engram())for(int h=24;h<48;++h)s.offsets[h]-=384006168;
     s.pad = m.token_map().at(m.file().get("deepseek41.engram.pad_token_id")->u);
     return s;
 }
@@ -149,6 +152,7 @@ struct EngramReader::Impl {
     struct Work { EngramQuery query; std::shared_ptr<EngramBatch> batch; bool split = false; };
     strata::platform::DirectFile file;
     std::array<uint64_t, 2> offsets, rows;
+    uint64_t row_bytes;
     PageCache cache;
     size_t queue_limit;
     bool continuous_reads;
@@ -164,8 +168,10 @@ struct EngramReader::Impl {
     EngramReadStats counters;
     std::deque<double> latencies;
     Impl(const std::string& path, std::array<uint64_t, 2> o, std::array<uint64_t, 2> r,
-         uint64_t budget, size_t limit,bool continuous,bool native_aio) : offsets(o), rows(r), cache(budget), queue_limit(limit),continuous_reads(continuous) {
+         uint64_t budget, size_t limit,bool continuous,bool native_aio,uint64_t packed_row_bytes)
+        : offsets(o), rows(r), row_bytes(packed_row_bytes), cache(budget), queue_limit(limit),continuous_reads(continuous) {
         if (!limit) throw std::invalid_argument("Engram zero queue limit");
+        if(row_bytes!=272 && row_bytes!=210 && row_bytes!=176)throw std::invalid_argument("Engram packed row bytes");
         std::string error;
         if (!file.open(path, error,native_aio)) throw std::runtime_error("Engram direct read: " + error);
         if(native_aio){
@@ -184,6 +190,16 @@ struct EngramReader::Impl {
     ~Impl() {
         { std::lock_guard<std::mutex> lock(mutex); stop = true; for (auto& w : queue) w.batch->cancel(); }
         queued.notify_all(); room.notify_all(); worker.join();
+    }
+    bool complete_read(uint64_t first,uint32_t bytes,uint8_t* data,const strata::platform::Completion& c) const {
+        const uint64_t offset=first*page_bytes;
+        if(offset>=file.size())return false;
+        const uint64_t expected=std::min<uint64_t>(bytes,file.size()-offset);
+        if(!c.ok||c.bytes!=expected)return false;
+        // Only pad beyond the original EOF; all requested tensor row bytes
+        // were bounds checked. A file truncated after open still fails.
+        if(expected<bytes)std::memset(data+expected,0,bytes-expected);
+        return true;
     }
     void read_continuous(const std::vector<uint64_t>& missing,const std::vector<uint64_t>& pages,uint8_t* loaded,
                          const EngramBatch& batch,uint64_t& disk,uint64_t& reads) {
@@ -243,7 +259,7 @@ struct EngramReader::Impl {
             for(int j=0;j<count;++j){const auto& c=complete[j];
             if(c.tag>=depth || active[c.tag]==SIZE_MAX)throw std::runtime_error("Engram invalid rolling completion");
             const auto& r=requests[active[c.tag]];active[c.tag]=SIZE_MAX;--inflight;
-            if(!c.ok || c.bytes!=r.bytes)error="Engram short/failed continuous read";
+            if(!complete_read(r.first,r.bytes,loaded+r.index*page_bytes,c))error="Engram short/failed continuous read";
             disk+=c.bytes;++reads;submit(c.tag);
             }
         }
@@ -313,7 +329,7 @@ struct EngramReader::Impl {
                 while (!file.wait(&c, 1, -1)) {}
                 if (c.tag >= pending.size()) { error = "Engram unexpected I/O completion"; continue; }
                 const auto& r = pending[c.tag];
-                if (!c.ok || c.bytes != r.bytes) error = "Engram short/failed direct read";
+                if (!complete_read(r.first,r.bytes,static_cast<uint8_t*>(r.buffer),c)) error = "Engram short/failed direct read";
                 else for (uint32_t b = 0; b < r.bytes; b += page_bytes) {
                     const uint64_t key = r.first + b / page_bytes;
                     const auto* src = static_cast<uint8_t*>(r.buffer) + b;
@@ -369,13 +385,18 @@ struct EngramReader::Impl {
     }
 };
 EngramReader::EngramReader(const std::string& path, const std::array<uint64_t, 2>& offsets,
-                         const std::array<uint64_t, 2>& rows, uint64_t budget, size_t limit,bool continuous,bool aio)
-    : impl_(std::make_unique<Impl>(path, offsets, rows, budget, limit,continuous,aio)) {}
+                         const std::array<uint64_t, 2>& rows, uint64_t budget, size_t limit,bool continuous,bool aio,uint64_t packed_row_bytes)
+    : impl_(std::make_unique<Impl>(path, offsets, rows, budget, limit,continuous,aio,packed_row_bytes)) {}
 EngramReader::EngramReader(const Model& m, uint64_t budget,bool continuous,bool aio)
-    : EngramReader(m.file().path(),
-        {m.file().data_start() + m.tensor("blk.1.engram_embd.weight").info->offset,
-         m.file().data_start() + m.tensor("blk.14.engram_embd.weight").info->offset},
-        {m.tensor("blk.1.engram_embd.weight").info->shape[1], m.tensor("blk.14.engram_embd.weight").info->shape[1]}, budget,4,continuous,aio) {}
+    : EngramReader(m.tensor(m.ple_engram()?"per_layer_token_embd.weight":"blk.1.engram_embd.weight").file->path(),
+        [&]{
+            const auto& first=m.tensor(m.ple_engram()?"per_layer_token_embd.weight":"blk.1.engram_embd.weight");
+            const auto& second=m.tensor(m.ple_engram()?"per_layer_token_embd.weight":"blk.14.engram_embd.weight");
+            if(first.file!=second.file)throw std::runtime_error("Engram tables must share a shard");
+            const uint64_t base=first.file->data_start()+first.info->offset;
+            return std::array<uint64_t,2>{base,m.ple_engram()?base+384006168*m.engram_row_bytes():second.file->data_start()+second.info->offset};
+        }(),
+        {384006168,384016682}, budget,4,continuous,aio,m.engram_row_bytes()) {}
 EngramReader::~EngramReader() = default;
 std::shared_ptr<EngramBatch> EngramReader::submit(EngramQuery query, uint64_t generation, bool split_layers) {
     // Bound each request independently of the queue, including hash/page scratch.
@@ -400,7 +421,11 @@ void engram_gate_cpu(float* h, const float* kv, const float* qw, const float* kw
         float hh = 0, kk = 0, dot = 0;
         float* x = h + (t * 4 + c) * width;
         const float* key = kv + (t * 5 + c) * width;
-        for (int d = 0; d < width; ++d) { hh += x[d] * x[d]; kk += key[d] * key[d]; dot += x[d] * qw[c * width + d] * kw[c * width + d] * key[d]; }
+        for (int d = 0; d < width; ++d) {
+            hh += x[d] * x[d]; kk += key[d] * key[d];
+            const float q=x[d]*qw[c*width+d];
+            dot += (kw?q*kw[c*width+d]:q)*key[d];
+        }
         dot /= std::sqrt((hh / width + 1e-20f) * (kk / width + 1e-20f) * width);
         float input = std::sqrt(std::max(std::abs(dot), 1e-6f)); if (dot < 0) input = -input;
         const float gate = image && image[t] ? 0.f : 1.f / (1.f + std::exp(-input));

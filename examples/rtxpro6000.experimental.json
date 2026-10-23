@@ -1,17 +1,13 @@
 {
   "engine": "../build/strata-deepseek41-experimental",
-  "model": "/path/to/DeepSeek-V4.1-Flash-GSQ-RCO-3.0bit.gguf",
-  "draft": "/path/to/draft-q2_k-q4.gguf",
-  "mmproj": "/path/to/DeepSeek-V4.1-Flash-mmproj-BF16.gguf",
+  "variant": "UD-Q2_K_XL",
+  "model": "/path/to/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf",
+  "draft": "/path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
+  "mmproj": "/path/to/mmproj-BF16.gguf",
   "tokenizer": "/path/to/tokenizer.json",
-  "integrity": "/path/to/integrity.txt",
-  "profile": "/path/to/frozen-startup.strp",
-  "heat": "/path/to/frozen-heat.txt",
-  "costs": "../data/dspark-costs-rtxpro6000.txt",
-  "draft_input_vocab": "/path/to/draft-vocab-final.bin",
-  "draft_output_vocab": "/path/to/draft-vocab-90000.bin",
+  "runtime_dir": "../runtime/ud-q2-k-xl",
   "host": "127.0.0.1",
   "port": 30011,
   "alias": "deepseek-v4.1",
-  "log": "../runtime/engine.log"
+  "log": "../runtime/ud-q2-k-xl/engine.log"
 }

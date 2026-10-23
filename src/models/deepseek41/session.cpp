@@ -12,8 +12,7 @@
 
 namespace strata::models::deepseek41 {
 namespace {
-constexpr char prefix_magic[16]="STRATA-DS41-P03";
-constexpr char main_sha[]="11f46543370256ef616b6e458b6950e148625b5f8b7545173d124445d3393c53";
+constexpr char prefix_magic[16]="STRATA-DS41-P04";
 void write_bytes(std::ostream& out,const void* data,uint64_t size) {
     out.write(static_cast<const char*>(data),size);if(!out)throw std::runtime_error("DeepSeek prefix write");
 }
@@ -134,7 +133,7 @@ void Session::Impl::init(const std::vector<int>& ids,int64_t start) {
     }
     ++batch_epoch;index_epoch=0;candidate_epoch=0;index_source=-1;
     if(runtime.options.engram_pipeline) {
-        if(!engram_pipeline)engram_pipeline=std::make_unique<EngramPipeline>(work,runtime.options.arithmetic,runtime.options.trace,runtime.options.huge_pinned_memory);
+        if(!engram_pipeline)engram_pipeline=std::make_unique<EngramPipeline>(work,runtime.options.arithmetic,runtime.options.trace,runtime.options.huge_pinned_memory,runtime.model.engram_type());
         engram_pipeline->start(engram_ticket,batch_epoch,ids.size(),runtime.tensor(1,"engram_wkv"),runtime.tensor(14,"engram_wkv"));
     }
     gpu_check(cudaMemcpyAsync(work.ids,ids.data(),ids.size()*sizeof(int),cudaMemcpyHostToDevice,runtime.stream.value));
@@ -210,8 +209,8 @@ std::vector<float> Session::prefill(const std::vector<int>& ids,bool ced,const s
         if(ced){
             prefill::LedgerScope kv_trace(r.options.trace,"ds41.decoder.kv_only");
             s.save_boundary(count,start);
-            gpu_check(hc_pre_gpu(s.work.h,s.work.pre,s.work.x,5120,count,r.stream.value));r.round(s.work.x,int64_t(count)*5120);
-            gpu_check(rms_gpu(s.work.x,static_cast<const float*>(r.tensor(20,"attn_norm").data),s.work.x,5120,count,r.model.geometry().norm_eps,r.stream.value));r.round(s.work.x,int64_t(count)*5120);
+            gpu_check((r.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(s.work.h,s.work.pre,s.work.x,5120,count,r.stream.value));
+            gpu_check((r.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(s.work.x,static_cast<const float*>(r.tensor(20,"attn_norm").data),s.work.x,5120,count,r.model.geometry().norm_eps,r.stream.value));
             s.compression(20,count,start,true);
         }else if(start+count==static_cast<int64_t>(ids.size()))result=s.logits(count);
         gpu_check(cudaStreamSynchronize(r.stream.value));s.position=start+count;s.encoder_position=s.position;
@@ -396,7 +395,9 @@ void Session::save_prefix(const std::string& path)const {
     if(std::filesystem::exists(path)||std::filesystem::exists(path+".tmp"))throw std::runtime_error("DeepSeek prefix destination exists");
     std::fstream out(path+".tmp",std::ios::out|std::ios::binary);if(!out)throw std::runtime_error("DeepSeek prefix destination");
     try {
-        write_bytes(out,prefix_magic,sizeof(prefix_magic));write_bytes(out,main_sha,sizeof(main_sha));
+        const auto identity=r.model.checkpoint_identity();
+        write_bytes(out,prefix_magic,sizeof(prefix_magic));write_scalar<uint32_t>(out,identity.size());
+        write_bytes(out,identity.data(),identity.size());
         write_scalar<int32_t>(out,static_cast<int32_t>(r.options.arithmetic));write_scalar<int32_t>(out,r.options.context);write_scalar<uint8_t>(out,s.ced);
         write_scalar<int64_t>(out,s.position);write_scalar<int64_t>(out,s.history.position);write_bytes(out,s.history.recent.data(),12);
         write_scalar<int64_t>(out,s.boundary_begin);write_scalar<int64_t>(out,s.boundary_end);
@@ -433,8 +434,12 @@ void Session::load_prefix(const std::string& path,const std::vector<int>& expect
     if(prefix_checksum(path,file_bytes-8)!=expected_checksum)throw std::runtime_error("DeepSeek prefix checksum mismatch");
     try {
     std::fstream in(path,std::ios::in|std::ios::binary);if(!in)throw std::runtime_error("DeepSeek prefix open");
-    char magic[sizeof(prefix_magic)],sha[sizeof(main_sha)];read_bytes(in,magic,sizeof(magic));read_bytes(in,sha,sizeof(sha));
-    if(std::memcmp(magic,prefix_magic,sizeof(magic))||std::memcmp(sha,main_sha,sizeof(sha))||read_scalar<int32_t>(in)!=static_cast<int32_t>(r.options.arithmetic)||
+    char magic[sizeof(prefix_magic)];read_bytes(in,magic,sizeof(magic));
+    if(std::memcmp(magic,prefix_magic,sizeof(magic)))throw std::runtime_error("DeepSeek prefix version mismatch");
+    const auto identity=r.model.checkpoint_identity();const auto identity_size=read_scalar<uint32_t>(in);
+    if(identity_size!=identity.size())throw std::runtime_error("DeepSeek prefix model mismatch");
+    std::string saved_identity(identity_size,'\0');read_bytes(in,saved_identity.data(),identity_size);
+    if(saved_identity!=identity||read_scalar<int32_t>(in)!=static_cast<int32_t>(r.options.arithmetic)||
         read_scalar<int32_t>(in)!=r.options.context)throw std::runtime_error("DeepSeek prefix version/model/arithmetic/context mismatch");
     const uint8_t ced=read_scalar<uint8_t>(in);const auto position=read_scalar<int64_t>(in);
     if(ced>1||position<1||position>r.options.context||expected.size()!=static_cast<size_t>(position))throw std::runtime_error("DeepSeek prefix length/mode mismatch");

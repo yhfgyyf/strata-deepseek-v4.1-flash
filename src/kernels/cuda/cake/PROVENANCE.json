@@ -1,0 +1,68 @@
+{
+  "kernel_commit": "cf9aa7cac3630bf088a58dd41620f166dd79ea47",
+  "tree_commit": "36469765801271d729d8c1c309ff9b840129c653",
+  "selected": [
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 96384,
+      "source": "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu",
+      "tiles": 2,
+      "variant": "default"
+    },
+    {
+      "dual": false,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu",
+      "tiles": 2,
+      "variant": "sa+ip+pw+el+e2m1_nomul"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu",
+      "tiles": 1,
+      "variant": "sa+pw+lq+t1+el+ew+ra"
+    },
+    {
+      "heads": 64,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu",
+      "variant": "default"
+    },
+    {
+      "heads": 64,
+      "source": "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu",
+      "variant": "mo2"
+    },
+    {
+      "dual": true,
+      "heads": 64,
+      "smem_bytes": 98432,
+      "source": "cake_sparse_mla_dsv41_mixed_h64_dual_sa_tl_ip_el_e2m1_nomul.cu",
+      "tiles": 2,
+      "variant": "sa+tl+ip+el+e2m1_nomul"
+    }
+  ],
+  "sources_sha256": {
+    "cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu": "83f2d9112f97c8c7fb35b4dc6275373c01f1300530e88f4499ec2b3987ecb920",
+    "cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu": "b983190bb105ef2458b50419348c2f1008e7fca98cd4df5f21de0bf31b11a831",
+    "cake_sparse_mla_dsv41_mixed_kernels.h": "9853b456ccbcb11fbd8690eca6a92a667c2bbfb64caa7620c88deb2cc9af16bb",
+    "cake_sparse_mla_dsv41_mixed_manifest.json": "0e670f17b89a4508c61b2dbcd6c6c5e6846f3220de2d88031bca4f49d7f33de9",
+    "cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu": "512663daada3dfdf3df089b077fafac6a5101cf8abdf9f71ba9bd7b333ece37e",
+    "cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu": "e968f4a1fb597cf62038750641c70683fb1fa0365243e5280066d957a612b897",
+    "cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu": "9a7ad9aa6735023d38a9054ba268cd1f621253274fee9c8d31933aa79933a417",
+    "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu": "a99f290c7abcbe0c078a4b9863c022b5c81aa228a46421234a1b82f7073662d1",
+    "cake_sparse_mla_dsv41_mixed_h64_dual_sa_tl_ip_el_e2m1_nomul.cu": "0e16bcfbd1e97eacd529a5ef2ba245853d81c8392a19a83dab536db289efffc7"
+  },
+  "origin": "FlashInfer0.7.2 wheel, Apache2 unmodified generated sources"
+}

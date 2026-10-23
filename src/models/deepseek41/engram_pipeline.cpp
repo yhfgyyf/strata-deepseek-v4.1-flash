@@ -3,8 +3,10 @@
 #include <cstring>
 
 namespace strata::models::deepseek41 {
-EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned) : work_(work),arithmetic_(arithmetic),trace_(trace) {
-    host_=std::make_unique<Pinned>(uint64_t(work.max_tokens)*24*272,false,huge_pinned);
+EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type)
+    : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==13?176:packed_type==14?210:272) {
+    if(packed_type!=8&&packed_type!=13&&packed_type!=14)throw std::invalid_argument("Engram pipeline type");
+    host_=std::make_unique<Pinned>(uint64_t(work.max_tokens)*24*row_bytes_,false,huge_pinned);
     if (!work.engram_input || !host_->pinned) throw std::runtime_error("Engram pipeline requires private BF16/pinned scratch");
     std::cerr<<"DeepSeek host_memory engram ";host_->info.write(std::cerr);std::cerr<<'\n';
     if (cublasCreate(&blas_)!=CUBLAS_STATUS_SUCCESS) throw std::runtime_error("Engram cuBLAS creation");
@@ -61,11 +63,13 @@ void EngramPipeline::run(){
                 }
                 { std::lock_guard<std::mutex> lock(mutex_);if(stopped_)return; }
                 prefill::LedgerScope trace(trace_,table?"ds41.engram.prepare14":"ds41.engram.prepare1");
-                for(int t=0;t<count;++t)std::memcpy(host_->data+uint64_t(t)*24*272,data.data()+(uint64_t(t)*48+table*24)*272,24*272);
-                gpu_check(cudaMemcpyAsync(work_.engram_packed,host_->data,uint64_t(count)*24*272,cudaMemcpyHostToDevice,stream_.value));
+                if(data.size()!=uint64_t(count)*48*row_bytes_)throw std::runtime_error("Engram packed batch size");
+                for(int t=0;t<count;++t)std::memcpy(host_->data+uint64_t(t)*24*row_bytes_,data.data()+(uint64_t(t)*48+table*24)*row_bytes_,24*row_bytes_);
+                gpu_check(cudaMemcpyAsync(work_.engram_packed,host_->data,uint64_t(count)*24*row_bytes_,cudaMemcpyHostToDevice,stream_.value));
                 gpu_check(cudaEventRecord(copied_.value,stream_.value));
-                gpu_check(dequant_gpu(work_.engram_packed,8,work_.engram_emb,int64_t(count)*6144,stream_.value));
-                if(arithmetic_==Arithmetic::production)gpu_check(round_bf16_gpu(work_.engram_emb,int64_t(count)*6144,stream_.value));
+                if(arithmetic_==Arithmetic::production)
+                    gpu_check(dequant_round_bf16_gpu(work_.engram_packed,packed_type_,work_.engram_emb,int64_t(count)*6144,stream_.value));
+                else gpu_check(dequant_gpu(work_.engram_packed,packed_type_,work_.engram_emb,int64_t(count)*6144,stream_.value));
                 matrix_product(matrices[table],work_.engram_emb,work_.engram_kv,count,blas_,stream_.value,work_.engram_input,arithmetic_);
                 gpu_check(cudaEventRecord(ready_[table].value,stream_.value));
                 { std::lock_guard<std::mutex> lock(mutex_);issued_[table]=sequence; }

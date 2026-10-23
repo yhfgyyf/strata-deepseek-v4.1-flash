@@ -10,6 +10,8 @@ bool scores_fast_enabled();
 void expert_dequant_fast_set_enabled(bool enabled);
 bool expert_dequant_fast_enabled();
 cudaError_t dequant_gpu(const void* packed, uint32_t type, float* output, int64_t elements, cudaStream_t stream);
+// Decode into FP32 storage with the production BF16 rounding boundary preserved.
+cudaError_t dequant_round_bf16_gpu(const void* packed, uint32_t type, float* output, int64_t elements, cudaStream_t stream);
 cudaError_t dequant_bf16_gpu(const void* packed, uint32_t type, uint16_t* output, int64_t elements, cudaStream_t stream);
 cudaError_t packed_bf16_gemv_gpu(const void* packed, uint32_t type, const float* x, float* out,
                                 int rows, int cols, int tokens, cudaStream_t stream);
@@ -73,4 +75,17 @@ cudaError_t pool2_gpu(const float* a, const float* b, const float* ga, const flo
 cudaError_t engram_gate_gpu(float* residual, const float* kv, const float* q_weight,
                            const float* k_weight, const uint8_t* image, int tokens, int hidden,
                            cudaStream_t stream);
+// Same FP32 arithmetic, with the existing terminal BF16 rounding fused.
+cudaError_t rms_bf16_gpu(const float* x, const float* weight, float* out, int width, int tokens,
+                    float eps, cudaStream_t stream);
+cudaError_t hc_pre_bf16_gpu(const float* residual, const float* pre, float* out, int hidden, int tokens, cudaStream_t stream);
+cudaError_t hc_post_bf16_gpu(const float* residual, const float* branch, const float* post, const float* comb,
+                        float* out, int hidden, int tokens, cudaStream_t stream);
+cudaError_t swiglu_bf16_gpu(const float* gate, const float* up, const float* routing_weights,
+                       float* out, int width, int tokens, float limit, cudaStream_t stream);
+cudaError_t engram_gate_bf16_gpu(float* residual, const float* kv, const float* q_weight,
+                           const float* k_weight, const uint8_t* image, int tokens, int hidden,
+                           cudaStream_t stream);
+cudaError_t hc_split_warp_gpu(const float* mixes, const float* scale, const float* base, float* pre,
+                         float* post, float* comb, int tokens, float eps, int iterations, cudaStream_t stream);
 } // namespace strata::models::deepseek41

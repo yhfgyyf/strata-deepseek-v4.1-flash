@@ -46,7 +46,7 @@ struct PrefetchBlockBenchmark {
             if(a.sources_[adaptive_index(x.out)]!=(x.rotate?x.saved:x.source)||a.sources_[adaptive_index(x.in)])
                 throw std::logic_error("rewind source owner mismatch");
             if(x.rotate){
-                auto& spare=a.spares_[adaptive_group(x.in.first)].at(x.spare);
+                auto& spare=a.spares_[a.groups_[x.in.first]].at(x.spare);
                 if(spare!=x.source)throw std::logic_error("rewind spare owner mismatch");
                 gpu_check(cudaMemcpyAsync(x.source,a.cache_.device_slot(x.slot),x.bytes,cudaMemcpyDeviceToHost,a.copies_.value));
                 gpu_check(cudaMemcpyAsync(a.cache_.device_slot(x.slot),x.saved,x.bytes,cudaMemcpyHostToDevice,a.copies_.value));

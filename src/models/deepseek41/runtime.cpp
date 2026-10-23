@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib>
 
 namespace strata::models::deepseek41 {
 namespace {
@@ -15,7 +16,7 @@ const std::string& verified_path(const std::string& path,const RuntimeOptions& o
                                  const std::string& draft,const std::string& vision) {
     require_integrity(o.integrity_file,"main",path);
     if(!draft.empty())require_integrity(o.integrity_file,"draft",draft,o.draft_sha256);
-    if(!vision.empty())require_integrity(o.integrity_file,"vision",vision);
+    if(!vision.empty())require_integrity(o.integrity_file,"vision",vision,o.vision_sha256);
     return path;
 }
 }
@@ -125,7 +126,7 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     if (info.cc_major < 8) throw std::runtime_error("DeepSeek native attention requires CUDA SM80 or later");
     struct BlasGuard {cublasHandle_t& handle;bool success=false;~BlasGuard(){if(!success&&handle)cublasDestroy(handle);}} guard{blas};
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas,stream.value) != CUBLAS_STATUS_SUCCESS ||
-        cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH) != CUBLAS_STATUS_SUCCESS)
+        cublasSetMathMode(blas,static_cast<cublasMath_t>(CUBLAS_PEDANTIC_MATH|CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)) != CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("DeepSeek cuBLAS initialization");
     if(o.dense_q8_1 && !o.dense_q8)throw std::invalid_argument("Q8_1 dense inputs require packed dense weights");
     if(o.expert_gu_mode<0 || o.expert_gu_mode>2)throw std::invalid_argument("expert GU mode must be 0, 1 or 2");
@@ -180,6 +181,10 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     WorkspaceLayout memory(work->arena.get());work->extras(memory,o);
     if(model.has_vision())vision_work=std::make_unique<VisionWork>(*work->arena);
     if(o.dspark)draft_work=std::make_unique<DraftWork>(*work->arena,draft_weights->vocab.size());
+    if(const char* mode=std::getenv("STRATA_DS41_DECODE_SEGMENTS")){
+        if(mode[0]<'0'||mode[0]>'3'||mode[1])throw std::invalid_argument("decode segment mask must be 0..3");
+        decode_segment_mask=static_cast<unsigned>(mode[0]-'0');
+    }
     guard.success=true;
 }
 Runtime::Impl::~Impl() { if (blas) cublasDestroy(blas); }
@@ -188,15 +193,16 @@ void Runtime::Impl::round(float* x,uint64_t n) {
 }
 void matrix_product(const Matrix& m,const float* x,float* out,int tokens,cublasHandle_t blas,cudaStream_t stream,
                     uint16_t* bf_input,Arithmetic arithmetic,int rows,int64_t ldx,int64_t ldy,
-                    uint64_t weight_offset,bool round_output,bool verify_batch) {
+                    uint64_t weight_offset,bool round_output,bool verify_batch,int bf_scratch_cols) {
     const int n=rows ? rows : m.rows,k=m.cols;
     if (!ldx) ldx=k;
     if (!ldy) ldy=n;
     if (tokens < 1 || n < 1 || k < 1 || ldx < k || ldy < n ||
         weight_offset + uint64_t(n)*k > m.elements) throw std::invalid_argument("DeepSeek matrix view");
-    if(m.type!=0&&m.type!=30&&m.type!=8)throw std::invalid_argument("DeepSeek matrix storage type");
-    if(m.type==8 && (weight_offset%32||tokens>8))throw std::invalid_argument("DeepSeek packed matrix requires a short row window");
-    const uint64_t byte_offset=m.type==8?weight_offset/32*34:weight_offset*(m.type==0?4:2);
+    if(m.type!=0&&m.type!=30&&m.type!=8&&m.type!=14)throw std::invalid_argument("DeepSeek matrix storage type");
+    const int block=m.type==14?256:32;
+    if((m.type==8||m.type==14) && (weight_offset%block||k%block||tokens>8))throw std::invalid_argument("DeepSeek packed matrix requires a short row window");
+    const uint64_t byte_offset=m.type==14?weight_offset/256*210:m.type==8?weight_offset/32*34:weight_offset*(m.type==0?4:2);
     const void* weights=static_cast<const uint8_t*>(m.data)+byte_offset;
     // Match single-token and short verification reductions; strided grouped output uses the BLAS contract.
     if (verify_batch && tokens>1 && tokens<=8) {
@@ -212,6 +218,17 @@ void matrix_product(const Matrix& m,const float* x,float* out,int tokens,cublasH
             static_cast<const float*>(weights),k,x,ldx,&beta,out,ldy);
         else {
             gpu_check(to_bf16_strided_gpu(x,bf_input,tokens,k,ldx,stream));
+            // MoE projection output has an immediate BF16 boundary. Reuse the
+            // remaining input arena, with explicit capacity and contiguous output.
+            if(round_output && arithmetic==Arithmetic::production && ldy==n && k+n<=bf_scratch_cols &&
+               n==5120 && k==2304 && tokens>=256) {
+                auto* bf_output=bf_input+int64_t(tokens)*k;
+                status=cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,n,tokens,k,&alpha,weights,CUDA_R_16BF,k,
+                    bf_input,CUDA_R_16BF,k,&beta,bf_output,CUDA_R_16BF,n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+                if(status!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("DeepSeek BF16 output multiplication status="+std::to_string(status));
+                gpu_check(bf16_to_float_gpu(bf_output,out,int64_t(tokens)*n,stream));
+                return;
+            }
             status=cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,n,tokens,k,&alpha,weights,CUDA_R_16BF,k,
                 bf_input,CUDA_R_16BF,k,&beta,out,CUDA_R_32F,ldy,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
         }
@@ -228,10 +245,11 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
     if(m.type==30 && tokens>8 && m.cols>w.max_bf_input_cols)throw std::invalid_argument("DeepSeek matrix exceeds BF16 input scratch");
     if(m.packed_bf16) {
         const int n=rows?rows:m.rows,k=m.cols;
+        const int block=m.type==14?256:32,block_bytes=m.type==14?210:34;
         if(!ldx)ldx=k;if(!ldy)ldy=n;
-        if(n<1 || k<1 || k>8192 || weight_offset%32 || weight_offset+uint64_t(n)*k>m.elements || ldx<k || ldy<n)
+        if((m.type!=8&&m.type!=14) || n<1 || k<1 || k>8192 || k%block || weight_offset%block || weight_offset+uint64_t(n)*k>m.elements || ldx<k || ldy<n)
             throw std::invalid_argument("DeepSeek packed projection view");
-        const auto* packed=static_cast<const uint8_t*>(m.data)+weight_offset/32*34;
+        const auto* packed=static_cast<const uint8_t*>(m.data)+weight_offset/block*block_bytes;
         if(tokens<=8) {
             if(options.dense_q8_1&&options.dense_q8_batch&&tokens>1){
                 // Existing exact multi-column kernel shares each loaded weight across rows.
@@ -239,40 +257,41 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
                 else for(int t=0;t<tokens;++t)kernels::native_quantize_q8_1(x+int64_t(t)*ldx,
                     w.dense_input_q8+int64_t(t)*k/32*36,k,1,stream.value);
                 float* result=ldy==n?out:reinterpret_cast<float*>(w.dense_weight);
-                kernels::native_q8_0_mmvq(packed,w.dense_input_q8,result,k,n,tokens,stream.value);
+                kernels::native_mmvq(m.type,packed,w.dense_input_q8,result,k,n,tokens,stream.value);
                 if(ldy!=n)gpu_check(cudaMemcpy2DAsync(out,ldy*4,result,n*4,n*4,tokens,cudaMemcpyDeviceToDevice,stream.value));
             }else for(int t=0;t<tokens;++t) {
                 if(options.dense_q8_1){
                     kernels::native_quantize_q8_1(x+int64_t(t)*ldx,w.dense_input_q8,k,1,stream.value);
-                    kernels::native_q8_0_mmvq(packed,w.dense_input_q8,out+int64_t(t)*ldy,k,n,1,stream.value);
-                }else gpu_check(packed_bf16_gemv_gpu(packed,8,x+int64_t(t)*ldx,out+int64_t(t)*ldy,n,k,1,stream.value));
+                    kernels::native_mmvq(m.type,packed,w.dense_input_q8,out+int64_t(t)*ldy,k,n,1,stream.value);
+                }else gpu_check(packed_bf16_gemv_gpu(packed,m.type,x+int64_t(t)*ldx,out+int64_t(t)*ldy,n,k,1,stream.value));
             }
             if(round_output)gpu_check(round_bf16_strided_gpu(out,tokens,n,ldy,stream.value));
         }else {
             if(uint64_t(n)*k>8192ull*5120)throw std::invalid_argument("packed projection scratch bound");
             prefill::LedgerScope expand_trace(options.trace,"ds41.dense.expand");
-            gpu_check(dequant_bf16_gpu(packed,8,w.dense_weight,uint64_t(n)*k,stream.value));
+            gpu_check(dequant_bf16_gpu(packed,m.type,w.dense_weight,uint64_t(n)*k,stream.value));
             Matrix expanded{w.dense_weight,30,n,k,uint64_t(n)*k};
-            matrix_product(expanded,x,out,tokens,blas,stream.value,w.bf_input,options.arithmetic,0,ldx,ldy,0,round_output);
+            matrix_product(expanded,x,out,tokens,blas,stream.value,w.bf_input,options.arithmetic,0,ldx,ldy,0,round_output,false,w.max_bf_input_cols);
         }
         return;
     }
-    if(m.type==8&&tokens>8){
+    if((m.type==8||m.type==14)&&tokens>8){
         const int n=rows?rows:m.rows,k=m.cols;
+        const int block=m.type==14?256:32,block_bytes=m.type==14?210:34;
         if(!ldx)ldx=k;
         if(!ldy)ldy=n;
-        if(weight_offset%32)throw std::invalid_argument("DeepSeek packed matrix offset");
-        const auto* base=static_cast<const uint8_t*>(m.data)+weight_offset/32*34;
+        if(weight_offset%block||k%block)throw std::invalid_argument("DeepSeek packed matrix offset");
+        const auto* base=static_cast<const uint8_t*>(m.data)+weight_offset/block*block_bytes;
         for(int begin=0;begin<n;begin+=2048){
             const int count=std::min(2048,n-begin);
             if(int64_t(count)*k>5120*2304)throw std::runtime_error("DeepSeek head dequant workspace bound");
-            gpu_check(dequant_gpu(base+int64_t(begin)*k/32*34,8,w.dequant,int64_t(count)*k,stream.value));
+            gpu_check(dequant_gpu(base+int64_t(begin)*k/block*block_bytes,m.type,w.dequant,int64_t(count)*k,stream.value));
             Matrix tile{w.dequant,0,count,k,uint64_t(count)*k};
             matrix_product(tile,x,out+begin,tokens,blas,stream.value,w.bf_input,options.arithmetic,0,ldx,ldy,0,round_output);
         }
         return;
     }
-    matrix_product(m,x,out,tokens,blas,stream.value,w.bf_input,options.arithmetic,rows,ldx,ldy,weight_offset,round_output,options.target_verify_batch);
+    matrix_product(m,x,out,tokens,blas,stream.value,w.bf_input,options.arithmetic,rows,ldx,ldy,weight_offset,round_output,options.target_verify_batch,w.max_bf_input_cols);
 }
 Runtime::Runtime(const std::string& main,const RuntimeOptions& options,const std::string& draft,const std::string& vision)
     : impl_(std::make_unique<Impl>(main,options,draft,vision)) {}
@@ -296,6 +315,10 @@ void Runtime::write_ledger(std::ostream& out) const {
         <<",\"dspark_fused_moe\":"<<(p.options.dspark_fused_moe?"true":"false")
         <<",\"dspark_batch_projection\":"<<(p.options.dspark_batch_projection?"true":"false")
         <<",\"expert_gu_mode\":"<<p.options.expert_gu_mode<<",\"cpu_gu_q8_0\":"<<(p.options.cpu_gu_q8_0?"true":"false")
+        <<",\"decode_segment_mask\":"<<p.decode_segment_mask
+        <<",\"decode_segment_cache_bytes\":"<<p.work->segment_cache_bytes
+        <<",\"decode_segment_captures\":"<<(p.work->segment_captures[0]+p.work->segment_captures[1])
+        <<",\"decode_segment_replays\":"<<(p.work->segment_replays[0]+p.work->segment_replays[1])
         <<",\"decode_shared_graph\":"<<(p.options.decode_graph?"true":"false")<<",\"engram_continuous\":"<<(p.options.engram_continuous?"true":"false")
         <<",\"parallel_router\":"<<(p.options.parallel_router?"true":"false")
         <<",\"engram_aio\":"<<(p.options.engram_aio?"true":"false")

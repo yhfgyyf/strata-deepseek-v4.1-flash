@@ -1,28 +1,26 @@
 # Source provenance
 
-Publication date: October 20, 2026, Asia/Taipei.
+Release update: October 23, 2026, Asia/Taipei. Previous published commit: `159aba79f139b368fccc64a636799acb4958cb84`.
 
-## Source composition
+## Cumulative source
 
-- Foundation: `yhfgyyf/strata-nvfp4` commit `67adfffe4fe969df68d599f13190fd14665816cc` plus the current DeepSeek adaptation sources.
-- Cumulative experiment: the October 19 five-token adaptive/shared-Gate-Up-pair baseline. Its archived build receipt SHA256 is `c830d5f6e0b4e0bf400b31d1148b25c72f86d424c51eb88c53ff38f53adae3b3`.
-- 80 cumulative source-manifest entries were verified. The inactive `moe.cpp.orig` backup is not distributed; the other 79 entries supply the cumulative source overlay.
-- 141 supporting headers were verified against the same archived build receipt. Source overlays take precedence where manifests overlap.
-- The 45 Python serving files match the post-fix source set used for the latest API regression.
-- 314 selected source/tool files, including the 45 serving Python files, were checked against the current remote working tree with no differences. Manifest groups overlap; the published source manifest records each path once.
+The foundation remains `yhfgyyf/strata-nvfp4` commit `67adfffe4fe969df68d599f13190fd14665816cc`. This release overlays the frozen, 576-file October 23 cumulative snapshot, manifest SHA256 `e0370fb6588f5ee93b8a7aa10e0afb1336e9437fa859fcd08207f89b3d1d768c`, and the subsequently deployed 1M service entry. The source includes the accepted mixed-format/Unsloth/DSpark adaptations and 21-item experiment baseline. The original research history and evidence remain in their own locations.
 
-`data/source-manifest.json` records the exact published source hashes. It does not contain local home paths, host addresses or credentials. The repository is a new Git history containing this curated snapshot; the original source/workspace histories are retained separately.
+`data/source-manifest.json` identifies each distributed program-source hash and the files changed for packaging. All numerical runtime/kernel sources match the frozen snapshot, except the embedded bounded GEMM header whose non-allocated debug path strings are sanitized. Every non-debug ELF section, including executable code and constants, is byte-identical to the tested cubins. The PTX change is confined to `.file` paths. Original and packaged cubin hashes are retained in [bounded_gemm_generated.json](../src/kernels/cuda/bounded_gemm_generated.json).
 
 ## Packaging changes
 
-- Add the missing standalone CMake object target for `deepseek41_indexer_mx.cu`, with SM120a compilation, and a portable experimental executable.
-- Parameterize asset paths in the already-tested fixed native profile and add a local JSON launcher. The profile fixes chunk 8192, context 32768 and one slot.
-- Keep the cumulative loader's 100% huge-page guard. The last functional experiment's private 99% admission relaxation is not adopted; its actual allocation had been 100%.
-- Let the SHA-proof utility explicitly select the known Q2_K/Q4 draft digest.
-- Add bilingual documentation, configuration examples, a frozen historical cost table and derived measurement summaries. Private logs, traces, raw model inputs/outputs and weights are excluded.
+- Omit private, external-path experiment targets from CMake; keep the actual native runtime and operator-test targets.
+- Carry forward the deployed context=1048576, chunk=8192, IQ short-batch service entry. The frontend adds portable import paths and sets the adopted 40-block, 100%-huge-page and Graph-mask-2 environment.
+- Supply two explicit model configurations with variant-specific expert byte budgets and original 1017 draft/vision hashes.
+- Prepare full model-hash proofs and a clearly identified uncalibrated expert ranking/zero heat when calibrated assets are absent. Existing calibrated paths remain supported. There is no offline model conversion, shard merge or requantization.
+- Include two tokenizer-only ID-selection maps, with checked input/output subset semantics and hashes; no prompt or generated token streams are included.
+- Refresh bilingual documentation and derived measurements, preserving the prior performance report and its unresolved findings. FlashInfer CAKE source notices and exact source hashes are retained.
 
-## Validation
+## Verification scope
 
-A clean Linux/CUDA build linked all three native entry points; six selected native CPU tests and 69 Python API/configuration tests passed. The existing ggml checkout used for that build matched all 1376 files under the pinned upstream `ggml/` tree. Exact checks are in [publication-checks.json](../data/publication-checks.json). Build checks do not load a model. Existing operator and API evidence is described in [PERFORMANCE.md](PERFORMANCE.md), with its quality and configuration limits retained.
+A fresh isolated Linux/CUDA build linked the three native entry points; all 6 selected native CPU checks and 78 Python API/configuration tests passed. Actual asset-path preflight passed for both models, with no GPU loading. Source parity, 16 model-mirror identities, artifact content and 85 local documentation links are recorded in [publication-checks.json](../data/publication-checks.json). The previous release's receipt is preserved as [publication-checks-20261020.json](../data/publication-checks-20261020.json).
 
-No new GPU inference, profiling, model download, OS setting change or production-service deployment is part of publication. The existing server source tree and previous deployed binaries are not replaced.
+Both 1017 variants use the same original-GGUF runtime. Previously recorded GPU operator/full-model, vision and capacity evidence is reused within its stated scope; no new GPU inference, profile collection or service restart is part of publication. The automatic uncalibrated metadata path has CPU tests and path validation, not a fresh full-model execution or throughput result. The 6080.745 prefill peak and 512K input measurement are from the separate October 23 benchmark, not rebuilt publication binaries.
+
+No weights, private prompts/outputs, raw traces, calibrated heat snapshots, credentials or machine-private absolute paths are published. Repository visibility remains private. The existing running service and its original directories are not replaced.

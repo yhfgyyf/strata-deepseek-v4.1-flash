@@ -1033,6 +1033,49 @@ struct Q6KTraits {
         return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
     }
 };
+// Q6_K: one warp owns a row, keeping the original four independent block
+// accumulators and their reduction order. Avoid inter-warp shared memory while
+// retaining the exact single/multi-token Q8_1 arithmetic.
+template<int NCOLS>
+__launch_bounds__(4 * WARP, 2)
+__global__ void q6_row_warp_kernel(const Q6KBlock* __restrict__ w,
+                                 const Q81Block* __restrict__ x, float* __restrict__ y,
+                                 int n_in, int n_out) {
+    const int lane = threadIdx.x;
+    const int row = 4 * int(blockIdx.x) + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int nb = n_in / 256, xs = n_in / 32;
+    float sums[NCOLS][4] = {};
+    for (int first = 0; first < nb; first += 4) {
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const int block = first + part;
+            if (block < nb) {
+                const auto weight = Q6KTraits::load(w + size_t(row) * nb + block, lane);
+#pragma unroll
+                for (int t = 0; t < NCOLS; ++t)
+                    sums[t][part] += Q6KTraits::apply(weight, x + size_t(t) * xs + block * 8, lane);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NCOLS; ++t) {
+        float sum = sums[t][0];
+#pragma unroll
+        for (int part = 1; part < 4; ++part) sum += sums[t][part];
+        sum = warp_sum(sum);
+        if (!lane) y[size_t(t) * n_out + row] = sum;
+    }
+}
+void q6_row_warp(const void* w, const void* x, float* y, int ni, int no, int nc, cudaStream_t s) {
+    const dim3 grid(unsigned((no + 3) / 4)), block(WARP, 4);
+#define Q6_ROW_CASE(N) case N: q6_row_warp_kernel<N><<<grid, block, 0, s>>>(static_cast<const Q6KBlock*>(w), static_cast<const Q81Block*>(x), y, ni, no); break
+    switch (nc) {
+        Q6_ROW_CASE(1); Q6_ROW_CASE(2); Q6_ROW_CASE(3); Q6_ROW_CASE(4);
+        Q6_ROW_CASE(5); Q6_ROW_CASE(6); Q6_ROW_CASE(7); Q6_ROW_CASE(8);
+    }
+#undef Q6_ROW_CASE
+}
 struct IQ4XSTraits {
     using Block = IQ4XSBlock;
     static constexpr int DIV = 256, T = 8, KBY = 8, BPI = 4 * WARPS * WARP / 32;
@@ -2436,6 +2479,12 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
     STRATA_WAVE_MMVQ(Q6KTraits)
+    if (g_multi_exact && ((n_in==1280&&n_out==32768) ||
+        ((ncols==5||ncols==7)&&n_out>=5120) || (ncols==1&&n_in==2304&&n_out==5120))) {
+        q6_row_warp(weights, x_q8_1, y, n_in, n_out, ncols, static_cast<cudaStream_t>(stream));
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();

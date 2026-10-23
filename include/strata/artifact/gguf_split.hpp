@@ -20,7 +20,7 @@ namespace strata {
 // suffix is a model of one shard.  Only the five digits of the shard number are rewritten, so the directory and
 // the stem are the caller's own spelling (a symlinked Hugging Face snapshot keeps its split names).  Throws when
 // a shard is missing.
-inline std::vector<std::string> gguf_split_paths(const std::string& any) {
+inline std::vector<std::string> gguf_split_paths(const std::string& any, bool require_all = true) {
     static const char tag[] = "-of-";
     const size_t at = any.rfind(tag);
     // "...-NNNNN-of-MMMMM.gguf": five digits before the tag, five after it, then the extension
@@ -41,7 +41,7 @@ inline std::vector<std::string> gguf_split_paths(const std::string& any) {
         std::snprintf(num, sizeof num, "%05d", i);
         std::string p = any;
         p.replace(at - 5, 5, num);
-        if (!std::ifstream(p, std::ios::binary))
+        if (require_all && !std::ifstream(p, std::ios::binary))
             throw std::runtime_error("missing model shard " + p + " (shard " + std::to_string(i) + " of " +
                                      std::to_string(n) + "; is the download complete?)");
         out.push_back(std::move(p));

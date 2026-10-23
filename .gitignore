@@ -30,3 +30,8 @@ build*/
 /strata.json
 .DS_Store
 /examples/local*.json
+/examples/runtime/
+
+# Token-ID selection maps; contain no model weights or request tokens.
+!/data/draft-input-vocab-114801.bin
+!/data/draft-vocab-90000.bin

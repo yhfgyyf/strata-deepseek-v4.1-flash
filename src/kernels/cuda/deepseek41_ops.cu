@@ -3,6 +3,9 @@
 #include "strata/models/deepseek41/kernels.hpp"
 #include "strata/models/deepseek41/ops.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "deepseek41_rotary_shared.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -30,6 +33,14 @@ __device__ float weight_value(const uint8_t* p, int type, int64_t i) {
         return __uint_as_float(bits) * values[(p[1 + i % 16] >> ((i % 32) / 16 * 4)) & 15];
     }
     const int index = i % 256;
+    if (type == 14) {
+        p += (i / 256) * 210;
+        const int half=index/128,quarter=index%128/32,lane=index%32;
+        const int low=(p[half*64+(quarter%2)*32+lane] >> (quarter/2*4))&15;
+        const int high=(p[128+half*32+lane] >> (quarter*2))&3;
+        const int scale=reinterpret_cast<const int8_t*>(p+192)[half*8+quarter*2+lane/16];
+        return (half_value(p+208)*scale)*((low|(high<<4))-32);
+    }
     if (type == 10) {
         p += (i / 256) * 84;
         const int scale = p[index / 16];
@@ -43,7 +54,8 @@ __device__ float weight_value(const uint8_t* p, int type, int64_t i) {
     const int code = low - ((p[index % 32] & (1 << (index / 32))) ? 0 : 4);
     return (half_value(p + 108) * (scale - 32)) * code;
 }
-bool supported(int type) { return type == 0 || type == 1 || type == 2 || type == 42 || type == 8 || type == 10 || type == 11 || type == 30 || type == 39; }
+bool supported(int type) { return type == 0 || type == 1 || type == 2 || type == 42 || type == 8 || type == 10 || type == 11 || type == 14 || type == 30 || type == 39; }
+bool iq_type(int type) { return type==16 || type==17 || type==18 || type==21 || type==22; }
 __device__ float sigmoid(float x) { return x >= 0 ? 1.f / (1.f + expf(-x)) : expf(x) / (1.f + expf(x)); }
 __device__ float sum_block(float v) {
     __shared__ float sums[8];
@@ -125,6 +137,47 @@ __device__ void sum_columns(float (&values)[count]) {
         for(int j=0;j<count;++j)values[j]+=__shfl_down_sync(0xffffffff,values[j],delta);
     }
 }
+// Q6_K heads retain FP32 activations and decoded weights. Four independent
+// warp rows reduce launch/CTA overhead; every token count uses the same order.
+template<int NT>
+__global__ void q6_projection_warp(const uint8_t* __restrict__ weights,const float* __restrict__ x,
+                                 float* __restrict__ out,int rows,int cols,int64_t ldx,int64_t ldy,
+                                 bool round_weights,bool round_output) {
+    const int row=blockIdx.x*4+threadIdx.x/32,lane=threadIdx.x&31;
+    if(row>=rows)return;
+    const int blocks=cols/256;float sum[NT]{};
+    for(int b=0;b<blocks;++b){
+        const auto* p=weights+(int64_t(row)*blocks+b)*210;
+        const float d=half_value(p+208);
+        const int lo[4]={p[lane],p[32+lane],p[64+lane],p[96+lane]};
+        const int hi[2]={p[128+lane],p[160+lane]};
+#pragma unroll
+        for(int g=0;g<8;++g){
+            const int q=((lo[(g/4)*2+(g&1)]>>((g%4)/2*4))&15)|(((hi[g/4]>>(2*(g%4)))&3)<<4);
+            const int scale=reinterpret_cast<const int8_t*>(p+192)[2*g+lane/16];
+            float w=(d*scale)*(q-32);
+            if(round_weights)w=__bfloat162float(__float2bfloat16_rn(w));
+#pragma unroll
+            for(int t=0;t<NT;++t)sum[t]+=w*x[int64_t(t)*ldx+b*256+g*32+lane];
+        }
+    }
+#pragma unroll
+    for(int delta=16;delta;delta>>=1){
+#pragma unroll
+        for(int t=0;t<NT;++t)sum[t]+=__shfl_down_sync(0xffffffff,sum[t],delta);
+    }
+    if(lane==0){
+#pragma unroll
+        for(int t=0;t<NT;++t)out[int64_t(t)*ldy+row]=round_output?__bfloat162float(__float2bfloat16_rn(sum[t])):sum[t];
+    }
+}
+cudaError_t q6_projection(const void* weights,const float* x,float* out,int rows,int cols,int tokens,
+                          int64_t ldx,int64_t ldy,bool round_weights,bool round_output,cudaStream_t stream){
+#define Q6_PROJECTION(N) case N:q6_projection_warp<N><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);break
+    switch(tokens){Q6_PROJECTION(1);Q6_PROJECTION(2);Q6_PROJECTION(3);Q6_PROJECTION(4);Q6_PROJECTION(5);Q6_PROJECTION(6);Q6_PROJECTION(7);Q6_PROJECTION(8);default:return cudaErrorInvalidValue;}
+#undef Q6_PROJECTION
+    return cudaGetLastError();
+}
 __device__ float bf16(float value){return __bfloat162float(__float2bfloat16_rn(value));}
 __global__ void draft_projection5_kernel(const uint8_t* weights,int type,const float* x,float* out,
                                          int cols,int64_t ldx,int64_t ldy,bool round_weights,bool round_output){
@@ -156,6 +209,7 @@ __global__ void draft_projection7_kernel(const uint8_t* weights,int type,const f
         for(int t=0;t<7;++t)out[int64_t(t)*ldy+row]=round_output?bf16(values[t]):values[t];
     }
 }
+#include "deepseek41_draft_warp.cuh"
 template<int expert_type>
 __global__ void draft_moe_gu_kernel(const uint8_t* experts,uint64_t projection,const uint8_t* shared_gate,
                                     const uint8_t* shared_up,int shared_type,const float* x,const int* ids,
@@ -533,7 +587,8 @@ __global__ void engram_gate_kernel(float* h, const float* kv, const float* qw, c
     float hh = 0, kk = 0, dot = 0;
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
         hh += x[d] * x[d]; kk += key[d] * key[d];
-        dot += x[d] * qw[c * width + d] * kw[c * width + d] * key[d];
+        const float q=x[d]*qw[c*width+d];
+        dot += (kw?q*kw[c*width+d]:q)*key[d];
     }
     __shared__ float sums[3], gate;
     hh = sum_block(hh); if (!threadIdx.x) sums[0] = hh; __syncthreads();
@@ -551,14 +606,25 @@ __global__ void engram_gate_kernel(float* h, const float* kv, const float* qw, c
 int grid(int64_t n) { return static_cast<int>(std::min<int64_t>((n + 255) / 256, 65535)); }
 }
 cudaError_t dequant_gpu(const void* p, uint32_t type, float* out, int64_t n, cudaStream_t s) {
-    if (!supported(type) || n <= 0 || (type == 10 || type == 11 ? n % 256 : type == 42 ? n % 64 : type == 2 || type == 8 || type == 39 ? n % 32 : 0)) return cudaErrorInvalidValue;
+    if(type==13 || type==14 || iq_type(type)){
+        if(!p || !out || n<=0 || n%256)return cudaErrorInvalidValue;
+        kernels::dequant_f32(type,p,0,1,n,out,s);return cudaGetLastError();
+    }
+    if (!supported(type) || n <= 0 || (type == 10 || type == 11 || type == 14 ? n % 256 : type == 42 ? n % 64 : type == 2 || type == 8 || type == 39 ? n % 32 : 0)) return cudaErrorInvalidValue;
     dequant_kernel<<<grid(n),256,0,s>>>(static_cast<const uint8_t*>(p), type, out, n); return cudaGetLastError();
+}
+cudaError_t dequant_round_bf16_gpu(const void* p, uint32_t type, float* out, int64_t n, cudaStream_t s) {
+    if(type==13 && kernels::dequant_q5_f32_bf16(p,n,out,s))return cudaGetLastError();
+    if(type==14 && kernels::dequant_q6_f32_bf16(p,n,out,s))return cudaGetLastError();
+    const cudaError_t decoded=dequant_gpu(p,type,out,n,s);
+    return decoded==cudaSuccess?round_bf16_gpu(out,n,s):decoded;
 }
 cudaError_t draft_projection5_gpu(const void* weights,uint32_t type,const float* x,float* out,
                                  int rows,int cols,int64_t ldx,int64_t ldy,bool round_weights,
                                  bool round_output,cudaStream_t stream){
     if(!weights||!x||!out||rows<1||cols<1||ldx<cols||ldy<rows||
-       (type!=0&&type!=2&&type!=8&&type!=30)||((type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
+       (type!=0&&type!=2&&type!=8&&type!=14&&type!=30)||(type==14?cols%256:(type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
+    if(type==14)return q6_projection(weights,x,out,rows,cols,5,ldx,ldy,round_weights,round_output,stream);
     draft_projection5_kernel<<<rows,256,0,stream>>>(static_cast<const uint8_t*>(weights),type,x,out,cols,ldx,ldy,round_weights,round_output);
     return cudaGetLastError();
 }
@@ -566,7 +632,8 @@ cudaError_t draft_projection7_gpu(const void* weights,uint32_t type,const float*
                                  int rows,int cols,int64_t ldx,int64_t ldy,bool round_weights,
                                  bool round_output,cudaStream_t stream){
     if(!weights||!x||!out||rows<1||cols<1||ldx<cols||ldy<rows||
-       (type!=0&&type!=2&&type!=8&&type!=30)||((type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
+       (type!=0&&type!=2&&type!=8&&type!=14&&type!=30)||(type==14?cols%256:(type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
+    if(type==14)return q6_projection(weights,x,out,rows,cols,7,ldx,ldy,round_weights,round_output,stream);
     draft_projection7_kernel<<<rows,256,0,stream>>>(static_cast<const uint8_t*>(weights),type,x,out,cols,ldx,ldy,round_weights,round_output);
     return cudaGetLastError();
 }
@@ -577,6 +644,14 @@ cudaError_t draft_fused_moe_gpu(const void* experts,uint32_t expert_type,uint64_
     const uint64_t expected=expert_type==39?uint64_t(5120)*2304/32*17:uint64_t(5120)*2304/256*84;
     if((expert_type!=10&&expert_type!=39)||!experts||projection!=expected||!shared_gate||!shared_up||!shared_down||
        (shared_type!=2&&shared_type!=8&&shared_type!=30)||!x||!ids||!routing||!scratch||!out||tokens<1||tokens>7)return cudaErrorInvalidValue;
+    if(expert_type==39 && shared_type==30) {
+        draft_warp::draft_gu_warp<<<dim3(576,tokens*4),128,0,stream>>>(static_cast<const uint8_t*>(experts),projection,
+            static_cast<const uint8_t*>(shared_gate),static_cast<const uint8_t*>(shared_up),x,ids,routing,scratch);
+        const auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        draft_warp::draft_down_warp<<<dim3(1280,tokens),128,0,stream>>>(static_cast<const uint8_t*>(experts),projection,
+            static_cast<const uint8_t*>(shared_down),ids,scratch,out);
+        return cudaGetLastError();
+    }
     if(expert_type==10)draft_moe_gu_kernel<10><<<dim3(2304,tokens*4),256,0,stream>>>(static_cast<const uint8_t*>(experts),projection,
         static_cast<const uint8_t*>(shared_gate),static_cast<const uint8_t*>(shared_up),shared_type,x,ids,routing,scratch);
     else draft_moe_gu_kernel<39><<<dim3(2304,tokens*4),256,0,stream>>>(static_cast<const uint8_t*>(experts),projection,
@@ -602,7 +677,8 @@ cudaError_t expert_gu_gpu(const void* p,uint32_t type,const float* x,float* gate
 cudaError_t packed_verify_gpu(const void* p,uint32_t type,const float* x,float* out,
                              int rows,int cols,int tokens,int64_t ldx,int64_t ldy,cudaStream_t stream){
     if(!p||!x||!out||rows<1||cols<1||tokens<2||tokens>8||ldx<cols||ldy<rows||
-       (type!=0&&type!=30&&type!=8)||(type==8&&cols%32))return cudaErrorInvalidValue;
+       (type!=0&&type!=30&&type!=8&&type!=14)||(type==14?cols%256:type==8&&cols%32))return cudaErrorInvalidValue;
+    if(type==14)return q6_projection(p,x,out,rows,cols,tokens,ldx,ldy,false,false,stream);
     #define VERIFY_PROJECTION(N) case N: verify_projection_kernel<N><<<rows,256,0,stream>>>(static_cast<const uint8_t*>(p),type,x,out,cols,ldx,ldy);break
     switch(tokens){VERIFY_PROJECTION(2);VERIFY_PROJECTION(3);VERIFY_PROJECTION(4);VERIFY_PROJECTION(5);VERIFY_PROJECTION(6);VERIFY_PROJECTION(7);VERIFY_PROJECTION(8);}
     #undef VERIFY_PROJECTION
@@ -663,8 +739,14 @@ cudaError_t expert_q2_activation_grouped_gpu(const VerifyExpertGroup* groups,int
 }
 
 cudaError_t dequant_bf16_gpu(const void* p, uint32_t type, uint16_t* out, int64_t n, cudaStream_t s) {
+    if(type==13 || type==14 || iq_type(type)){
+        if(!p || !out || n<=0 || n%256)return cudaErrorInvalidValue;
+        if(type==13||type==14)kernels::dequant_bf16(type,p,0,1,n,out,s);
+        else kernels::iq_dequant_bf16(type,p,n,out,s);
+        return cudaGetLastError();
+    }
     if (!p || !out || n < 1 || !supported(type) ||
-        (type == 10 || type == 11 ? n % 256 : type == 42 ? n % 64 : type == 2 || type == 8 || type == 39 ? n % 32 : 0)) return cudaErrorInvalidValue;
+        (type == 10 || type == 11 || type == 14 ? n % 256 : type == 42 ? n % 64 : type == 2 || type == 8 || type == 39 ? n % 32 : 0)) return cudaErrorInvalidValue;
     if(expert_dequant_fast_enabled() && type==10)
         dq_pairs<10><<<(n+2047)/2048,256,0,s>>>(static_cast<const uint8_t*>(p),out,n);
     else if(expert_dequant_fast_enabled() && type==11)
@@ -674,12 +756,14 @@ cudaError_t dequant_bf16_gpu(const void* p, uint32_t type, uint16_t* out, int64_
 }
 cudaError_t packed_bf16_gemv_gpu(const void* p, uint32_t type, const float* x, float* out, int rows, int cols, int tokens, cudaStream_t s) {
     if (!p || !x || !out || rows < 1 || cols < 1 || tokens < 1 || tokens > 8 || !supported(type) ||
-        (type == 10 || type == 11 ? cols % 256 : type == 42 ? cols % 64 : type == 2 || type == 8 || type == 39 ? cols % 32 : 0)) return cudaErrorInvalidValue;
+        (type == 10 || type == 11 || type == 14 ? cols % 256 : type == 42 ? cols % 64 : type == 2 || type == 8 || type == 39 ? cols % 32 : 0)) return cudaErrorInvalidValue;
+    if(type==14)return q6_projection(p,x,out,rows,cols,tokens,cols,rows,true,false,s);
     gemv_kernel<true><<<dim3(rows,tokens),256,0,s>>>(static_cast<const uint8_t*>(p),type,x,out,rows,cols); return cudaGetLastError();
 }
 cudaError_t packed_gemv_gpu(const void* p, uint32_t type, const float* x, float* out, int rows, int cols, int tokens, cudaStream_t s) {
     if (!supported(type) || rows < 1 || cols < 1 || tokens < 1 || tokens > 65535 ||
-        (type == 10 || type == 11 ? cols % 256 : type == 42 ? cols % 64 : type == 2 || type == 8 || type == 39 ? cols % 32 : 0)) return cudaErrorInvalidValue;
+        (type == 10 || type == 11 || type == 14 ? cols % 256 : type == 42 ? cols % 64 : type == 2 || type == 8 || type == 39 ? cols % 32 : 0)) return cudaErrorInvalidValue;
+    if(type==14&&tokens<=8)return q6_projection(p,x,out,rows,cols,tokens,cols,rows,false,false,s);
     gemv_kernel<false><<<dim3(rows,tokens),256,0,s>>>(static_cast<const uint8_t*>(p), type, x, out, rows, cols); return cudaGetLastError();
 }
 cudaError_t rms_gpu(const float* x, const float* w, float* out, int width, int tokens, float eps, cudaStream_t s) {
@@ -720,7 +804,7 @@ cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hi
 cudaError_t hc_split_gpu(const float* x, const float* scale, const float* base, float* pre, float* post, float* comb,
                          int tokens, float eps, int iterations, cudaStream_t s) {
     if (tokens < 1 || eps <= 0 || iterations < 1) return cudaErrorInvalidValue;
-    hc_split_kernel<<<tokens,32,0,s>>>(x,scale,base,pre,post,comb,eps,iterations); return cudaGetLastError();
+    return hc_split_warp_gpu(x,scale,base,pre,post,comb,tokens,eps,iterations,s);
 }
 cudaError_t hc_pre_gpu(const float* x, const float* pre, float* out, int hidden, int tokens, cudaStream_t s) {
     if (hidden < 1 || tokens < 1) return cudaErrorInvalidValue;
@@ -736,6 +820,8 @@ cudaError_t rotate_gpu(float* x, int heads, int head_dim, int tokens, int64_t st
     if (heads < 1 || g.rope_dim != 64 || head_dim < g.rope_dim || tokens < 1 || start < 0) return cudaErrorInvalidValue;
     // Use the same FP32 frequency table on CPU and GPU; per-device pow rounding grows with position.
     const auto frequencies = rotary_frequencies(g, compressed);
+    if(rotary_detail::shared_shape(heads,head_dim,tokens))
+        return rotary_detail::launch(x,heads,head_dim,tokens,start,1,frequencies,inverse,s);
     rotate_kernel<<<grid(int64_t(tokens)*heads*g.rope_dim/2),256,0,s>>>(x,heads,head_dim,tokens,start,frequencies,inverse); return cudaGetLastError();
 }
 cudaError_t pool2_gpu(const float* a, const float* b, const float* ga, const float* gb, float* out, int width, cudaStream_t s) {

@@ -148,12 +148,13 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     auto round=[&](float* x,uint64_t n){if(c.arithmetic==Arithmetic::production)gpu_check(round_bf16_gpu(x,n,stream));};
     auto matmul=[&](const Matrix& m,const float* x,float* out,int tokens,Workspace& work,int rows=0,int64_t ldx=0,
                    int64_t ldy=0,uint64_t offset=0,bool round_output=true){
-        if(c.batch_projection&&tokens==draft_tokens&&(m.type==0||m.type==2||m.type==8||m.type==30)){
-            const int n=rows?rows:m.rows,k=m.cols;const bool packed=m.type==2||m.type==8;
+        if(c.batch_projection&&tokens==draft_tokens&&(m.type==0||m.type==2||m.type==8||m.type==14||m.type==30)){
+            const int n=rows?rows:m.rows,k=m.cols;const bool packed=m.type==2||m.type==8||m.type==14;
+            const int block=m.type==14?256:32;
             if(!ldx)ldx=k;if(!ldy)ldy=n;
-            if(n<1||k<1||(packed&&offset%32)||offset+uint64_t(n)*k>m.elements)
+            if(n<1||k<1||(packed&&(offset%block||k%block))||offset+uint64_t(n)*k>m.elements)
                 throw std::invalid_argument("DSpark draft matrix view");
-            const uint64_t bytes=packed?offset/32*(m.type==2?18:34):offset*(m.type==0?4:2);
+            const uint64_t bytes=packed?offset/block*(m.type==14?210:m.type==2?18:34):offset*(m.type==0?4:2);
             gpu_check((tokens==5?draft_projection5_gpu:draft_projection7_gpu)(static_cast<const uint8_t*>(m.data)+bytes,m.type,x,out,n,k,ldx,ldy,
                 m.packed_bf16&&c.arithmetic==Arithmetic::production,round_output&&c.arithmetic==Arithmetic::production,stream));
             if(c.stats)++c.stats->draft_batch_projection_calls;
@@ -187,7 +188,7 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         }
         matmul(weights.dense.at("fc.weight"),input_hidden,d.main_x,projected,w);
         dump("draft.fc",d.main_x,{updates,5120});
-        gpu_check(rms_gpu(d.main_x,static_cast<const float*>(weights.dense.at("enc.output_norm.weight").data),d.main_x,5120,projected,g.norm_eps,stream));round(d.main_x,int64_t(projected)*5120);
+        gpu_check((c.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(d.main_x,static_cast<const float*>(weights.dense.at("enc.output_norm.weight").data),d.main_x,5120,projected,g.norm_eps,stream));
         dump("draft.main_x",d.main_x,{updates,5120});
     }
     if(c.stats){c.stats->draft_context_rows+=updates;c.stats->draft_context_projection_rows+=projected;}
@@ -198,7 +199,7 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     gpu_check(init_residual_gpu(embedding.data,embedding.type,d.ids,nullptr,nullptr,d.h,d.pre,draft_tokens,stream));round(d.h,draft_tokens*20480);
     dump("draft.init",d.h,{draft_tokens,4,5120});
     auto norm=[&](const float* x,const std::string& name,float* out,int width,int count,int layer){
-        gpu_check(rms_gpu(x,static_cast<const float*>(weights.tensor(layer,name).data),out,width,count,g.norm_eps,stream));round(out,int64_t(width)*count);
+        gpu_check((c.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(x,static_cast<const float*>(weights.tensor(layer,name).data),out,width,count,g.norm_eps,stream));
     };
     std::vector<int64_t> writes(window+draft_tokens);std::iota(writes.begin(),writes.end(),0);
     std::vector<int64_t> slots(draft_tokens*(window+draft_tokens));for(int t=0;t<draft_tokens;++t)std::iota(slots.begin()+t*(window+draft_tokens),slots.begin()+(t+1)*(window+draft_tokens),0);
@@ -215,7 +216,7 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
             gpu_check(hc_project_gpu(d.h,static_cast<const float*>(weights.tensor(layer,p+"_fn").data),d.mixes,5120,draft_tokens,g.norm_eps,stream));
             gpu_check(hc_split_gpu(d.mixes,static_cast<const float*>(weights.tensor(layer,p+"_scale").data),static_cast<const float*>(weights.tensor(layer,p+"_base").data),pre,d.post,d.comb,draft_tokens,g.hc_eps,20,stream));
         };
-        hc("attn",d.attn_pre);gpu_check(hc_pre_gpu(d.h,d.pre,d.x,5120,draft_tokens,stream));round(d.x,draft_tokens*5120);norm(d.x,"attn_norm",d.x,5120,draft_tokens,layer);
+        hc("attn",d.attn_pre);gpu_check((c.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(d.h,d.pre,d.x,5120,draft_tokens,stream));norm(d.x,"attn_norm",d.x,5120,draft_tokens,layer);
         const std::string prefix="draft.blk."+std::to_string(layer)+".";
         dump(prefix+"attn_norm",d.x,{draft_tokens,5120});
         if(updates){
@@ -259,9 +260,11 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         }else{
             gpu_check(float_to_bf16_gpu(d.kv,d.kv_bf,draft_tokens*512,stream));gpu_check(pack_swa_gpu(d.kv_bf,d.writes+window,draft_tokens,512,cache,stream));
             gpu_check(float_to_bf16_gpu(d.q,d.q_bf,draft_tokens*32768,stream));
-            for(int t=0;t<draft_tokens;++t){PackedAttention a;a.q=d.q_bf+t*32768;a.output=d.out_bf+t*32768;a.tokens=1;a.swa=cache;
-                a.swa_slots=d.slots+t*(window+draft_tokens);a.swa_topk=window+draft_tokens;a.splits=8;a.partial=d.partial;a.lse=d.lse;a.sinks=static_cast<const float*>(weights.tensor(layer,"attn_sinks").data);
-                gpu_check(packed_attention_gpu(a,stream));}
+            PackedAttention a;a.q=d.q_bf;a.output=d.out_bf;a.tokens=draft_tokens;a.swa=cache;
+            a.swa_slots=d.slots;a.swa_topk=window+draft_tokens;a.splits=1;a.partial=d.partial;a.lse=d.lse;
+            a.sinks=static_cast<const float*>(weights.tensor(layer,"attn_sinks").data);
+            // Q projection scratch is dead until the next layer; keep the draft arena unchanged.
+            gpu_check(packed_attention_cake_draft_gpu(a,reinterpret_cast<int32_t*>(d.qr),size_t(draft_tokens)*1280*4,stream));
             gpu_check(bf16_to_float_gpu(d.out_bf,d.q,draft_tokens*32768,stream));
         }
         gpu_check(rotate_gpu(d.q,64,512,draft_tokens,position,g,false,true,stream));round(d.q,draft_tokens*32768);
@@ -269,9 +272,9 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         const auto& wo=weights.tensor(layer,"attn_output_a");for(int group=0;group<8;++group)matmul(wo,d.q+group*4096,d.o_low+group*1024,draft_tokens,w,1024,32768,8192,int64_t(group)*1024*4096);
         matmul(weights.tensor(layer,"attn_output_b"),d.o_low,d.branch,draft_tokens,w);
         dump(prefix+"attn_out",d.branch,{draft_tokens,5120});
-        gpu_check(hc_post_gpu(d.h,d.branch,d.post,d.comb,d.h,5120,draft_tokens,stream));round(d.h,draft_tokens*20480);
+        gpu_check((c.arithmetic==Arithmetic::production?hc_post_bf16_gpu:hc_post_gpu)(d.h,d.branch,d.post,d.comb,d.h,5120,draft_tokens,stream));
         dump(prefix+"attn_post",d.h,{draft_tokens,4,5120});
-        hc("ffn",d.pre);gpu_check(hc_pre_gpu(d.h,d.attn_pre,d.x,5120,draft_tokens,stream));round(d.x,draft_tokens*5120);norm(d.x,"ffn_norm",d.x,5120,draft_tokens,layer);
+        hc("ffn",d.pre);gpu_check((c.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(d.h,d.attn_pre,d.x,5120,draft_tokens,stream));norm(d.x,"ffn_norm",d.x,5120,draft_tokens,layer);
         dump(prefix+"ffn_norm",d.x,{draft_tokens,5120});
         matmul(weights.tensor(layer,"ffn_gate_inp"),d.x,d.route_logits,draft_tokens,w,0,0,0,0,false);
         const auto& shared_gate=weights.tensor(layer,"ffn_gate_shexp");
@@ -298,7 +301,7 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
             if(c.stats)++c.stats->draft_fused_moe_calls;
         }else{
         matmul(shared_gate,d.x,d.shared_gate,draft_tokens,w);matmul(shared_up,d.x,d.shared_up,draft_tokens,w);
-        gpu_check(swiglu_gpu(d.shared_gate,d.shared_up,nullptr,d.shared_act,2304,draft_tokens,10,stream));round(d.shared_act,draft_tokens*2304);
+        gpu_check((c.arithmetic==Arithmetic::production?swiglu_bf16_gpu:swiglu_gpu)(d.shared_gate,d.shared_up,nullptr,d.shared_act,2304,draft_tokens,10,stream));
         matmul(shared_down,d.shared_act,d.shared_out,draft_tokens,w);
         int offset=0;
         struct Group{int id,offset,count;};std::vector<Group> groups;
@@ -316,20 +319,20 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
                     Matrix m{bf,30,rows,cols,uint64_t(rows)*cols};matmul(m,input,output,group.count,w);}
             };
             project(blob,w.group_x,w.group_gate,2304,5120,w.expert_gate);project(blob+projection,w.group_x,w.group_up,2304,5120,w.expert_up);
-            gpu_check(swiglu_gpu(w.group_gate,w.group_up,w.group_weights+group.offset,w.group_act,2304,group.count,10,stream));round(w.group_act,int64_t(group.count)*2304);
+            gpu_check((c.arithmetic==Arithmetic::production?swiglu_bf16_gpu:swiglu_gpu)(w.group_gate,w.group_up,w.group_weights+group.offset,w.group_act,2304,group.count,10,stream));
             project(blob+2*projection,w.group_act,w.group_out,5120,2304,w.expert_down);
             gpu_check(scatter_expert_gpu(w.group_out,w.group_slots+group.offset,d.parts,group.count,3,stream));
         }
         gpu_check(combine_experts_gpu(d.parts,d.routes,d.shared_out,d.branch,draft_tokens,3,stream));round(d.branch,draft_tokens*5120);
         }
         dump(prefix+"ffn_out",d.branch,{draft_tokens,5120});
-        gpu_check(hc_post_gpu(d.h,d.branch,d.post,d.comb,d.h,5120,draft_tokens,stream));round(d.h,draft_tokens*20480);
+        gpu_check((c.arithmetic==Arithmetic::production?hc_post_bf16_gpu:hc_post_gpu)(d.h,d.branch,d.post,d.comb,d.h,5120,draft_tokens,stream));
         dump(prefix+"output",d.h,{draft_tokens,4,5120});
     }
     if(context_cache)context_cache->position=position;
-    gpu_check(hc_pre_gpu(d.h,d.pre,d.mean,5120,draft_tokens,stream));round(d.mean,draft_tokens*5120);
+    gpu_check((c.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(d.h,d.pre,d.mean,5120,draft_tokens,stream));
     dump("draft.mean",d.mean,{draft_tokens,5120});
-    gpu_check(rms_gpu(d.mean,static_cast<const float*>(weights.dense.at("output_norm.weight").data),d.x,5120,draft_tokens,g.norm_eps,stream));round(d.x,draft_tokens*5120);
+    gpu_check((c.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(d.mean,static_cast<const float*>(weights.dense.at("output_norm.weight").data),d.x,5120,draft_tokens,g.norm_eps,stream));
     matmul(weights.dense.at("output.weight"),d.x,d.head,draft_tokens,w,0,0,0,0,false);
     dump("draft.head",d.head,{draft_tokens,vocab});
     validate_sampling(sampling);
@@ -375,7 +378,8 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     DraftProposal proposal;std::vector<int> history=token_history;history.push_back(first);int previous=first;
     for(int i=0;i<draft_tokens;++i){
         const auto& markov=weights.dense.at("markov_w1.weight");
-        const auto* row=static_cast<const uint8_t*>(markov.data)+int64_t(weights.input_vocab.inverse[previous])*256/32*(markov.type==2?18:34);
+        const uint64_t row_bytes=markov.type==2?256/32*18:markov.type==8?256/32*34:256*(markov.type==0?4:2);
+        const auto* row=static_cast<const uint8_t*>(markov.data)+uint64_t(weights.input_vocab.inverse[previous])*row_bytes;
         gpu_check(dequant_gpu(row,markov.type,d.markov,256,stream));round(d.markov,256);
         matmul(weights.dense.at("markov_w2.weight"),d.markov,d.bias,1,w,0,0,0,0,false);
         dump("draft.markov."+std::to_string(i),d.markov,{256});dump("draft.bias."+std::to_string(i),d.bias,{vocab});

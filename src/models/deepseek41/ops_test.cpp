@@ -120,6 +120,11 @@ int main() {
         d::engram_gate_cpu(eng_ref.data(),eng_kv.data(),eng_q.data(),eng_k.data(),eng_mask.data(),tokens,hidden);
         cuda_check(d::engram_gate_gpu(dres.p,dekv.p,deq.p,dek.p,dem.p,tokens,hidden,nullptr));
         close(dres.read(),eng_ref,"Engram per-copy signed sqrt gate and image mask");
+        for(size_t i=0;i<eng_q.size();++i)eng_q[i]*=eng_k[i];
+        deq.upload(eng_q);dres.upload(residual);eng_ref=residual;
+        d::engram_gate_cpu(eng_ref.data(),eng_kv.data(),eng_q.data(),nullptr,eng_mask.data(),tokens,hidden);
+        cuda_check(d::engram_gate_gpu(dres.p,dekv.p,deq.p,nullptr,dem.p,tokens,hidden,nullptr));
+        close(dres.read(),eng_ref,"Engram folded F32 gate and image mask");
         d::Geometry geometry;
         std::vector<float>q(64*512);for(auto& x:q)x=normal(generator);
         for(bool compressed:{false,true})for(int position:{1,128,32767,131071,1048575}){

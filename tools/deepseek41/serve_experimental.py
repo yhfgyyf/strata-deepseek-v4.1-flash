@@ -10,6 +10,8 @@ import threading
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from tools.deepseek41.startup_assets import VARIANTS, prepare
+
 
 def load_config(path):
     path = Path(path).resolve()
@@ -19,6 +21,30 @@ def load_config(path):
         raise ValueError("a non-loopback DeepSeek API requires api_key")
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("port must be an integer in 1..65535")
+    variant = cfg.get("variant")
+    if variant is not None and variant not in VARIANTS:
+        raise ValueError("variant must be UD-IQ3_XXS or UD-Q2_K_XL")
+    # Explicit calibrated assets retain their existing behavior. The two supplied
+    # variant configs can instead prepare only small metadata beside the config.
+    if variant:
+        cfg.setdefault("hot_bytes", VARIANTS[variant])
+        runtime = Path(cfg.get("runtime_dir", "runtime/" + path.stem)).expanduser()
+        if not runtime.is_absolute():
+            runtime = path.parent / runtime
+        for name, filename in (("costs", "dspark-costs-rtxpro6000.txt"),
+                               ("draft_input_vocab", "draft-input-vocab-114801.bin"),
+                               ("draft_output_vocab", "draft-vocab-90000.bin")):
+            cfg.setdefault(name, str(ROOT / "data" / filename))
+        if bool(cfg.get("profile")) != bool(cfg.get("heat")):
+            raise ValueError("supply both profile and heat, or omit both for starter metadata")
+        cfg["_auto_profile"] = not cfg.get("profile")
+        cfg["_auto_integrity"] = not cfg.get("integrity")
+        if cfg["_auto_profile"]:
+            cfg.update(profile=str(runtime / "starter.strp"), heat=str(runtime / "starter-heat.txt"))
+        if cfg["_auto_integrity"]:
+            cfg["integrity"] = str(runtime / "integrity.txt")
+    if "hot_bytes" in cfg and (type(cfg["hot_bytes"]) is not int or not 0 < cfg["hot_bytes"] < 1 << 63):
+        raise ValueError("hot_bytes must be a positive integer below 2^63")
     for name in ("engine", "model", "draft", "tokenizer", "integrity", "profile", "heat",
                  "costs", "draft_input_vocab", "draft_output_vocab", "mmproj", "log"):
         value = cfg.get(name)
@@ -29,12 +55,24 @@ def load_config(path):
         resolved = Path(value).expanduser()
         if not resolved.is_absolute():
             resolved = path.parent / resolved
-        resolved = resolved.resolve()
-        if name != "log" and not resolved.is_file():
+        # Split GGUF peers are discovered beside the supplied first-shard path.
+        # Preserve an intentional symlink directory that assembles those peers.
+        resolved = Path(os.path.abspath(resolved)) if name == "model" else resolved.resolve()
+        generated = (name == "integrity" and cfg.get("_auto_integrity") or
+                     name in ("profile", "heat") and cfg.get("_auto_profile"))
+        if name != "log" and not generated and not resolved.is_file():
             raise ValueError(name + " file is missing: " + str(resolved))
         cfg[name] = str(resolved)
     if not os.access(cfg["engine"], os.X_OK):
         raise ValueError("engine must be executable")
+    if variant:
+        prefix = "DeepSeek-V4.1-Flash-1017-" + variant
+        if Path(cfg["model"]).name != prefix + "-00001-of-00007.gguf":
+            raise ValueError("model must name the first of the seven " + variant + " shards")
+        for i in range(1, 8):
+            peer = Path(cfg["model"]).with_name(prefix + f"-{i:05d}-of-00007.gguf")
+            if not peer.is_file():
+                raise ValueError("model shard is missing: " + str(peer))
     return cfg
 
 
@@ -45,8 +83,9 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.check_config:
-        print("Configuration paths are valid. No model or GPU was loaded.")
+        print("Configuration paths are valid. Generated metadata and full hashes are checked at launch. No model or GPU was loaded.")
         return
+    prepare(cfg)
     from serve.deepseek41_engine import DeepSeekEngine
     from serve.deepseek41_frontend import DeepSeekService
     from serve.deepseek41_tokenizer import DeepSeekTokenizer
@@ -55,13 +94,18 @@ def main():
     command = [cfg["engine"], cfg["model"], cfg["draft"], cfg.get("mmproj") or "-",
                cfg["integrity"], cfg["profile"], cfg["heat"], cfg["costs"],
                cfg["draft_input_vocab"], cfg["draft_output_vocab"]]
+    if "hot_bytes" in cfg:
+        command.append(str(cfg["hot_bytes"]))
     if cfg.get("log"):
         Path(cfg["log"]).parent.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX", "0")
+    os.environ["STRATA_DS41_BLOCK_SEGMENTS"] = "40"
+    os.environ["STRATA_DS41_BLOCK_HUGE_MIN_PERCENT"] = "100"
+    os.environ["STRATA_DS41_DECODE_SEGMENTS"] = "2"
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    engine = DeepSeekEngine(command, 32768, 1, True, True, log_path=cfg.get("log"))
+    engine = DeepSeekEngine(command, 1048576, 1, True, True, log_path=cfg.get("log"))
     server = None
     try:
         tokenizer = DeepSeekTokenizer(cfg["tokenizer"])
@@ -69,6 +113,7 @@ def main():
                                  vision=bool(cfg.get("mmproj")),
                                  sampling_defaults={"temperature": 0.0, "top_k": 1,
                                                     "top_p": 1.0, "seed": 1234})
+        service.set_shared({"max_tokens": 32768})
         service.api_key = cfg.get("api_key", "")
         server = serve(service, cfg.get("host", "127.0.0.1"), cfg.get("port", 30011))
         print("DeepSeek ready on {}:{}".format(*server.server_address[:2]), flush=True)

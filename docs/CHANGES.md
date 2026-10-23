@@ -10,7 +10,7 @@ For the phrase “new compared with Strata”, the upstream inspection was pinne
 |---|---|---|
 | Model contracts and CED | [model.cpp](../src/models/deepseek41/model.cpp), [session.cpp](../src/models/deepseek41/session.cpp), [layer.cpp](../src/models/deepseek41/layer.cpp) | DeepSeek geometry, KV ownership, compressed/indexed attention, hyper-connections and prompt/tail replay. |
 | Engram | [engram.cpp](../src/models/deepseek41/engram.cpp), [engram_pipeline.cpp](../src/models/deepseek41/engram_pipeline.cpp) | SSD row access, host row cache and asynchronous preparation/upload. |
-| Expert residency | [adaptive_cache.cpp](../src/models/deepseek41/adaptive_cache.cpp), [adaptive_policy.hpp](../src/models/deepseek41/adaptive_policy.hpp), [expert_pipeline.cpp](../src/models/deepseek41/expert_pipeline.cpp) | Q3_K/Q2_K format groups, bounded migration, prefill lookahead and raw-cache handling. |
+| Expert residency | [adaptive_cache.cpp](../src/models/deepseek41/adaptive_cache.cpp), [adaptive_policy.hpp](../src/models/deepseek41/adaptive_policy.hpp), [expert_pipeline.cpp](../src/models/deepseek41/expert_pipeline.cpp) | Mixed IQ3/Q2_K/Q6_K format groups, bounded migration, prefill lookahead and raw-cache handling. |
 | Host backing | [host_memory.hpp](../src/models/deepseek41/host_memory.hpp) | Model-specific 40-segment registration and measured 2 MiB coverage checks; bounded collapse attempts on process-owned memory. |
 | DSpark | [draft.cpp](../src/models/deepseek41/draft.cpp), [weights.cpp](../src/models/deepseek41/weights.cpp), [deepseek41_runtime.cu](../src/kernels/cuda/deepseek41_runtime.cu) | Low-bit draft, distinct input/output vocabularies, fused/batched projections, incremental KV and exact accepted-prefix commit. |
 | Adaptive verification | [adaptive_verification.hpp](../include/strata/models/deepseek41/adaptive_verification.hpp), [deepseek41_confidence.cu](../src/kernels/cuda/deepseek41_confidence.cu) | Fused FP32 confidence head plus sigmoid; cost-based prefix selection before verification, currently greedy-only. |
@@ -25,8 +25,10 @@ Strata already supplies expert caching, heterogeneous offload, chunked prefill, 
 
 ## What is enabled
 
-The fixed experimental starter enables the current 5-token adaptive/shared-pair recipe. Source support for 7 tokens remains for reproducibility, but the measured 7-token configuration regressed and is not selected. The separate rejected CPU cold-expert overlap candidate is not merged into this snapshot. Broad model quality and stability remain open as described in [PERFORMANCE.md](PERFORMANCE.md).
+The fixed experimental starter enables the October 23 cumulative 5-token adaptive/shared-pair recipe, mixed-format expert paths, IQ short-batch verification and decode Graph mask 2. Source support for 7 tokens remains for reproducibility, but the measured 7-token configuration regressed and is not selected. The separate rejected CPU cold-expert overlap candidate is not merged into this snapshot. Broad model quality and stability remain open as described in [PERFORMANCE.md](PERFORMANCE.md).
 
-## Publication changes
+## October 23 source update
 
-Publication adds only portable path/configuration entry points, the missing standalone CMake wiring for the already-tested MX indexer, a derived-draft proof selection, documentation and source provenance. It does not introduce a new quantization algorithm or a new model-performance result. The core cumulative arithmetic sources are preserved byte-for-byte, with the packaging exceptions recorded separately.
+The new snapshot includes both Unsloth seven-shard contracts, original 1017 DSpark/BF16 vision loading, mixed expert kernels, dense Q6 paths, boundary/rotary/vision fusions, main and draft CAKE attention, bounded grouped MoE and IQ short-batch verification. These are previously accepted cumulative components; publishing them is not a new performance experiment. The 1M service entry is carried forward with its 8192 chunk.
+
+Publication adds two explicit model configurations, automatic full-hash proofs and uncalibrated startup metadata, plus tokenizer-derived draft ID maps. Existing calibrated profile/heat paths remain usable. No model weights are rewritten. Embedded cubin debug paths are sanitized with all non-debug ELF sections preserved byte-for-byte. Private experiment-only CMake targets are omitted. Exact source and packaging provenance is in [SOURCE_PROVENANCE.md](SOURCE_PROVENANCE.md).

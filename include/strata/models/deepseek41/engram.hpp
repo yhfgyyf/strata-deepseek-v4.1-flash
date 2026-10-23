@@ -54,7 +54,8 @@ class EngramReader {
 public:
     EngramReader(const std::string& path, const std::array<uint64_t, 2>& table_offsets,
                  const std::array<uint64_t, 2>& table_rows, uint64_t cache_budget,
-                 size_t queue_limit = 4,bool continuous_reads = false,bool native_aio = false);
+                 size_t queue_limit = 4,bool continuous_reads = false,bool native_aio = false,
+                 uint64_t packed_row_bytes = 272);
     explicit EngramReader(const Model& model, uint64_t cache_budget,bool continuous_reads = false,bool native_aio = false);
     ~EngramReader();
     EngramReader(const EngramReader&) = delete;

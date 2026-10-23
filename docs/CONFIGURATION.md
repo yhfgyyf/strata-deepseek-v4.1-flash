@@ -1,42 +1,45 @@
-# Runtime profiles
+# Runtime configuration
 
-## Fixed experimental starter
+Both [UD-Q2_K_XL](../examples/rtxpro6000.ud-q2-k-xl.json) and [UD-IQ3_XXS](../examples/rtxpro6000.ud-iq3-xxs.json) use `tools/deepseek41/serve_experimental.py --config FILE`. `rtxpro6000.experimental.json` is a compatibility copy of the Q2_K_XL example.
 
-`tools/deepseek41/serve_experimental.py` launches `strata-deepseek41-experimental` using [the example JSON](../examples/rtxpro6000.experimental.json). Relative paths are resolved against the configuration file's directory. `--check-config` checks files and the engine's executable bit without loading a model or accessing a GPU. Full model SHA proofs are enforced by the native loader during startup.
-
-The C++ recipe is [experimental_server.cpp](../tools/deepseek41/experimental_server.cpp). It is intentionally a fixed, reviewable recipe for the test machine:
+## Fixed starter settings
 
 | Setting | Value |
 |---|---|
-| Context / request slots | 32768 / 1 |
-| Prefill chunk | 8192; automatic chunk selection disabled |
+| Context / request slots | 1048576 / 1 |
+| Default maximum output | 32768; bounded by remaining context |
+| Prefill chunk | 8192, no automatic chunk selection |
 | Work / state / GPU headroom | 6720 / 1024 / 700 MiB |
-| GPU expert budget | 72,596,914,176 bytes; 5649 experts with the original frozen ranking |
-| RAM expert budget / host headroom | 144 / 16 GiB |
-| Engram host row cache | 8 GiB |
-| Expert migration scratch | 3072 MiB |
-| Host expert backing | 40 segments, 100% 2 MiB pages before and after registration |
-| Main short-row MoE fusion | Mode 2 |
-| Indexer scores / paired expert expansion | Fast paths enabled |
-| DSpark | 5 draft tokens, batched target verification, incremental KV, prefix commit |
-| Adaptive verification / shared Q8 pair | Enabled / enabled |
+| GPU expert byte budget | UD-Q2_K_XL: 68664950784; UD-IQ3_XXS: 67636039680 |
+| RAM expert budget / host headroom | 160 / 16 GiB |
+| Engram host cache / migration scratch | 8 GiB / 3072 MiB |
+| Host expert backing | 40 registered blocks, 100% 2 MiB page coverage before and after registration |
+| Main arithmetic | Existing BF16/route/reduction contracts; accepted mixed-format and short-batch kernels |
+| DSpark | Original 1017 draft; at most 5 proposals, adaptive greedy verification, incremental KV, prefix commit |
+| Shared Q8 pair / main MoE fusion | Enabled / mode 2 |
+| Decode Graph segments | Output/router mask 2 |
 | Sampling | Greedy, temperature 0, top_k 1, seed 1234 |
-| Residency | Format groups, accepted-row update period, saved startup heat |
-| Routed expert arithmetic | GPU; rejected CPU overlap path is not enabled |
-| Images | Optional matching mmproj; omit `mmproj` or set it to an empty string for text only |
+| Residency | Format groups and online accepted-row adaptation |
+| Vision | Matching BF16 mmproj; optional |
 
-The GPU budget is a byte budget, not a guaranteed expert count on a different profile. Starting with a different profile or heat distribution changes execution and may change speed. The cost file is a historical calibration, not an automatically tuned setting.
+A byte budget does not guarantee an expert count: the exact count depends on formats and ranking. The deployed Q2_K_XL calibrated configuration has 5571 initial experts. Do not attach that number or its throughput to the uncalibrated starter ranking. The 32K-chunk throughput benchmark used 23823646720 bytes of workspace and 51887734784 hot-expert bytes (4221 experts); it is not the fixed starter configuration.
 
-The starter keeps a process-owned runtime, matching the tested native harness, and exits the native IPC process after service shutdown. It does not apply OS huge-page policy, clear global caches, stop unrelated processes or download assets. Insufficient huge pages cause startup to fail with an explicit error.
+The existing 1 GiB state arena accommodated 1000.523 MiB of actual 1M session state on the deployed Q2_K_XL service. This validates capacity allocation, not a complete 1M-input request or continuous 32K output.
 
-## Generic launcher
+## JSON fields
 
-`python -m serve.deepseek41 --config examples/basic.json` uses the original general CLI wrapper. Edit the asset paths first. It is a basic non-speculative configuration; it does not enable every experimental runtime switch. Its paths follow the working directory, as in the inherited launcher.
+Required: `engine`, `variant`, `model` (first shard), `draft`, `tokenizer`. `variant` is `UD-IQ3_XXS` or `UD-Q2_K_XL`. Optional `mmproj` enables images. The example paths must be edited before use.
 
-The source still contains `auto` chunk parsing and other research options. The supplied profiles deliberately use **8192** and do not select `auto` or `auto:N`.
+Optional `runtime_dir` contains auto-generated `integrity.txt`, `starter.strp` and `starter-heat.txt`. The default is `runtime/<config-stem>` beside the JSON. Bundled `costs`, `draft_input_vocab` and `draft_output_vocab` are used unless explicit paths are supplied. The cost table is a historical calibration, not an automatic hardware tuner.
 
-## Asset identity
+To reuse calibrated startup assets, provide both `profile` and `heat`. An explicit `integrity` path uses your existing native-loader proof. Explicit files must exist and are not overwritten. `hot_bytes` overrides the variant's byte budget; it must be a positive integer. Arbitrary new budgets/profiles are not covered by the published performance evidence.
 
-The experimental starter expects the tested derived draft SHA256 `9269e73cbd04c493d2510d3513da85429441949f6f10ed8130392ae0de2a949b`. Its input/output vocabulary maps, startup ranking and heat must be supplied locally. The maps contain token IDs; profile/heat contain expert ranking and counters. None of these files is silently inferred from the current request or replaced by a generic placeholder.
+`host`, `port`, `alias`, `log` and private `api_key` control the frontend. The defaults are localhost, 30011 and `deepseek-v4.1`. Non-loopback binding requires authentication. Paths are relative to the config file, while the supplied first-shard directory spelling is preserved for intentional symlink assemblies.
 
-The loader checks model file identity against a locally created full-hash proof, including device, inode, size and timestamps. Moving or changing a file can require regenerating that proof. The proof is a startup integrity check, not a claim that subsequent hardware reads can never be inconsistent.
+The launcher sets `STRATA_DS41_BLOCK_SEGMENTS=40`, `STRATA_DS41_BLOCK_HUGE_MIN_PERCENT=100` and `STRATA_DS41_DECODE_SEGMENTS=2`, and defaults `CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX=0`, matching the adopted profile. It does not change system configuration. `--check-config` only checks paths and executable permissions; startup checks generated metadata and full model identity.
+
+## What preparation changes
+
+Only small metadata files are written. All GGUFs remain read-only, including original draft and vision files. The packaged draft maps select token IDs during loading; their SHA256 and tokenizer provenance are recorded in [draft-vocab-provenance.json](../data/draft-vocab-provenance.json). A complete, interleaved expert ranking with zero heat is provided automatically when no calibrated pair is configured, and is clearly logged as uncalibrated.
+
+The proof is host/filesystem specific and cannot be copied blindly to another machine. Full SHA verification proves the bytes read at that time; it does not resolve historical hardware/readback or model-repeatability anomalies.

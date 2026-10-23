@@ -1,5 +1,6 @@
 #include "../../models/deepseek41/runtime_kernels.hpp"
 #include "strata/models/deepseek41/ops.hpp"
+#include "deepseek41_rotary_shared.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cmath>
@@ -143,7 +144,7 @@ cudaError_t init_residual_gpu(const void* w,int type,const int* ids,const float*
 }
 cudaError_t draft_markov_row_gpu(const void* weights,int type,const int* previous,const int* inverse,
                                 float* out,bool bf16,int* status,cudaStream_t stream) {
-    if(!weights||!previous||!inverse||!out||!status||(type!=2&&type!=8))return cudaErrorInvalidValue;
+    if(!weights||!previous||!inverse||!out||!status||(type!=0&&type!=2&&type!=8&&type!=30))return cudaErrorInvalidValue;
     draft_markov_row_kernel<<<1,256,0,stream>>>(weights,type,previous,inverse,out,bf16,status);return cudaGetLastError();
 }
 cudaError_t draft_penalty_counts_gpu(const int* history,int count,const int* inverse,int* counts,cudaStream_t stream) {
@@ -179,6 +180,8 @@ cudaError_t pool_groups_gpu(const float* kv,const float* gate,const float* previ
 cudaError_t rotate_strided_gpu(float* x,int heads,int dim,int tokens,int64_t start,int step,const Geometry& g,
                               bool compressed,bool inverse,cudaStream_t s) {
     if (tokens < 1 || heads < 1 || dim < 64 || start < 0 || step < 1) return cudaErrorInvalidValue;
+    if(rotary_detail::shared_shape(heads,dim,tokens))
+        return rotary_detail::launch(x,heads,dim,tokens,start,step,rotary_frequencies(g,compressed),inverse,s);
     rotate_kernel<<<grid(int64_t(tokens)*heads*32),256,0,s>>>(x,heads,dim,tokens,start,step,rotary_frequencies(g,compressed),inverse); return cudaGetLastError();
 }
 cudaError_t window_slots_gpu(int64_t* slots,int tokens,int previous,cudaStream_t s) {

@@ -16,11 +16,11 @@ inline int adaptive_index(ExpertKey key){return key.first*384+key.second;}
 inline int adaptive_group(int layer){return layer<14?0:1;}
 
 // Selection is CPU-only so the same policy can be checked independently of DMA.
-// Grouped mode is enabled only after the caller validates the two NativeFmt layouts.
+// The caller assigns identical IDs only to identical NativeFmt layouts.
 inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
     const std::array<uint64_t,40>& sizes,const std::vector<double>& heat,
     const std::vector<int32_t>& slots,const std::vector<uint64_t>& offsets,
-    bool grouped,uint64_t capacity,uint64_t budget){
+    bool grouped,uint64_t capacity,uint64_t budget,const std::array<int,40>* layout_groups=nullptr){
     constexpr int keys=40*384;
     constexpr auto no_ram=std::numeric_limits<uint64_t>::max();
     if(heat.size()!=keys||slots.size()!=keys||offsets.size()!=keys)
@@ -28,13 +28,14 @@ inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
     struct Ranked { double value;ExpertKey key; };
     std::array<std::vector<Ranked>,40> candidates,victims;
     for(int l=0;l<40;++l)for(int e=0;e<384;++e){
-        const int k=l*384+e,g=grouped?adaptive_group(l):l;
+        const int k=l*384+e,g=grouped?(layout_groups?layout_groups->at(l):adaptive_group(l)):l;
+        if(g<0||g>=40)throw std::invalid_argument("adaptive format group ID");
         if(!std::isfinite(heat[k])||heat[k]<0)throw std::invalid_argument("adaptive nonfinite/negative heat");
         if(slots[k]>=0)victims[g].push_back({heat[k],{l,e}});
         else if(heat[k]>=2.0&&offsets[k]!=no_ram)candidates[g].push_back({heat[k],{l,e}});
     }
     std::vector<AdaptiveExchange> choices;
-    for(int g=0;g<(grouped?2:40);++g){
+    for(int g=0;g<40;++g){
         auto& in=candidates[g];auto& out=victims[g];
         std::sort(in.begin(),in.end(),[](auto a,auto b){return a.value!=b.value?a.value>b.value:a.key<b.key;});
         std::sort(out.begin(),out.end(),[](auto a,auto b){return a.value!=b.value?a.value<b.value:a.key<b.key;});

@@ -1290,11 +1290,14 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   if(STRATA_ENABLE_CUDA)
     add_library(strata_deepseek41_kernels STATIC src/kernels/cuda/deepseek41_ops.cu
+      src/kernels/cuda/deepseek41_bounded_moe.cu
+        src/kernels/cuda/deepseek41_boundary_fusions.cu
+      src/kernels/cuda/deepseek41_mixed_expert.cu
       src/kernels/cuda/deepseek41_confidence.cu
       src/kernels/cuda/deepseek41_format_down.cu
       src/kernels/cuda/deepseek41_attention.cu src/kernels/cuda/deepseek41_cache.cu
       src/kernels/cuda/deepseek41_runtime.cu
-      src/kernels/cuda/deepseek41_vision.cu
+      src/kernels/cuda/deepseek41_vision.cu src/kernels/cuda/deepseek41_vision_tiled.cu
       src/kernels/cuda/deepseek41_indexer.cu src/models/deepseek41/indexer.cpp src/models/deepseek41/cache.cpp)
     # The cumulative SM120 indexer uses architecture-specific block-scaled MMA.
     # A separate object keeps its 120a code out of the portable CUDA targets.
@@ -1304,7 +1307,23 @@ if(STRATA_NATIVE_EXPERTS)
     target_compile_options(strata_deepseek41_indexer_mx PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120a,code=sm_120a>)
     target_sources(strata_deepseek41_kernels PRIVATE $<TARGET_OBJECTS:strata_deepseek41_indexer_mx>)
+    # Fixed upstream CAKE sources, standalone CUDA; no Python/TVM dependency.
+    add_library(strata_deepseek41_cake OBJECT src/kernels/cuda/deepseek41_cake.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_dual_sa_ip_el_heads_pw_h32_64_128_fold.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_dual_sa_lq_t1_el_ew_ra_pw_h64_fold.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_h64_dual_sa_tl_ip_el_e2m1_nomul.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_merge_default_heads_h8_16_32_48_64_80_96_112_128_fold.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_merge_mo2_heads_h8_16_32_64_128_fold.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_single_default_heads_h32_64_96_128_fold.cu
+      src/kernels/cuda/cake/cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu
+    )
+    target_include_directories(strata_deepseek41_cake PRIVATE include)
+    set_target_properties(strata_deepseek41_cake PROPERTIES CUDA_ARCHITECTURES OFF)
+    target_compile_options(strata_deepseek41_cake PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_120a,code=sm_120a>)
+    target_sources(strata_deepseek41_kernels PRIVATE $<TARGET_OBJECTS:strata_deepseek41_cake>)
     target_link_libraries(strata_deepseek41_kernels PUBLIC strata_deepseek41_model CUDA::cudart PRIVATE strata_kernels)
+    target_include_directories(strata_deepseek41_kernels PRIVATE third_party/ggml)
     add_library(strata_deepseek41_runtime STATIC src/models/deepseek41/runtime.cpp src/models/deepseek41/weights.cpp
       src/models/deepseek41/layer.cpp src/models/deepseek41/moe.cpp src/models/deepseek41/session.cpp src/models/deepseek41/vision.cpp
       src/models/deepseek41/draft.cpp)
@@ -1346,6 +1365,13 @@ if(STRATA_NATIVE_EXPERTS)
     target_compile_definitions(strata PRIVATE STRATA_DEEPSEEK41=1)
     target_link_libraries(strata PRIVATE strata_deepseek41_runtime)
     if(STRATA_BUILD_DEEPSEEK41_TESTS)
+      add_executable(deepseek41_iq3xxs_operator_test src/models/deepseek41/iq3xxs_operator_test.cpp)
+      target_include_directories(deepseek41_iq3xxs_operator_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(deepseek41_iq3xxs_operator_test PRIVATE strata_deepseek41_runtime ggml-base)
+      add_executable(deepseek41_mixed_expert_test src/models/deepseek41/mixed_expert_test.cpp
+        src/models/deepseek41/mixed_expert_compare.cu)
+      target_include_directories(deepseek41_mixed_expert_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(deepseek41_mixed_expert_test PRIVATE strata_deepseek41_runtime ggml-base)
       add_test(NAME deepseek41_score_self_test COMMAND strata-deepseek41-score-runtime --self-test)
       set_tests_properties(deepseek41_score_self_test PROPERTIES TIMEOUT 30 ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
       add_executable(deepseek41_phase_gpu_test src/models/deepseek41/phase_gpu_test.cu)
@@ -1360,7 +1386,7 @@ if(STRATA_NATIVE_EXPERTS)
       add_executable(deepseek41_expert_pipeline_test src/models/deepseek41/expert_pipeline_test.cu)
       add_executable(deepseek41_engram_pipeline_test src/models/deepseek41/engram_pipeline_test.cu)
       target_include_directories(deepseek41_engram_pipeline_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-      target_link_libraries(deepseek41_engram_pipeline_test PRIVATE strata_deepseek41_runtime)
+      target_link_libraries(deepseek41_engram_pipeline_test PRIVATE strata_deepseek41_runtime ggml-base)
       add_test(NAME deepseek41_engram_pipeline_test COMMAND deepseek41_engram_pipeline_test)
       set_tests_properties(deepseek41_engram_pipeline_test PROPERTIES TIMEOUT 60)
       target_include_directories(deepseek41_expert_pipeline_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

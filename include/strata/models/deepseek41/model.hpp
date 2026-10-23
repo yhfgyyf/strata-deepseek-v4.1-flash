@@ -39,11 +39,12 @@ struct TensorView {
     const uint8_t* data = nullptr;
     uint64_t bytes = 0, row_bytes = 0;
     TensorRole role = TensorRole::dense;
+    const GgufFile* file = nullptr;
 };
 
 struct ExpertSlice {
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
-    uint32_t type = 0;
+    uint32_t type = 0, down_type = 0;
     uint64_t gu_row_bytes = 0, down_row_bytes = 0, projection_bytes = 0, blob_bytes = 0;
 };
 
@@ -69,11 +70,21 @@ public:
     Model(const std::string& main, const std::string& draft = {}, const std::string& vision = {});
     static std::unique_ptr<Model> vision_only(const std::string& path);
     static std::unique_ptr<Model> draft_only(const std::string& path);
+    // Explicit inspection/operator harness only; Runtime refuses incomplete main weights.
+    static std::unique_ptr<Model> operator_weights_only(const std::string& path);
+    bool main_complete() const { return main_complete_; }
+    bool ple_engram() const { return ple_engram_; }
+    bool draft_shares_embeddings() const { return draft_shared_embeddings_; }
+    std::string checkpoint_identity() const;
+    uint32_t engram_type() const { return ple_engram_ ? tensor("per_layer_token_embd.weight").info->type : 8; }
+    uint64_t engram_row_bytes() const { return ple_engram_ ? tensor("per_layer_token_embd.weight").row_bytes : 272; }
     bool has_vision() const { return vision_ != nullptr; }
     bool has_draft() const { return draft_ != nullptr; }
     const Geometry& geometry() const { return geometry_; }
     const auto& ownership() const { return ownership_; }
-    const auto& tensors() const { return tensors_; }
+    const auto& tensors(bool draft = false, bool vision = false) const {
+        return vision ? vision_tensors_ : draft ? draft_tensors_ : tensors_;
+    }
     const TensorView& tensor(const std::string& name, bool draft = false, bool vision = false) const;
     ExpertSlice expert(int layer, int expert, bool draft = false) const;
     std::array<uint64_t, 40> expert_bytes() const;
@@ -85,12 +96,15 @@ private:
     Model() = default;
     using Views = std::map<std::string, TensorView>;
     void load_main();
+    void open_main(const std::string& path, bool operator_only);
     void load_draft();
     void load_vision();
     void validate_file(const GgufFile& file, Views& views, bool draft, bool vision);
     Geometry geometry_;
     std::array<LayerOwnership, 40> ownership_ = layer_ownership();
     std::unique_ptr<GgufFile> main_, draft_, vision_;
+    std::vector<std::unique_ptr<GgufFile>> main_shards_;
+    bool main_complete_ = true, ple_engram_ = false, draft_shared_embeddings_ = false;
     Views tensors_, draft_tensors_, vision_tensors_;
     std::vector<int32_t> token_map_;
 };

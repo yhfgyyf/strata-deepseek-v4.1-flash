@@ -36,6 +36,12 @@ void coverage(const d::HostMemoryInfo& info,bool huge,bool blocks=false){
     else need(info.huge_before==0 && info.huge_after==0,"fallback still reports huge mapping");
 }
 void layout_checks(){
+    need(d::host_huge_sufficient(98,100,98) && !d::host_huge_sufficient(97,100,98),"98 percent boundary");
+    need(d::host_huge_sufficient(99,101,98) && !d::host_huge_sufficient(98,101,98),"fractional threshold rounding");
+    need(!d::host_huge_sufficient(99,100,100) && d::host_huge_sufficient(100,100,100),"strict default boundary");
+    need(!d::host_huge_sufficient(0,0,98) && !d::host_huge_sufficient(101,100,98),"invalid coverage");
+    need(d::host_huge_sufficient(UINT64_MAX,UINT64_MAX,98) &&
+        d::host_huge_sufficient(UINT64_MAX,UINT64_MAX,100),"large threshold overflow");
     constexpr uint64_t no_ram=std::numeric_limits<uint64_t>::max();
     std::vector<uint64_t> offsets{0,no_ram,1,no_ram,2,no_ram,3,4,no_ram,no_ram,no_ram,no_ram};
     const auto boundaries=d::make_expert_host_segments({15206400,11612160,15206400},4,offsets);
@@ -52,6 +58,30 @@ void layout_checks(){
         const auto end=std::upper_bound(split.begin(),split.end(),large[i]);
         need(end!=split.end() && large[i]+15206400<=*end,"expert straddles registrations");
         if(i)need(large[i]>=large[i-1]+15206400,"expert blobs overlap");
+    }
+    // Actual old/new 40-layer blob sizes and the frozen 4645-hot distribution.
+    const std::vector<int> hot_count{150,140,138,114,121,111,100,102,83,100,102,99,118,141,106,136,94,114,115,160,106,101,128,142,94,94,107,111,90,98,107,110,113,122,120,116,119,138,147,138};
+    for(const auto& sizes:std::vector<std::vector<uint64_t>>{{15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,15206400,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160,11612160},{13086720,13086720,12349440,12349440,12349440,13824000,13824000,13824000,13824000,13824000,12625920,12625920,12625920,12625920,12625920,15298560,15298560,15298560,15298560,15298560,15298560,15298560,15298560,15298560,15298560,16404480,16404480,16404480,16404480,16404480,16404480,16404480,16404480,16404480,16404480,14100480,14100480,14100480,15206400,14100480}}){
+        std::vector<uint64_t> mixed(40*384,0);
+        for(int l=0;l<40;++l)for(int e=0;e<hot_count[l];++e)mixed[l*384+e]=no_ram;
+        const auto plan=d::make_expert_host_segments(sizes,384,mixed,40);
+        need(plan.size()==41,"balanced host segment count");
+        for(size_t i=1;i<plan.size();++i)need(plan[i]%d::expert_host_page==0 &&
+            plan[i]>plan[i-1] && plan[i]-plan[i-1]<=d::expert_host_registration_limit,"balanced segment span");
+        uint64_t previous_end=0;size_t cold=0;
+        for(size_t i=0;i<mixed.size();++i){
+            if(int(i%384)<hot_count[i/384]){need(mixed[i]==no_ram,"balanced hot omission");continue;}
+            const auto end=std::upper_bound(plan.begin(),plan.end(),mixed[i]);
+            need(end!=plan.end() && mixed[i]+sizes[i/384]<=*end && mixed[i]>=previous_end,"balanced blob crossing or overlap");
+            previous_end=mixed[i]+sizes[i/384];++cold;
+        }
+        need(cold==10715,"balanced cold coverage");
+    }
+    for(const auto count:{1u,3u}){
+        std::vector<uint64_t> invalid(2,17);const auto before=invalid;bool rejected=false;
+        try{d::make_expert_host_segments({d::expert_host_registration_limit},2,invalid,count);}
+        catch(const std::invalid_argument&){rejected=true;}
+        need(rejected && invalid==before,"balanced infeasible plan changed offsets");
     }
     for(bool oversized:{false,true}){
         std::vector<uint64_t> bad{17};const auto before=bad;bool rejected=false;

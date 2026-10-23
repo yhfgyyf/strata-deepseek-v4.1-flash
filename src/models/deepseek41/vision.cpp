@@ -41,7 +41,9 @@ std::vector<float> vision_forward(WeightBank& weights,VisionWork& w,const std::v
         linear(weights.at(prefix+"attn_qkv.weight"),w.norm,w.qkv,p,bias(prefix+"attn_qkv.bias"));
         gpu_check(vision_qkv_gpu(w.qkv,w.q,w.k,w.v,height,width,bf,stream));
         dump(prefix+"q",w.q,{p,16,64});dump(prefix+"k",w.k,{p,16,64});
-        gpu_check(vision_attention_gpu(w.q,w.k,w.v,w.attention,p,bf,stream));
+        // The gate buffer is dead until the following FFN;2048*p fits its2816*p allocation.
+        if(!bf&&p>=128)gpu_check(vision_attention_tiled_gpu(w.q,w.k,w.v,w.attention,w.gate,p,128,blas,stream));
+        else gpu_check(vision_attention_gpu(w.q,w.k,w.v,w.attention,p,bf,stream));
         linear(weights.at(prefix+"attn_out.weight"),w.attention,w.branch,p,bias(prefix+"attn_out.bias"));
         gpu_check(vision_add_gpu(w.h,w.branch,p*1024,bf,stream));
         dump(prefix+"after_attention",w.h,{p,1024});
@@ -63,8 +65,10 @@ std::vector<float> vision_forward(WeightBank& weights,VisionWork& w,const std::v
     std::vector<float> output(span*5120);gpu_check(cudaMemcpyAsync(output.data(),w.span,output.size()*4,cudaMemcpyDeviceToHost,stream));gpu_check(cudaStreamSynchronize(stream));return output;
 }
 std::vector<float> encode_vision(const std::string& mmproj,const std::vector<float>& patches,int h,int w,Arithmetic arithmetic,std::string capture_path,std::string integrity) {
-    require_integrity(integrity,"vision",mmproj);
-    auto model=Model::vision_only(mmproj);Stream stream;cublasHandle_t blas=nullptr;
+    auto model=Model::vision_only(mmproj);
+    const bool modern=model->file(false,true).get("clip.projector_type")->s=="deepseek41v";
+    require_integrity(integrity,"vision",mmproj,modern?"9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9":"");
+    Stream stream;cublasHandle_t blas=nullptr;
     if(cublasCreate(&blas)!=CUBLAS_STATUS_SUCCESS||cublasSetStream(blas,stream.value)!=CUBLAS_STATUS_SUCCESS||cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH)!=CUBLAS_STATUS_SUCCESS)
         throw std::runtime_error("DeepSeek standalone vision cuBLAS");
     struct Cleanup {cublasHandle_t value;~Cleanup(){cublasDestroy(value);}} cleanup{blas};

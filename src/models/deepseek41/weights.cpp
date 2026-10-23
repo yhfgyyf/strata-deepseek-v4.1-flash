@@ -24,11 +24,11 @@ bool packed_projection(const std::string& name) {
 }
 int storage_type(const TensorView& v,const std::string& name,Arithmetic arithmetic,const Model& model,bool draft,bool dense_q8) {
     if(draft&&(v.info->type==2||(v.info->type==8&&model.expert(0,0,true).type!=39)))return v.info->type;
-    if(dense_q8 && arithmetic==Arithmetic::production && v.info->type==8 && packed_projection(name))return 8;
-    // Read the large vocabulary heads in native Q8_0 with FP32 activations. This preserves their weights and
+    if(dense_q8 && arithmetic==Arithmetic::production && (v.info->type==8||v.info->type==14) && packed_projection(name))return v.info->type;
+    // Read the large vocabulary heads in native Q8_0/Q6_K with FP32 activations. This preserves their weights and
     // avoids a 2.65 GB FP32 copy; the fixed five-row DSpark head and Markov tables use the same contract.
-    if(v.info->type==8 && (name=="output.weight" || (draft &&
-        (name=="token_embd.weight"||name=="markov_w1.weight"||name=="markov_w2.weight"))))return 8;
+    if((v.info->type==8||v.info->type==14) && (name=="output.weight" || (draft &&
+        (name=="token_embd.weight"||name=="markov_w1.weight"||name=="markov_w2.weight"))))return v.info->type;
     const bool compressor_f32=name.find("attn_compressor_")!=std::string::npos &&
         model.ownership()[std::stoi(name.substr(4))].compression>1;
     if (arithmetic == Arithmetic::f32 || v.info->type == 0 || v.info->shape.size()==1 || name == "output.weight" || compressor_f32) return 0;
@@ -43,19 +43,20 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
                        const std::vector<int32_t>* draft_vocab,const std::vector<int32_t>* draft_input_vocab) {
     if(draft_vocab&&(!draft||vision||draft_vocab->empty()))throw std::invalid_argument("draft vocabulary weight bank");
     uint64_t bytes = 0;
-    for (const auto& t : model.file(draft,vision).tensors()) {
-        const auto& v = model.tensor(t.name,draft,vision);
+    for (const auto& [name,v] : model.tensors(draft,vision)) {
+        const auto& t = *v.info;
         if (!include_weight(v.role)) continue;
         Matrix m; m.type = storage_type(v,t.name,arithmetic,model,draft,dense_q8); m.cols = t.shape[0]; m.elements = 1;
-        m.packed_bf16=(dense_q8&&m.type==8&&packed_projection(t.name))||(draft&&(m.type==2||m.type==8)&&!vocab_weight(t.name));
+        m.packed_bf16=(dense_q8&&(m.type==8||m.type==14)&&packed_projection(t.name))||(draft&&(m.type==2||m.type==8)&&!vocab_weight(t.name));
         for (auto dim : t.shape) m.elements *= dim;
         m.rows = m.elements / m.cols;
         const auto* selected=(t.name=="token_embd.weight"||t.name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
         if(selected&&vocab_weight(t.name)){
-            if((m.type!=8&&m.type!=2)||t.shape.size()!=2||m.rows!=129280)throw std::runtime_error("draft vocabulary tensor layout");
+            if((m.type!=8&&m.type!=2&&m.type!=14&&!(t.type==30&&(m.type==30||m.type==0)))||
+               t.shape.size()!=2||m.rows!=129280)throw std::runtime_error("draft vocabulary tensor layout");
             m.rows=selected->size();m.elements=m.rows*m.cols;
         }
-        bytes += aligned(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.elements*(m.type==0?4:2));matrices_.emplace(t.name,m);
+        bytes += aligned(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));matrices_.emplace(t.name,m);
     }
     arena_ = std::make_unique<core::DeviceArena>(bytes);
     core::DeviceArena temporary(128ull << 20);
@@ -64,11 +65,32 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
     int last_layer = -1;
     for (auto& [name,m] : matrices_) {
         const auto& v = model.tensor(name,draft,vision);
-        m.data=arena_->alloc(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.elements*(m.type==0?4:2));
-        if(m.type==8||m.type==2){
+        m.data=arena_->alloc(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));
+        const auto* selected_bf16=(name=="token_embd.weight"||name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
+        if(selected_bf16&&vocab_weight(name)&&v.info->type==30){
+            const uint64_t row_bytes=uint64_t(m.cols)*2,rows_per_chunk=(32ull<<20)/row_bytes;
+            std::vector<uint8_t> rows(rows_per_chunk*row_bytes);
+            for(uint64_t begin=0;begin<selected_bf16->size();begin+=rows_per_chunk){
+                const uint64_t count=std::min<uint64_t>(rows_per_chunk,selected_bf16->size()-begin);
+                for(uint64_t i=0;i<count;++i){
+                    const int id=selected_bf16->at(begin+i);
+                    if(id<0||id>=129280)throw std::invalid_argument("draft vocabulary row ID");
+                    std::memcpy(rows.data()+i*row_bytes,v.data+uint64_t(id)*row_bytes,row_bytes);
+                }
+                if(m.type==30)gpu_check(cudaMemcpyAsync(static_cast<uint8_t*>(m.data)+begin*row_bytes,
+                    rows.data(),count*row_bytes,cudaMemcpyHostToDevice,stream));
+                else{
+                    gpu_check(cudaMemcpyAsync(packed,rows.data(),count*row_bytes,cudaMemcpyHostToDevice,stream));
+                    gpu_check(dequant_gpu(packed,30,static_cast<float*>(m.data)+begin*m.cols,count*m.cols,stream));
+                }
+                gpu_check(cudaStreamSynchronize(stream));
+            }
+            continue;
+        }
+        if(m.type==8||m.type==2||m.type==14){
             const auto* selected=(name=="token_embd.weight"||name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
             if(selected&&vocab_weight(name)){
-                const uint64_t row_bytes=m.cols/32*(m.type==2?18:34),rows_per_chunk=(32ull<<20)/row_bytes;
+                const uint64_t row_bytes=m.type==14?m.cols/256*210:m.cols/32*(m.type==2?18:34),rows_per_chunk=(32ull<<20)/row_bytes;
                 std::vector<uint8_t> rows(rows_per_chunk*row_bytes);
                 for(uint64_t begin=0;begin<selected->size();begin+=rows_per_chunk){
                     const auto count=std::min<uint64_t>(rows_per_chunk,selected->size()-begin);
@@ -113,25 +135,31 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
     const auto sizes = model.expert_bytes();
     for (int l = 0; l < 40; ++l) {
         const auto e = model.expert(l,0);
-        if (!kernels::cpu::native_fmt(e.type,e.type,5120,2304,formats_[l],error)) throw std::runtime_error(error);
+        if (!kernels::cpu::native_fmt(e.type,e.down_type,5120,2304,formats_[l],error)) throw std::runtime_error(error);
         formats_[l].swiglu_limit = 10.f;
         formats_[l].bf16_io = options.arithmetic == Arithmetic::production;
         if(formats_[l].bf16_io){
-            if((e.type==10||e.type==11)&&!(options.cpu_gu_q8_0?
+            if(!(options.cpu_gu_q8_0 && (e.type==10||e.type==11)?
                 kernels::cpu::native_enable_q8_0_gu(formats_[l],error):kernels::cpu::native_enable_bf16_gu(formats_[l],error)))
                 throw std::runtime_error(error);
-            const bool q3=kernels::cpu::deepseek41_down_fusion_enabled()&&e.type==11;
+            const bool q3=kernels::cpu::deepseek41_down_fusion_enabled()&&e.down_type==11;
             if(!(q3?kernels::cpu::native_enable_q3_q8_1_down(formats_[l],error):kernels::cpu::native_enable_bf16_down(formats_[l],error)))
                 throw std::runtime_error(error);
         }
         if (formats_[l].bytes != sizes[l]) throw std::runtime_error("DeepSeek expert layout mismatch");
     }
-    if(options.adaptive_groups)for(int l=0;l<40;++l){
-        const auto& f=formats_[l];const auto& ref=formats_[l<14?0:14];const int type=l<14?11:10;
-        if(f.gu_type!=type||f.d_type!=type||f.n_embd!=5120||f.n_ff!=2304||
-           f.gu_row!=ref.gu_row||f.d_row!=ref.d_row||f.up_off!=ref.up_off||f.down_off!=ref.down_off||
-           f.bytes!=ref.bytes||f.tail_off!=ref.tail_off||f.bytes%256)
-            throw std::invalid_argument("grouped residency requires identical Q3_K first14/Q2_K last26 blob layouts");
+    std::array<int,40> layout_groups{};
+    int groups=0;
+    for(int l=0;l<40;++l){
+        const auto& f=formats_[l];int representative=-1;
+        for(int j=0;j<l;++j){const auto& ref=formats_[j];
+            if(f.gu_type==ref.gu_type&&f.d_type==ref.d_type&&f.gu_row==ref.gu_row&&f.d_row==ref.d_row&&
+               f.up_off==ref.up_off&&f.down_off==ref.down_off&&f.bytes==ref.bytes&&f.tail_off==ref.tail_off){
+                representative=j;break;
+            }
+        }
+        layout_groups[l]=representative<0?groups++:layout_groups[representative];
+        if(f.bytes%256)throw std::invalid_argument("grouped residency requires aligned expert blobs");
     }
     offsets_.assign(40 * 384,core::detail::kNoCacheComplement);
     for(auto& counts:route_counts_)counts.assign(40*384,0);
@@ -152,7 +180,12 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         if (!core::detail::make_cache_complement_plan(40,384,layer_sizes,hot_,{},offsets_,ram_bytes_,error)) throw std::runtime_error(error);
         std::vector<uint64_t> host_segments;
         if(options.pinned_experts && options.huge_pinned_memory && ram_bytes_){
-            host_segments=make_expert_host_segments(layer_sizes,384,offsets_);
+            std::size_t segments=0;
+            if(const char* value=std::getenv("STRATA_DS41_BLOCK_SEGMENTS")){
+                if(std::string(value)!="40")throw std::invalid_argument("DeepSeek explicit host segment count must be 40");
+                segments=40;
+            }
+            host_segments=make_expert_host_segments(layer_sizes,384,offsets_,segments);
             ram_bytes_=host_segments.back(); // Include padding in RAM and phase-cache budgets.
         }
         std::vector<ExpertKey> core=hot_;
@@ -179,7 +212,10 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         ram_.allocate(ram_bytes_,options.pinned_experts && options.huge_pinned_memory,host_segments);
     }
 #ifndef _WIN32
-    fd_ = ::open(model.file().path().c_str(),O_RDONLY);
+    for(const auto& [name,view]:model.tensors())if(view.role==TensorRole::routed_expert){
+        const auto& path=view.file->path();
+        if(!fds_.count(path))fds_[path]=::open(path.c_str(),O_RDONLY);
+    }
 #endif
     Pinned staging(*std::max_element(sizes.begin(),sizes.end()));
     // Cold blobs are copied once; hot blobs have only a GPU copy after startup.
@@ -213,11 +249,11 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         ram_.register_if_needed();
         std::cerr<<"DeepSeek host_memory expert ";ram_.memory_info().write(std::cerr);std::cerr<<'\n';
     }
-    if(options.adaptive_experts)adaptive_=std::make_unique<AdaptiveCache>(cache_,hot_,offsets_,ram_.get(),sizes,options.migration_bytes,options.trace,options.adaptive_groups,ram_.pinned(),options.huge_pinned_memory);
+    if(options.adaptive_experts)adaptive_=std::make_unique<AdaptiveCache>(cache_,hot_,offsets_,ram_.get(),sizes,options.migration_bytes,options.trace,options.adaptive_groups,ram_.pinned(),options.huge_pinned_memory,&layout_groups);
 }
 GgufExperts::~GgufExperts() {
 #ifndef _WIN32
-    if (fd_ >= 0) ::close(fd_);
+    for(const auto& [path,fd]:fds_)if(fd>=0)::close(fd);
 #endif
 }
 bool GgufExperts::copy_blob(int64_t layer,int64_t expert,uint8_t* out) {
@@ -349,12 +385,13 @@ void GgufExperts::release_mapped(int layer,int expert) const {
         const uintptr_t end = (reinterpret_cast<uintptr_t>(span.first) + span.second) & ~uintptr_t(4095);
         if (end > begin) ::madvise(reinterpret_cast<void*>(begin),end-begin,MADV_DONTNEED);
     }
-    if (fd_ >= 0) {
+    if (!fds_.empty()) {
         for (const char* suffix : {"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"}) {
             const auto& view = model_.tensor("blk." + std::to_string(layer) + "." + suffix);
             const uint64_t count = suffix[4] == 'd' ? f.bytes-f.down_off : f.up_off;
-            const uint64_t offset = model_.file().data_start() + view.info->offset + count*expert;
-            ::posix_fadvise(fd_,offset,count,POSIX_FADV_DONTNEED);
+            const uint64_t offset = view.file->data_start() + view.info->offset + count*expert;
+            const auto fd=fds_.at(view.file->path());
+            if(fd>=0)::posix_fadvise(fd,offset,count,POSIX_FADV_DONTNEED);
         }
     }
 #else

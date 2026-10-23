@@ -30,6 +30,9 @@ cudaError_t candidate_scores_gpu(const float* scores, float* blocks, int tokens,
 cudaError_t candidate_mask_gpu(const IndexSortBuffers& sorted_blocks, uint8_t* block_mask, uint8_t* key_mask,
                                int tokens, int key_rows, int64_t start_position, int ratio, cudaStream_t stream);
 // Candidate block IDs are ascending, padded with -1. This keeps stable score ties in original key order.
+// When every block fits, compact valid IDs directly; no score ordering is needed.
+cudaError_t candidate_all_blocks_gpu(const float* block_scores,int32_t* blocks,int tokens,
+                                     int block_count,cudaStream_t stream);
 cudaError_t candidate_blocks_gpu(const IndexSortBuffers& sorted_blocks, int32_t* blocks, int tokens,
                                  int key_rows, cudaStream_t stream);
 cudaError_t compact_index_scores_gpu(const float* query, const float* weights, const float* keys,

@@ -45,6 +45,15 @@ int main(){try{
     f.heat[7]=0;f.sizes[13]=512;bool rejected=false;try{f.plan(true);}catch(const std::logic_error&){rejected=true;}need(rejected,"mixed-size group accepted");
     f.sizes[13]=768;f.heat[7]=std::numeric_limits<double>::quiet_NaN();rejected=false;
     try{f.plan(true);}catch(const std::invalid_argument&){rejected=true;}need(rejected,"NaN accepted");
+    // Equal byte counts do not permit exchange across different quantized layouts.
+    Fixture mixed;std::array<int,40> layouts{};
+    for(int l=0;l<40;++l){mixed.sizes[l]=512;layouts[l]=l%8;}
+    mixed.hot({0,0},0);mixed.hot({1,0},1);mixed.hot({2,0},2);
+    mixed.heat[3*384]=100; // No victim with layout 3, despite identical byte size.
+    mixed.heat[8*384]=10;mixed.heat[9*384]=9;mixed.heat[10*384]=8;
+    const auto grouped=d::choose_adaptive_exchanges(mixed.sizes,mixed.heat,mixed.slots,mixed.offsets,true,96,128*1024,&layouts);
+    need(grouped.size()==3,"multi-layout plan length");
+    for(const auto& item:grouped)need(layouts[item.in.first]==layouts[item.out.first],"same-size cross-layout exchange");
     std::mt19937 rng(20261018);int checked=0;
     for(int trial=0;trial<80;++trial){Fixture z;int slot=0;
         for(int l:{0,13,14,39})for(int e=0;e<4;++e){z.heat[l*384+e]=double(rng()%100)/4;if(rng()%2)z.hot({l,e},slot++,z.heat[l*384+e]);}

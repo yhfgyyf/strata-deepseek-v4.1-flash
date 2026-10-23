@@ -14,11 +14,13 @@ inline constexpr uint64_t expert_host_registration_limit=(4ull<<30)-expert_host_
 
 // Repack a validated cold complement in layer/expert order. Every nonempty
 // layer starts a new registration; larger layers split only between blobs.
+// An explicit segment count instead balances cold bytes across layers.
 // Returned boundaries include zero and the padded arena size. All-hot layers
 // produce no empty registrations. Leave offsets unchanged if planning fails.
 inline std::vector<uint64_t> make_expert_host_segments(const std::vector<uint64_t>& layer_bytes,
                                                       std::size_t experts_per_layer,
-                                                      std::vector<uint64_t>& offsets){
+                                                      std::vector<uint64_t>& offsets,
+                                                      std::size_t segment_count=0){
     if(!experts_per_layer || layer_bytes.size()>std::numeric_limits<std::size_t>::max()/experts_per_layer ||
        offsets.size()!=layer_bytes.size()*experts_per_layer)
         throw std::invalid_argument("DeepSeek expert host layout dimensions");
@@ -34,6 +36,37 @@ inline std::vector<uint64_t> make_expert_host_segments(const std::vector<uint64_
         bytes=(bytes+expert_host_page-1)/expert_host_page*expert_host_page;
         boundaries.push_back(bytes);
     };
+    if(segment_count){
+        std::vector<std::size_t> cold;
+        uint64_t remaining=0;
+        for(std::size_t index=0;index<next.size();++index){
+            if(next[index]==std::numeric_limits<uint64_t>::max())continue;
+            const auto blob=layer_bytes[index/experts_per_layer];
+            if(remaining>std::numeric_limits<uint64_t>::max()-blob)
+                throw std::overflow_error("DeepSeek expert host size overflow");
+            remaining+=blob;cold.push_back(index);
+        }
+        if(cold.size()<segment_count)
+            throw std::invalid_argument("DeepSeek fewer cold experts than host segments");
+        std::size_t cursor=0;
+        for(std::size_t left=segment_count;left;--left){
+            const auto target=remaining/left+(remaining%left!=0);
+            uint64_t payload=0;
+            while(cursor<cold.size() && cold.size()-cursor>=left){
+                const auto index=cold[cursor];
+                const auto blob=layer_bytes[index/experts_per_layer];
+                if(payload && (payload>=target || payload>expert_host_registration_limit-blob))break;
+                if(bytes>std::numeric_limits<uint64_t>::max()-blob)
+                    throw std::overflow_error("DeepSeek expert host size overflow");
+                next[index]=bytes;bytes+=blob;payload+=blob;remaining-=blob;++cursor;
+            }
+            if(!payload)throw std::invalid_argument("DeepSeek empty balanced host segment");
+            close_segment();
+        }
+        if(cursor!=cold.size())throw std::invalid_argument("DeepSeek cold experts exceed requested host segments");
+        offsets=std::move(next);
+        return boundaries;
+    }
     for(std::size_t layer=0;layer<layer_bytes.size();++layer){
         const uint64_t blob=layer_bytes[layer];
         for(std::size_t expert=0;expert<experts_per_layer;++expert){

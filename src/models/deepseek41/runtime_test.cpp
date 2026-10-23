@@ -22,12 +22,36 @@ void exact(const std::vector<float>& a,const std::vector<float>& b,const char* n
     if(a.size()!=b.size()||std::memcmp(a.data(),b.data(),a.size()*4))throw std::runtime_error(name);
 }
 float bf(float x){return ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));}
+void markov_bf16_rows(){
+    std::vector<float> values(4*256);
+    std::vector<uint16_t> packed(values.size());
+    for(size_t i=0;i<values.size();++i){
+        values[i]=bf(float(int(i%31)-15)*.03125f);
+        packed[i]=ggml_fp32_to_bf16(values[i]).bits;
+    }
+    std::vector<int> inverse(129280,-1);
+    for(int i=0;i<4;++i)inverse[std::vector<int>{0,2,128799,129279}[i]]=i;
+    Device<uint16_t> db(packed);Device<float> df(values),out(256);
+    Device<int> di(inverse),previous(1),status(std::vector<int>{0});
+    for(int type:{0,30})for(int id:{0,2,128799,129279}){
+        d::gpu_check(cudaMemcpy(previous.p,&id,sizeof(id),cudaMemcpyHostToDevice));
+        d::gpu_check(d::draft_markov_row_gpu(type==30?static_cast<const void*>(db.p):df.p,
+            type,previous.p,di.p,out.p,true,status.p,nullptr));
+        exact(out.read(),std::vector<float>(values.begin()+inverse[id]*256,values.begin()+(inverse[id]+1)*256),
+              "BF16/F32 Markov row and vocabulary mapping");
+        if(status.read()[0])throw std::runtime_error("valid Markov ID rejected");
+    }
+    const int invalid=3;d::gpu_check(cudaMemcpy(previous.p,&invalid,sizeof(invalid),cudaMemcpyHostToDevice));
+    d::gpu_check(d::draft_markov_row_gpu(db.p,30,previous.p,di.p,out.p,true,status.p,nullptr));
+    exact(out.read(),std::vector<float>(256,0),"invalid Markov ID output");
+    if(status.read()[0]!=1)throw std::runtime_error("unmapped Markov ID accepted");
+}
 void workspace_auto_budget(){
     for(int context:{8192,32768,131072,524288}){
         d::RuntimeOptions options;options.context=context;
-        const uint64_t budget=d::Workspace::bytes_needed(32768,options);
-        const int chosen=d::select_prefill_chunk(32768,context,budget,[&](int n){return d::Workspace::bytes_needed(n,options);});
-        if(chosen!=std::min(context,32768))throw std::runtime_error("32K workspace plan context ceiling");
+        const uint64_t budget=d::Workspace::bytes_needed(d::PREFILL_CHUNK_MAX,options);
+        const int chosen=d::select_prefill_chunk(d::PREFILL_CHUNK_MAX,context,budget,[&](int n){return d::Workspace::bytes_needed(n,options);});
+        if(chosen!=std::min(context,d::PREFILL_CHUNK_MAX))throw std::runtime_error("fixed workspace plan context ceiling");
     }
     for(int mode=0;mode<5;++mode){
         d::RuntimeOptions options;options.context=1048576;
@@ -35,7 +59,7 @@ void workspace_auto_budget(){
         options.dense_q8=(mode==1||mode==4);options.engram_pipeline=(mode==1||mode==4);options.expert_pipeline=(mode==1||mode==4);
         options.dspark=mode>=3;const bool vision=mode==2;
         const uint64_t budget=d::Workspace::bytes_needed(256,options,vision);
-        const int chosen=d::select_prefill_chunk(32768,options.context,budget,[&](int n){return d::Workspace::bytes_needed(n,options,vision);});
+        const int chosen=d::select_prefill_chunk(d::PREFILL_CHUNK_MAX,options.context,budget,[&](int n){return d::Workspace::bytes_needed(n,options,vision);});
         if(chosen!=256)throw std::runtime_error("workspace auto exact-budget selection");
         d::Workspace work(budget,chosen,options.context,options.compact_logits,options.compact_workspace,options.dspark);
         d::WorkspaceLayout layout(work.arena.get());work.extras(layout,options);
@@ -248,7 +272,7 @@ int main(){
     try{
         cublasHandle_t blas=nullptr;if(cublasCreate(&blas)!=CUBLAS_STATUS_SUCCESS||cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("test BLAS");
         struct Cleanup{cublasHandle_t h;~Cleanup(){cublasDestroy(h);}} cleanup{blas};
-        helpers();strided(blas);strided_round();workspace_attention_bounds();compact_workspace_budget();workspace_auto_budget();
+        helpers();strided(blas);strided_round();workspace_attention_bounds();compact_workspace_budget();workspace_auto_budget();markov_bf16_rows();
         for(int type:{10,11,39})for(int tokens:{3,12})routed(type,tokens,blas);
         std::cout<<"deepseek41_runtime_test passed\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
