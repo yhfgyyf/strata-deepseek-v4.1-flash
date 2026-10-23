@@ -1,12 +1,12 @@
-# API behavior
+# API usage
 
-The default model alias is `deepseek-v4.1`, with base URL `http://127.0.0.1:30011/v1`. The local service does not contact the OpenAI or Anthropic cloud. It implements the documented subset of their request shapes.
+The default model alias is `deepseek-v4.1`, with base URL `http://127.0.0.1:30011/v1`. OpenAI Chat Completions / Responses and Anthropic Messages are supported.
 
 | Endpoint | Text | SSE | Image input | Automatic tool round trip |
 |---|---|---|---|---|
-| `/v1/chat/completions` | Checked | Checked | Checked | Checked |
-| `/v1/responses` | Checked | Checked | Checked | Checked |
-| `/v1/messages` | Checked | Checked | Checked | Checked |
+| `/v1/chat/completions` | Supported | Supported | Supported | Supported |
+| `/v1/responses` | Supported | Supported | Supported | Supported |
+| `/v1/messages` | Supported | Supported | Supported | Supported |
 
 ## Chat Completions
 
@@ -26,7 +26,7 @@ curl http://127.0.0.1:30011/v1/responses \
   -d '{"model":"deepseek-v4.1","input":"What is 6 times 7?","max_output_tokens":128,"temperature":0,"reasoning":{"effort":"none"}}'
 ```
 
-Automatic function calls and client-supplied results are supported. Forced or named tool selection returns HTTP 400 with `unsupported_parameter` for `tool_choice`; it is not silently ignored. Stateful `previous_response_id` is unsupported. Send the needed history explicitly.
+Automatic function calls and client-supplied results are supported. Include conversation history in the request.
 
 ## Anthropic Messages
 
@@ -36,14 +36,10 @@ curl http://127.0.0.1:30011/v1/messages \
   -d '{"model":"deepseek-v4.1","messages":[{"role":"user","content":"What is 6 times 7?"}],"max_tokens":128,"temperature":0,"thinking":{"type":"disabled"}}'
 ```
 
-`thinking.type=disabled` is respected. Enabled thinking with a budget was also checked. Automatic tools work; forced selection is unsupported.
+Use `thinking.type=disabled` to disable thinking, or enable thinking with a budget. Automatic tool selection is supported.
 
-## Images and boundaries
+## Images
 
-Image data follows each endpoint's image-content format and requires the matching mmproj model. The regression used two fixtures across all three APIs and checked colors, shapes, left/right relations and text. Image preprocessing is capped at 1024 image tokens. Invalid image data is rejected.
-
-The fixed adaptive starter is greedy-only. Use temperature 0; support for a generic API field does not mean every experimental runtime mode supports every sampling combination. The basic launcher has a different runtime profile.
+Image input uses each endpoint's image-content format and requires the `mmproj` model path in the configuration.
 
 Authentication is optional on loopback. A non-loopback bind requires `api_key`; clients then supply the configured key. Do not commit real API keys in configuration examples.
-
-See the relevant [frontend](../serve/deepseek41_frontend.py), [engine protocol](../serve/deepseek41_engine.py) and [regression tests](../serve/test_deepseek41.py) for the implemented contracts.

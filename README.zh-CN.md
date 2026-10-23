@@ -6,13 +6,11 @@
 
 基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。两种 Unsloth 模型共用一个启动脚本，直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
 
-支持 **1M 上下文容量（1,048,576 tokens）**、**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。已验证 1M 会话分配及短 API 请求，长输入测速到 512K；完整 1M 输入和连续 32K 输出尚未压测。图片支持不代表已适配音频或视频。
-
-本项目是实验性源码发布。算子与功能检查有明确覆盖范围；整模型质量、重复性和长期稳定性仍有未决问题，见[验证与限制](docs/PERFORMANCE.md#validation-and-limitations)。
+支持 **1M 上下文容量（1,048,576 tokens）**、**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。
 
 ## 适配模型
 
-以下两种均来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**。下载所选目录全部 7 个分片，配置指向 `00001-of-00007.gguf`；保留原文件名和同级目录，包括用于 Engram 的大尺寸末分片。
+以下两种均来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**。
 
 | 主模型 | Hugging Face | ModelScope（魔搭） | 启动配置 |
 |---|---|---|---|
@@ -24,11 +22,8 @@
 | **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
 | **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
 
-统一使用十进制 **GB = 1,000,000,000 字节**，按已核对的 GGUF 文件大小统计：总计为全部七片，主模型为第 1–6 片，Engram 为第 7 片。包含 GGUF 元数据，不含单独的 DSpark（**7.977 GB**）和视觉文件（**0.972 GB**）。这是磁盘下载体积，不是 RAM 或显存需求；Engram 保存在 SSD，并使用有容量上限的内存缓存。[文件大小与哈希](data/models-1017.json)。
-
-两种模型共用仓库内的 `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`；图片输入另需 `mmproj-BF16.gguf`：[Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)。DSpark 保持发布文件中的 MXFP4/Q8/BF16 混合格式，文件名 Q8_0 不代表所有张量都是 Q8。运行时解量化与词表行选择不会改写下载文件。
-
-2026-10-23 已核对两站的 14 个主模型分片及 2 个辅助模型文件，尺寸与 SHA256 全部一致；加载器接受的内容身份见 [models-1017.json](data/models-1017.json)。还需下载匹配的[官方 tokenizer.json](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/tokenizer.json)。权重和 tokenizer 不包含在代码仓库中。[文件准备说明](docs/INSTALL.md#model-assets)。
+- **DSpark**：[Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
+- **mmproj**：[Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/mmproj-BF16.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
 
 ## 测试机器
 
@@ -45,7 +40,7 @@
 
 **已测最大 prefill：6,080.745 tokens/s**，使用 UD-Q2_K_XL、原格式 DSpark、131,072 输入、chunk 32768。这是无 profiler 的单次正式结果；同配置三次均值为 **6,037.613 tokens/s**。
 
-以下为 2026-10-23 测试：单请求，每档一次预热＋三次正式测量，贪心解码，固定完整 512 输出。输入由同一 LongSWE token 流重复拼接和截取，用于长度压测，不是自然长文质量评测。数值为均值 ± 样本标准差。
+以下为 2026-10-23 测试：单请求，每档一次预热＋三次正式测量，贪心解码，固定完整 512 输出。输入由同一 LongSWE token 流重复拼接和截取，用于长度测试。数值为均值 ± 样本标准差。
 
 | 输入 tokens | Chunk | 常驻专家数 | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|
@@ -54,15 +49,15 @@
 | 131,072 | 32,768 | 4221 | **6,037.613 ± 40.617** | 35.048 ± 0.026 |
 | 524,288 | 32,768 | 4221 | 4,499.192 ± 3.861 | 42.216 ± 0.038 |
 
-Prefill 使用引擎原生 prompt 时间；decode 包含 DSpark 生成过程，最终 drain 单独记录，不冒充客户端 TTFT。32K chunk 需要更大工作区和更少常驻专家，与默认 8K 启动配置不同。测速采用既有校准排序和热度；脚本自动生成的是未校准的通用排序，尚未单独测速。本次重新构建的发布二进制也没有追加 GPU 性能测试。[12 条正式记录](data/performance-20261023.csv) · [条件、历史结果和限制](docs/PERFORMANCE.md)。
+Prefill 按引擎原生 prompt 时间统计；decode 按 DSpark 生成时间统计。测速使用校准后的专家排序与热度，chunk 和常驻专家数见上表。
 
 ## 初始专家 profile 与内存搬运
 
-已使用更广泛的代码、agent 和通用推理 prompt 采集专家路由统计，来源包括 DeepSWE、SWE-bench Pro 与 Verified、R2E-Gym、LongSWE、LiveCodeBench、BigCodeBench、ProgramBench、Terminal-Bench、BFCL 和 HLE，据此调整初始 profile 的专家排序与热度，并保留运行期间的在线自适应。这是基于 prompt 的专家驻留校准，不是任务成功率评测。脚本自动生成的通用排序仍未校准；复用校准方案时应同时提供匹配的 `profile` 和 `heat`。
+已使用更广泛的代码、agent 和通用推理 prompt 采集专家路由统计，来源包括 DeepSWE、SWE-bench Pro 与 Verified、R2E-Gym、LongSWE、LiveCodeBench、BigCodeBench、ProgramBench、Terminal-Bench、BFCL 和 HLE，据此调整初始 profile 的专家排序与热度，并保留运行期间的在线自适应。
 
-**PCIe 5.0 上的 block-pinned memory（分块锁页内存）＋大页存储**显著提高了本机的专家搬运带宽：专家内存使用 40 段 CUDA 注册及 100% 的 2 MiB 大页覆盖，独立 H2D 对照从单次注册／4 KiB 页的 **23.952 GB/s 提升到 45.104 GB/s（+88.31%）**。更快的专家上传可减少搬运开销，从而在搬运受限时提升 prefill 和 decode 速度。该实测提升限定于已测试的 PCIe 5.0 ×16 配置；这是带宽增幅，不代表 tokens/s 同比增长，也不外推其他 PCIe 代际。[测量范围](docs/PERFORMANCE.md#host-memory-transfer-measurements)。
+**PCIe 5.0 上的 block-pinned memory（分块锁页内存）＋大页存储**显著提高了本机的专家搬运带宽：专家内存使用 40 段 CUDA 注册及 100% 的 2 MiB 大页覆盖，独立 H2D 对照从单次注册／4 KiB 页的 **23.952 GB/s 提升到 45.104 GB/s（+88.31%）**。更快的专家上传可减少搬运开销，从而在搬运受限时提升 prefill 和 decode 速度。该实测提升限定于已测试的 PCIe 5.0 ×16 配置。
 
-如果使用支持 **AVX-512、配备大容量内存和高内存带宽的服务器 CPU**，也可以尝试在 **decode 阶段由 CPU 执行 MoE 专家**，GPU 继续处理注意力等适合的工作。实际收益取决于量化 CPU 算子、内存通道与 NUMA 布局，以及 CPU/GPU 调度；需要单独配置并验证精度和吞吐。当前单脚本配置采用 GPU 专家计算，本项目尚未完成上述服务器方案的性能验证。
+如果使用支持 **AVX-512、配备大容量内存和高内存带宽的服务器 CPU**，也可以尝试在 **decode 阶段由 CPU 执行 MoE 专家**，GPU 继续处理注意力等适合的工作。
 
 ## 构建与启动
 
@@ -91,9 +86,9 @@ cp examples/rtxpro6000.ud-q2-k-xl.json examples/local.json
 python tools/deepseek41/serve_experimental.py --config examples/local.json
 ```
 
-首次启动自动完整 SHA 校验、写入校验凭据与全专家通用排序/零初始热度，并使用仓库附带的 tokenizer 派生草稿 ID 映射；后续仅在文件身份不变时复用凭据。不需要额外权重转换或校准命令。已有校准方案可同时传入 `profile` 和 `heat`，脚本会保留这些文件。`--check-config` 只核对路径，不写元数据、不读取全量权重、不加载 GPU。
+支持 **OpenAI Chat Completions / Responses** 和 **Anthropic Messages** 兼容接口。
 
-默认 API 为 `http://127.0.0.1:30011/v1`，`Ctrl+C` 停止。监听非本机地址时须在私有配置中设置 `api_key`。[安装说明](docs/INSTALL.md) · [配置说明](docs/CONFIGURATION.md) · [API 示例](docs/API.md)。
+[安装说明](docs/INSTALL.md) · [配置说明](docs/CONFIGURATION.md) · [API 示例](docs/API.md)。
 
 ## 相对上游 Strata 的 DeepSeek 专项适配
 
@@ -107,4 +102,4 @@ python tools/deepseek41/serve_experimental.py --config examples/local.json
 | 专家与 Engram | 在线自适应格式分组、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
 | API 与图片 | DeepSeek 消息/tokenizer、thinking/工具编码、图片预处理及原生视觉编码器。 |
 
-专家缓存、异构卸载、推测解码、图片输入和兼容 API 已存在于上游 Strata；此处说明的是 DeepSeek 专项实现与接入。[源码入口与来源](docs/CHANGES.md) · [第三方声明](docs/THIRD_PARTY.md) · [MIT 许可证](LICENSE)。
+专家缓存、异构卸载、推测解码、图片输入和兼容 API 已存在于上游 Strata；此处说明的是 DeepSeek 专项实现与接入。[第三方声明](docs/THIRD_PARTY.md) · [MIT 许可证](LICENSE)。
