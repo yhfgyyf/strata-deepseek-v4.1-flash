@@ -67,5 +67,43 @@ int main(){try{
         }
     }
     std::cout<<"PASS "<<checked<<" independent randomized oracle comparisons; boundaries, full keys, zero-quota, budget and invalid heat/geometry\n";
+    // Maya's strict relative margin and recent-window eligibility are independent
+    // of the legacy absolute threshold. A repeated hot route need not reach two.
+    Fixture m;m.hot({0,0},0,4);m.heat[1]=6;
+    std::vector<uint8_t> recent(15360);recent[1]=1;
+    auto maya=[&](const Fixture& x,uint64_t cap=96,uint64_t budget=128*1024){
+        return d::choose_adaptive_exchanges(x.sizes,x.heat,x.slots,x.offsets,false,cap,budget,nullptr,&recent);
+    };
+    need(maya(m).empty(),"Maya strict threshold admitted equality");
+    m.heat[1]=6.0001;need(maya(m).size()==1,"Maya relative threshold rejected above boundary");
+    recent[1]=0;need(maya(m).empty(),"Maya admitted old nonrecent heat");
+    recent[1]=1;m.heat[0]=0;m.heat[1]=1.5;need(maya(m).size()==1,"Maya inherited legacy minimum heat");
+    Fixture all;std::fill(recent.begin(),recent.end(),0);
+    for(int l=0;l<40;++l)for(int e=0;e<2;++e){all.hot({l,e},l*2+e);all.heat[l*384+e+2]=10+l;recent[l*384+e+2]=1;}
+    auto bounded=maya(all);need(bounded.size()==80,"Maya heat policy throttled existing Strata capacity");
+    std::set<int> selected;for(const auto& x:bounded)need(selected.insert(x.slot).second,"duplicate victim slot");
+    need(maya(all,0).empty()&&maya(all,3).size()==3&&maya(all,96,1023).empty(),"Maya capacity/byte cap");
+    Fixture maximum;std::fill(recent.begin(),recent.end(),0);
+    for(int e=0;e<128;++e){maximum.hot({14,e},e);maximum.heat[14*384+128+e]=8;recent[14*384+128+e]=1;}
+    need(maya(maximum).size()==96,"existing96 exchange limit");
+    // Independent exhaustive best-pair matching. Selection is then globally ranked.
+    for(int trial=0;trial<40;++trial){Fixture z;std::fill(recent.begin(),recent.end(),0);int slot=0;
+        for(int l:{0,13,14,39})for(int e=0;e<4;++e){z.heat[l*384+e]=double(rng()%100)/4;recent[l*384+e]=rng()%2;if(rng()%2)z.hot({l,e},slot++,z.heat[l*384+e]);}
+        auto expected=std::vector<d::AdaptiveExchange>{};
+        for(int l:{0,13,14,39}){std::set<int> used;
+            for(;;){int a=-1,b=-1;double gain=-1;
+                for(int i=0;i<4;++i)for(int j=0;j<4;++j){int x=l*384+i,y=l*384+j;
+                    if(z.slots[x]>=0||z.slots[y]<0||used.count(x)||used.count(y)||!recent[x]||z.heat[x]<=z.heat[y]*1.25+1)continue;
+                    double g=z.heat[x]-z.heat[y];if(g>gain||(g==gain&&(a<0||x<a||(x==a&&y<b)))){a=x;b=y;gain=g;}
+                }
+                if(a<0)break;
+                used.insert(a);used.insert(b);expected.push_back({{l,a%384},{l,b%384},z.slots[b],z.offsets[a],z.sizes[l],0,gain});
+            }
+        }
+        std::sort(expected.begin(),expected.end(),[](auto a,auto b){return a.gain!=b.gain?a.gain>b.gain:a.in<b.in;});
+        const auto actual=maya(z);need(actual.size()==expected.size(),"Maya independent oracle count");
+        for(size_t i=0;i<actual.size();++i)need(actual[i].in==expected[i].in&&actual[i].out==expected[i].out,"Maya independent oracle pair");
+    }
+    std::cout<<"PASS Maya40 independent comparisons, strict margin, recent eligibility, existing96 capacity and byte limits\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -12,14 +12,45 @@
 #include <cstdlib>
 
 namespace strata::models::deepseek41 {
-void Runtime::Impl::route(int layer,int tokens,Workspace& w) {
+namespace {
+std::atomic<bool> route_group_enabled{true};
+// Each retained format/row bucket passed independent ABBA confirmation.
+bool shared_early_selected(int gu_type,int down_type,int tokens){
+    unsigned mask=0;
+    if(gu_type==16&&down_type==16)mask=0x110u;
+    else if(gu_type==16&&down_type==18)mask=0x1d4u;
+    else if(gu_type==17&&down_type==39)mask=0x8u;
+    else if(gu_type==18&&down_type==18)mask=0x4eu;
+    else if(gu_type==18&&down_type==21)mask=0x12eu;
+    else if(gu_type==22&&down_type==21)mask=0x4u;
+    else if(gu_type==22&&down_type==39)mask=0x104u;
+    return tokens>=1&&tokens<=8&&(mask&(1u<<tokens));
+}
+}
+void route_group_set_enabled(bool value){route_group_enabled.store(value);}
+bool Runtime::Impl::short_gpu_moe(int tokens,int phase) const {
+    return phase==2&&tokens>=1&&tokens<=8&&options.slots==1&&options.arithmetic==Arithmetic::production&&
+        (options.experts==ExpertMode::gpu||(options.experts==ExpertMode::hybrid&&options.pcie_frac==1));
+}
+bool Runtime::Impl::compact_routes(int tokens,int phase) const {
+    return options.route_compact_handoff&&short_gpu_moe(tokens,phase)&&options.decode_graph&&
+        (decode_segment_mask&2)&&((1u<<tokens)&0x1b4u)&&route_group_enabled.load();
+}
+void Runtime::Impl::route(int layer,int tokens,Workspace& w,int phase) {
     matmul(tensor(layer,"ffn_gate_inp"),w.x,w.branch,tokens,w,0,0,0,0,false);
     const auto& bias=weights->at("blk."+std::to_string(layer)+".exp_probs_b.bias");
     const auto& vl=weights->at("blk."+std::to_string(layer)+".exp_probs_b_vl.bias");
     gpu_check((options.parallel_router?route_parallel_gpu:route_gpu)(w.branch,static_cast<const float*>(bias.data),static_cast<const float*>(vl.data),w.image,
         w.route_ids,w.route_weights,384,6,tokens,1.5f,stream.value));
-    gpu_check(cudaMemcpyAsync(w.host_ids,w.route_ids,tokens*6*sizeof(int),cudaMemcpyDeviceToHost,stream.value));
-    gpu_check(cudaMemcpyAsync(w.host_weights,w.route_weights,tokens*6*sizeof(float),cudaMemcpyDeviceToHost,stream.value));
+    if(compact_routes(tokens,phase)){
+        gpu_check(route_handoff_short_gpu(w.route_ids,w.route_weights,w.group_rows,w.group_slots,w.group_weights,w.route_handoff,tokens,stream.value));
+        gpu_check(cudaMemcpyAsync(w.host_ids,w.route_handoff,(tokens*6+1)*sizeof(int),cudaMemcpyDeviceToHost,stream.value));
+    }else{
+        if(route_group_enabled.load()&&tokens>1&&tokens<=8)
+            gpu_check(route_group_short_gpu(w.route_ids,w.route_weights,w.group_rows,w.group_slots,w.group_weights,tokens,stream.value));
+        gpu_check(cudaMemcpyAsync(w.host_ids,w.route_ids,tokens*6*sizeof(int),cudaMemcpyDeviceToHost,stream.value));
+        gpu_check(cudaMemcpyAsync(w.host_weights,w.route_weights,tokens*6*sizeof(float),cudaMemcpyDeviceToHost,stream.value));
+    }
 }
 void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,int phase,std::vector<int>* deferred_routes,bool routes_ready) {
     prefill::LedgerScope moe_trace(options.trace,"ds41.moe");
@@ -27,12 +58,69 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     const bool mixed_fast=options.arithmetic==Arithmetic::production&&expert_mixed_fast_enabled();
     if(decode_raw_cache && !prefill && tokens>8)decode_raw_cache->clear(upload.value);
     const auto& f=experts->format(layer);
-    if(!routes_ready)route(layer,tokens,w);
+    const bool compact=compact_routes(tokens,phase);
+    const bool early_shared=options.shared_early_submit&&short_gpu_moe(tokens,phase)&&options.decode_graph&&
+        shared_early_selected(f.gu_type,f.d_type,tokens);
+    auto shared=[&]{
+        const auto& gate=tensor(layer,"ffn_gate_shexp");
+        const auto& up=tensor(layer,"ffn_up_shexp");
+        // Keep the validated shared path: the experimental grouped Q8 chain
+        // has no material speed gain and two activation-reference failures.
+        if(options.shared_q8_pair && options.arithmetic==Arithmetic::production && tokens<=8 &&
+           options.dense_q8_1 && (tokens==1||options.dense_q8_batch) &&
+           gate.packed_bf16 && up.packed_bf16 && gate.type==8 && up.type==8 &&
+           gate.rows==2304 && up.rows==2304 && gate.cols==5120 && up.cols==5120){
+            kernels::native_quantize_q8_1(w.x,w.dense_input_q8,5120,tokens,stream.value);
+            if(!kernels::native_mmvq_pair(8,gate.data,up.data,w.dense_input_q8,w.shared_gate,w.shared_up,
+                                         5120,2304,tokens,stream.value)){
+                kernels::native_q8_0_mmvq(gate.data,w.dense_input_q8,w.shared_gate,5120,2304,tokens,stream.value);
+                kernels::native_q8_0_mmvq(up.data,w.dense_input_q8,w.shared_up,5120,2304,tokens,stream.value);
+            }
+            gpu_check(round_bf16_strided_gpu(w.shared_gate,tokens,2304,2304,stream.value));
+            gpu_check(round_bf16_strided_gpu(w.shared_up,tokens,2304,2304,stream.value));
+        }else{
+            matmul(gate,w.x,w.shared_gate,tokens,w);
+            matmul(up,w.x,w.shared_up,tokens,w);
+        }
+        gpu_check((options.arithmetic==Arithmetic::production?swiglu_bf16_gpu:swiglu_gpu)(w.shared_gate,w.shared_up,nullptr,w.shared_act,2304,tokens,10.f,stream.value));
+        matmul(tensor(layer,"ffn_down_shexp"),w.shared_act,w.shared_out,tokens,w);
+    };
+    uint64_t shared_captures=0,shared_launches=0;
+    auto submit_shared=[&]{
+        prefill::LedgerScope shared_trace(options.trace,"ds41.moe.shared.submit");
+        if(options.decode_graph && phase==2 && tokens<=8){
+            auto& graph=shared_graphs[layer][tokens-1];std::string error;
+            if(!graph.valid()){
+                if(!graph.begin(stream.value,error))throw std::runtime_error(error);
+                try{shared();}catch(...){graph.end(stream.value,error);throw;}
+                if(!graph.end(stream.value,error))throw std::runtime_error(error);
+                ++shared_captures;
+            }
+            if(!graph.launch(stream.value,error))throw std::runtime_error(error);
+            ++shared_launches;
+        }else shared();
+    };
+    // The event excludes the later shared work. Scratch remains ordered on the
+    // same stream; the CPU may plan ownership while shared kernels execute.
+    struct SharedFailureGuard {
+        cudaStream_t stream;bool active=false;int exceptions=std::uncaught_exceptions();
+        ~SharedFailureGuard(){if(active&&std::uncaught_exceptions()>exceptions)cudaStreamSynchronize(stream);}
+    } shared_failure{stream.value};
+    if(!routes_ready)route(layer,tokens,w,phase);
     const bool cpu_path=options.arithmetic==Arithmetic::production &&
         (options.experts==ExpertMode::cpu || (options.experts==ExpertMode::hybrid && !prefill && tokens<=kernels::cpu::MAXT));
     if(cpu_path && options.pcie_frac<1)gpu_check(cudaMemcpyAsync(w.host_x,w.x,int64_t(tokens)*5120*4,cudaMemcpyDeviceToHost,stream.value));
-    gpu_check(cudaStreamSynchronize(stream.value));
-    for(int i=0;i<tokens*6;++i)if(w.host_ids[i]<0||w.host_ids[i]>=384||!std::isfinite(w.host_weights[i])){
+    if(early_shared){
+        gpu_check(cudaEventRecord(route_ready.value,stream.value));
+        shared_failure.active=true;
+        submit_shared();
+        prefill::LedgerScope wait_trace(options.trace,"ds41.moe.route.wait");
+        gpu_check(cudaEventSynchronize(route_ready.value));
+    }else gpu_check(cudaStreamSynchronize(stream.value));
+    const int invalid_route=compact?w.host_ids[tokens*6]:-1;
+    if(compact&&(invalid_route<-1||invalid_route>=tokens*6))throw std::runtime_error("DeepSeek invalid route status");
+    for(int i=0;i<tokens*6;++i)if(w.host_ids[i]<0||w.host_ids[i]>=384||
+        (compact?i==invalid_route:!std::isfinite(w.host_weights[i]))){
         // Validate before updating counters or indexing expert tables. Preserve
         // enough context to distinguish a router failure from cache ownership.
         std::vector<float> logits(tokens*384),input(tokens*5120);
@@ -43,6 +131,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
             " route="+std::to_string(i)+" expert="+std::to_string(w.host_ids[i])+" nonfinite_input="+std::to_string(bad(input))+
             " nonfinite_logits="+std::to_string(bad(logits)));
     }
+    stats.shared_graph_captures+=shared_captures;stats.shared_graph_launches+=shared_launches;
     if(phase==2)experts->observe_physical_routes(layer,w.host_ids,tokens);
     if(deferred_routes)deferred_routes->insert(deferred_routes->end(),w.host_ids,w.host_ids+tokens*6);
     else experts->observe_routes(layer,w.host_ids,tokens,phase);
@@ -51,14 +140,18 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     for(int e=0;e<384;++e)groups[e].expert=e;
     for(int t=0;t<tokens;++t)for(int k=0;k<6;++k){
         const int e=w.host_ids[t*6+k];if(e<0||e>=384)throw std::runtime_error("DeepSeek routed expert ID");
-        groups[e].rows.push_back(t);groups[e].slots.push_back(t*6+k);groups[e].weights.push_back(w.host_weights[t*6+k]);
+        groups[e].rows.push_back(t);groups[e].slots.push_back(t*6+k);
+        if(!compact)groups[e].weights.push_back(w.host_weights[t*6+k]);
     }
+    const bool gpu_metadata=compact||(route_group_enabled.load()&&tokens>1&&tokens<=8);
     int metadata_offset=0;
     for(auto& g:groups){
         g.offset=metadata_offset;
-        std::copy(g.rows.begin(),g.rows.end(),w.host_group_rows+metadata_offset);
-        std::copy(g.slots.begin(),g.slots.end(),w.host_group_slots+metadata_offset);
-        std::copy(g.weights.begin(),g.weights.end(),w.host_group_weights+metadata_offset);
+        if(!gpu_metadata){
+            std::copy(g.rows.begin(),g.rows.end(),w.host_group_rows+metadata_offset);
+            std::copy(g.slots.begin(),g.slots.end(),w.host_group_slots+metadata_offset);
+            std::copy(g.weights.begin(),g.weights.end(),w.host_group_weights+metadata_offset);
+        }
         metadata_offset+=g.rows.size();
     }
     const char* fusion_env=std::getenv("STRATA_DS41_MAIN_MOE_FUSION");
@@ -71,7 +164,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     const bool short_possible=mixed_fast&&expert_mixed_short_enabled()&&phase==2&&tokens<=8&&
         options.target_verify_batch&&options.expert_direct_gemv&&expert_mixed_type(f.gu_type)&&
         expert_mixed_type(f.d_type)&&w.max_tokens>=tokens*6;
-    if(!single){
+    if(!single&&!gpu_metadata){
         gpu_check(cudaMemcpyAsync(w.group_rows,w.host_group_rows,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
         gpu_check(cudaMemcpyAsync(w.group_slots,w.host_group_slots,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
         gpu_check(cudaMemcpyAsync(w.group_weights,w.host_group_weights,metadata_offset*sizeof(float),cudaMemcpyHostToDevice,stream.value));
@@ -94,6 +187,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         stats.demand_expert_bytes+=take*f.bytes;stats.cold_expert_groups+=take;stats.demand_expert_groups+=take;
         cold.insert(cold.end(),cpu.begin(),cpu.begin()+take);cpu.erase(cpu.begin(),cpu.begin()+take);
     }
+    if(compact&&!cpu.empty())throw std::logic_error("DeepSeek compact route reached CPU experts");
     // Route observation already counted true residency. Demand offload is kept
     // separate and never contributes to that hit counter.
     if(prefetch_active && !prefill)throw std::logic_error("prefill stream reached decode");
@@ -150,42 +244,11 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         if(rc)throw std::runtime_error("DeepSeek bounded grouped MoE error="+std::to_string(rc));
         for(int i=0;i<count;++i)stats.expert_gpu+=batch[i].tokens;
     };
-    // Start demand upload before submitting shared and resident GPU work.
-    auto shared=[&]{
-        const auto& gate=tensor(layer,"ffn_gate_shexp");
-        const auto& up=tensor(layer,"ffn_up_shexp");
-        // Keep the validated shared path: the experimental grouped Q8 chain
-        // has no material speed gain and two activation-reference failures.
-        if(options.shared_q8_pair && options.arithmetic==Arithmetic::production && tokens<=8 &&
-           options.dense_q8_1 && (tokens==1||options.dense_q8_batch) &&
-           gate.packed_bf16 && up.packed_bf16 && gate.type==8 && up.type==8 &&
-           gate.rows==2304 && up.rows==2304 && gate.cols==5120 && up.cols==5120){
-            kernels::native_quantize_q8_1(w.x,w.dense_input_q8,5120,tokens,stream.value);
-            if(!kernels::native_mmvq_pair(8,gate.data,up.data,w.dense_input_q8,w.shared_gate,w.shared_up,
-                                         5120,2304,tokens,stream.value)){
-                kernels::native_q8_0_mmvq(gate.data,w.dense_input_q8,w.shared_gate,5120,2304,tokens,stream.value);
-                kernels::native_q8_0_mmvq(up.data,w.dense_input_q8,w.shared_up,5120,2304,tokens,stream.value);
-            }
-            gpu_check(round_bf16_strided_gpu(w.shared_gate,tokens,2304,2304,stream.value));
-            gpu_check(round_bf16_strided_gpu(w.shared_up,tokens,2304,2304,stream.value));
-        }else{
-            matmul(gate,w.x,w.shared_gate,tokens,w);
-            matmul(up,w.x,w.shared_up,tokens,w);
-        }
-        gpu_check((options.arithmetic==Arithmetic::production?swiglu_bf16_gpu:swiglu_gpu)(w.shared_gate,w.shared_up,nullptr,w.shared_act,2304,tokens,10.f,stream.value));
-        matmul(tensor(layer,"ffn_down_shexp"),w.shared_act,w.shared_out,tokens,w);
-    };
-    if(options.decode_graph && phase==2 && tokens<=8){
-        auto& graph=shared_graphs[layer][tokens-1];std::string error;
-        if(!graph.valid()){
-            if(!graph.begin(stream.value,error))throw std::runtime_error(error);
-            try{shared();}catch(...){graph.end(stream.value,error);throw;}
-            if(!graph.end(stream.value,error))throw std::runtime_error(error);
-            ++stats.shared_graph_captures;
-        }
-        if(!graph.launch(stream.value,error))throw std::runtime_error(error);
-        ++stats.shared_graph_launches;
-    }else shared();
+    if(!early_shared){
+        submit_shared();
+        stats.shared_graph_captures+=shared_captures;stats.shared_graph_launches+=shared_launches;
+    }
+    if(moe_shared_host_ready)moe_shared_host_ready();
     auto compute=[&](const Group& g,const uint8_t* blob,const std::array<uint16_t*,3>* prepared=nullptr){
         const int nt=g.rows.size();
         if(!single)gpu_check(gather_rows_gpu(w.x,w.group_rows+g.offset,w.group_x,nt,5120,stream.value));
@@ -279,7 +342,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     const bool short_uniform=std::all_of(resident.begin(),resident.end(),[&](const auto& item){return item.first->rows.size()==static_cast<size_t>(tokens);});
     const bool short_batch=short_possible&&expert_mixed_short_selected(f.gu_type,f.d_type,tokens,resident.size(),short_uniform);
     if(short_batch){
-        if(single){
+        if(single&&!gpu_metadata){
             gpu_check(cudaMemcpyAsync(w.group_rows,w.host_group_rows,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
             gpu_check(cudaMemcpyAsync(w.group_slots,w.host_group_slots,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
             gpu_check(cudaMemcpyAsync(w.group_weights,w.host_group_weights,metadata_offset*sizeof(float),cudaMemcpyHostToDevice,stream.value));

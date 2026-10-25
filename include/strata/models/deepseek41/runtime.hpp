@@ -9,6 +9,13 @@
 #include "strata/kernels/sampler.hpp"
 
 namespace strata::models::deepseek41 {
+// Drained test/rollback control for joined HC attention-input overlap.
+void hc_overlap_set_enabled(bool enabled);
+void engram_short_set_enabled(bool enabled);
+void output_a_batch_set_enabled(bool enabled);
+void route_group_set_enabled(bool enabled);
+void target_greedy_set_enabled(bool enabled);
+void state_copy_set_enabled(bool enabled);
 enum class Arithmetic { f32, production };
 enum class ExpertMode { hybrid, gpu, cpu };
 struct RuntimeOptions {
@@ -35,6 +42,7 @@ struct RuntimeOptions {
     std::array<double,8> dspark_verify_cost_ms{};
     bool phase_residency = false;
     bool adaptive_experts = false; // Single-slot hybrid decode: asynchronous RAM/GPU exchanges.
+    bool adaptive_maya = false; // Opt-in Maya heat/hysteresis policy; legacy remains selectable.
     bool adaptive_groups = false; // Q3_K layers 0..13 / Q2_K layers 14..39 compete within each group.
     std::string expert_profile_save; // Opt-in: atomically save learned startup ranking after a successful request.
     uint64_t borrow_bytes = 8ull << 30, migration_bytes = 64ull << 20;
@@ -47,6 +55,7 @@ struct RuntimeOptions {
     bool compact_workspace = false; // Main-model phase scratch reuse; DSpark reserves its wider FC input.
     bool dense_q8 = false, dense_q8_1 = false; // Packed attention/shared weights; optional short Q8_1 inputs.
     bool shared_q8_pair = false; // Shared Gate/Up reuse one Q8_1 input and an exact paired projection.
+    bool shared_early_submit = true, route_compact_handoff = true; // Independently confirmed short all-GPU dispatch.
     int expert_gu_mode = 0; // 0: separate BF16 GEMVs; 1: fused BF16; 2: fused integer Q8_1.
     bool cpu_gu_q8_0 = false, decode_graph = false, engram_continuous = false;
     bool parallel_router = false;

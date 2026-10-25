@@ -262,6 +262,7 @@ struct Workspace {
     int32_t* candidate_blocks = nullptr;
     float* temp_swa_float = nullptr;
     int *ids = nullptr, *group_rows = nullptr, *group_slots = nullptr, *route_ids = nullptr;
+    int* route_handoff = nullptr;
     float *route_weights = nullptr, *group_weights = nullptr;
     int64_t *swa_slots = nullptr, *global_slots = nullptr, *write_slots = nullptr;
     IndexSortBuffers sort, block_sort;
@@ -324,6 +325,8 @@ struct Runtime::Impl {
     Model model;
     RuntimeOptions options;
     Stream stream, upload, dequant_stream;
+    Stream hc_stream;
+    Event hc_ready,hc_done;
     cublasHandle_t blas = nullptr;
     std::unique_ptr<WeightBank> weights;
     std::unique_ptr<GgufExperts> experts;
@@ -342,6 +345,8 @@ struct Runtime::Impl {
     std::unique_ptr<ExpertPipeline> expert_pipeline;
     std::unique_ptr<DecodeRawCache> decode_raw_cache;
     uint64_t expert_generation = 0;
+    // Test-only observation at shared completion / host-plan handoff; normally empty.
+    std::function<void()> moe_shared_host_ready;
     bool prefetch_active=false;
     size_t prefetch_cursor=0,prefetch_total=0;
     std::vector<uint64_t> prefetch_sizes;
@@ -350,7 +355,7 @@ struct Runtime::Impl {
     std::array<Event,2> ring_ready, ring_consumed;
     std::array<bool,2> ring_used{};
     std::array<Event,2> expert_ready,expert_used;
-    Event expert_begin;
+    Event expert_begin,route_ready;
     uint64_t ring_slot_bytes = 0;
     int ring_slots = 0;
     std::mutex execution_mutex;
@@ -364,7 +369,9 @@ struct Runtime::Impl {
         return weights->at("blk." + std::to_string(layer) + "." + name + ".weight");
     }
     void moe(int layer,int tokens,Workspace& work,ExecutionStats& stats,int phase,std::vector<int>* deferred_routes=nullptr,bool routes_ready=false);
-    void route(int layer,int tokens,Workspace& work);
+    bool short_gpu_moe(int tokens,int phase) const;
+    bool compact_routes(int tokens,int phase) const;
+    void route(int layer,int tokens,Workspace& work,int phase);
     void decode_segment(int part,int layer,int tokens,Workspace& work,bool eligible,const std::function<void()>& body);
     void begin_expert_prefetch(int first,int last,ExecutionStats& stats);
     void prune_expert_prefetch(int layer,const std::array<bool,384>& selected,ExecutionStats& stats);
@@ -392,6 +399,8 @@ struct Session::Impl {
     std::vector<int> tokens;
     std::vector<ImageEmbedding> images;
     std::vector<float> last_logits;
+    bool greedy_capture=false;
+    std::vector<int> last_greedy;
     float *boundary_h = nullptr, *boundary_pre = nullptr;
     float *draft_hidden = nullptr, *snapshot_hidden = nullptr;
     int64_t draft_capture_position = 0;

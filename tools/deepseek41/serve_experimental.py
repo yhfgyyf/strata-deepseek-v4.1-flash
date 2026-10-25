@@ -45,6 +45,8 @@ def load_config(path):
             cfg["integrity"] = str(runtime / "integrity.txt")
     if "hot_bytes" in cfg and (type(cfg["hot_bytes"]) is not int or not 0 < cfg["hot_bytes"] < 1 << 63):
         raise ValueError("hot_bytes must be a positive integer below 2^63")
+    if type(cfg.get("prefix_cache_mib", 0)) is not int or not 0 <= cfg.get("prefix_cache_mib", 0) <= 4096:
+        raise ValueError("prefix_cache_mib must be an integer from 0 to 4096")
     for name in ("engine", "model", "draft", "tokenizer", "integrity", "profile", "heat",
                  "costs", "draft_input_vocab", "draft_output_vocab", "mmproj", "log"):
         value = cfg.get(name)
@@ -99,13 +101,17 @@ def main():
     if cfg.get("log"):
         Path(cfg["log"]).parent.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX", "0")
+    os.environ.setdefault("OMP_NUM_THREADS", "6")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("STRATA_DS41_ADAPTIVE_POLICY", "maya")
     os.environ["STRATA_DS41_BLOCK_SEGMENTS"] = "40"
     os.environ["STRATA_DS41_BLOCK_HUGE_MIN_PERCENT"] = "100"
     os.environ["STRATA_DS41_DECODE_SEGMENTS"] = "2"
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    engine = DeepSeekEngine(command, 1048576, 1, True, True, log_path=cfg.get("log"))
+    engine = DeepSeekEngine(command, 1048576, 1, True, True, log_path=cfg.get("log"),
+                           prefix_cache_mib=cfg.get("prefix_cache_mib", 0))
     server = None
     try:
         tokenizer = DeepSeekTokenizer(cfg["tokenizer"])

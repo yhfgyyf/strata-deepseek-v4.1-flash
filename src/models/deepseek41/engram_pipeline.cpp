@@ -3,6 +3,8 @@
 #include <cstring>
 
 namespace strata::models::deepseek41 {
+namespace {std::atomic<bool> engram_short_enabled{true};}
+void engram_short_set_enabled(bool value){engram_short_enabled.store(value);}
 EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type)
     : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==13?176:packed_type==14?210:272) {
     if(packed_type!=8&&packed_type!=13&&packed_type!=14)throw std::invalid_argument("Engram pipeline type");
@@ -70,7 +72,8 @@ void EngramPipeline::run(){
                 if(arithmetic_==Arithmetic::production)
                     gpu_check(dequant_round_bf16_gpu(work_.engram_packed,packed_type_,work_.engram_emb,int64_t(count)*6144,stream_.value));
                 else gpu_check(dequant_gpu(work_.engram_packed,packed_type_,work_.engram_emb,int64_t(count)*6144,stream_.value));
-                matrix_product(matrices[table],work_.engram_emb,work_.engram_kv,count,blas_,stream_.value,work_.engram_input,arithmetic_);
+                matrix_product(matrices[table],work_.engram_emb,work_.engram_kv,count,blas_,stream_.value,work_.engram_input,arithmetic_,0,0,0,0,true,
+                    engram_short_enabled.load()&&arithmetic_==Arithmetic::production&&count>1&&count<=8);
                 gpu_check(cudaEventRecord(ready_[table].value,stream_.value));
                 { std::lock_guard<std::mutex> lock(mutex_);issued_[table]=sequence; }
                 changed_.notify_all();

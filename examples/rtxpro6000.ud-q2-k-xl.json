@@ -9,5 +9,6 @@
   "host": "127.0.0.1",
   "port": 30011,
   "alias": "deepseek-v4.1",
+  "prefix_cache_mib": 1024,
   "log": "../runtime/ud-q2-k-xl/engine.log"
 }

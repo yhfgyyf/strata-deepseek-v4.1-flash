@@ -51,6 +51,7 @@ void Workspace::layout(WorkspaceLayout& memory,int tokens,int context,bool compa
     image=bytes(t);
     ids=memory.alloc<int>(t);group_rows=memory.alloc<int>(t*6);group_slots=memory.alloc<int>(t*6);
     route_ids=memory.alloc<int>(t*6);route_weights=floats(t*6);group_weights=floats(t*6);
+    route_handoff=memory.alloc<int>(8*6+1);
     swa_slots=memory.alloc<int64_t>(t*128);global_slots=memory.alloc<int64_t>(t*512);write_slots=memory.alloc<int64_t>(t);
     // Bound index queries independently of the model chunk. Candidate readers use only 2048*8 keys.
     const uint64_t index_begin=memory.bytes;
@@ -74,11 +75,11 @@ Workspace::Workspace(uint64_t budget,int tokens,int context,bool compact_logits,
     arena=std::make_unique<core::DeviceArena>(budget);
     WorkspaceLayout memory(arena.get());layout(memory,tokens,context,compact_logits,compact_workspace,dspark);
     // Pinned exchanges are request-independent and reused while the execution mutex owns this workspace.
-    const uint64_t t=tokens,host_bytes=t*5120*4+t*6*5120*4+t*6*4*5;
+    const uint64_t t=tokens,host_bytes=t*5120*4+t*6*5120*4+t*6*4*5+sizeof(int);
     host=std::make_unique<Pinned>(host_bytes);
     host_x=reinterpret_cast<float*>(host->data);
     host_parts=host_x+t*5120;host_weights=host_parts+t*6*5120;host_ids=reinterpret_cast<int*>(host_weights+t*6);
-    host_group_rows=host_ids+t*6;host_group_slots=host_group_rows+t*6;
+    host_group_rows=host_ids+t*6+1;host_group_slots=host_group_rows+t*6;
     host_group_weights=reinterpret_cast<float*>(host_group_slots+t*6);
     std::cerr << "DeepSeek workspace used=" << arena->used() << " reserved=" << arena->capacity() << '\n';
 }
@@ -112,7 +113,7 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     if(o.phase_residency&&o.slots!=1)throw std::invalid_argument("experimental phase residency requires one request slot");
     if(o.adaptive_experts&&(o.phase_residency||o.slots!=1||o.arithmetic!=Arithmetic::production||o.experts!=ExpertMode::hybrid))
         throw std::invalid_argument("adaptive experts require single-slot production hybrid, without phase residency");
-    if((o.adaptive_groups||!o.expert_profile_save.empty())&&!o.adaptive_experts)
+    if((o.adaptive_groups||o.adaptive_maya||!o.expert_profile_save.empty())&&!o.adaptive_experts)
         throw std::invalid_argument("grouped residency/profile learning requires adaptive experts");
     if(!o.expert_profile_save.empty()&&!o.profile.empty()&&
        std::filesystem::weakly_canonical(o.expert_profile_save)==std::filesystem::weakly_canonical(o.profile))
@@ -187,7 +188,7 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     }
     guard.success=true;
 }
-Runtime::Impl::~Impl() { if (blas) cublasDestroy(blas); }
+Runtime::Impl::~Impl() { cudaStreamSynchronize(hc_stream.value);if (blas) cublasDestroy(blas); }
 void Runtime::Impl::round(float* x,uint64_t n) {
     if (options.arithmetic == Arithmetic::production) gpu_check(round_bf16_gpu(x,n,stream.value));
 }
@@ -337,6 +338,7 @@ void Runtime::write_ledger(std::ostream& out) const {
         << ",\"phase_backup_ram_bytes\":" << p.experts->backup_bytes()<<",\"phase_host_staging_bytes\":"<<p.experts->phase_staging_bytes()
         << ",\"adaptive_experts\":"<<(p.options.adaptive_experts?"true":"false")<<",\"adaptive_host_staging_bytes\":"<<p.experts->adaptive_staging_bytes()
         << ",\"adaptive_expert_scope\":\""<<(p.options.adaptive_groups?"format-group":"layer")<<"\""
+        << ",\"adaptive_expert_policy\":\""<<(p.options.adaptive_maya?"maya":"legacy")<<"\""
         << ",\"learned_profile_save_enabled\":"<<(!p.options.expert_profile_save.empty()?"true":"false")
         << ",\"state_gpu_budget\":" << p.options.state << ",\"slots\":" << p.options.slots
         << ",\"vision_gpu_bytes\":" << (p.vision_weights?p.vision_weights->bytes():0)

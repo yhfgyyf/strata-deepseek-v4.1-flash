@@ -11,7 +11,10 @@
 #include <numeric>
 
 namespace strata::models::deepseek41 {
+#include "state_copy.hpp"
 namespace {
+std::atomic<bool> target_greedy_enabled{true};
+std::atomic<bool> state_copy_enabled{true};
 constexpr char prefix_magic[16]="STRATA-DS41-P04";
 void write_bytes(std::ostream& out,const void* data,uint64_t size) {
     out.write(static_cast<const char*>(data),size);if(!out)throw std::runtime_error("DeepSeek prefix write");
@@ -281,17 +284,18 @@ void Session::begin_transaction() {
     snap->history=s.history;snap->token_count=s.tokens.size();snap->last_logits=s.last_logits;
     snap->draft_position=s.draft_capture_position;
     gpu_check(cudaMemcpyAsync(s.snapshot_hidden,s.draft_hidden,128*15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
+    StateCopies copies(state_copy_enabled.load(),r.stream.value);
     const int bytes=r.options.arithmetic==Arithmetic::f32?128*512*4:128*528;int owner=0;
     for(int l=0;l<40;++l){
         snap->local_position[l]=s.local[l].position;snap->local_count[l]=s.local[l].count;
-        gpu_check(cudaMemcpyAsync(s.snapshot_local+int64_t(l)*bytes,s.local[l].packed?static_cast<void*>(s.local[l].packed):static_cast<void*>(s.local[l].values),bytes,cudaMemcpyDeviceToDevice,r.stream.value));
+        copies.add(s.snapshot_local+int64_t(l)*bytes,s.local[l].packed?static_cast<void*>(s.local[l].packed):static_cast<void*>(s.local[l].values),bytes);
         if(r.model.ownership()[l].owns_global()){
             auto& g=s.global[l];snap->global_position[l]=g.position;snap->global_rows[l]=g.rows;snap->partial[l]=g.partial;
-            gpu_check(cudaMemcpyAsync(s.snapshot_partial+owner*1024,g.partial_kv,512*4,cudaMemcpyDeviceToDevice,r.stream.value));
-            gpu_check(cudaMemcpyAsync(s.snapshot_partial+owner*1024+512,g.partial_gate,512*4,cudaMemcpyDeviceToDevice,r.stream.value));++owner;
+            copies.add(s.snapshot_partial+owner*1024,g.partial_kv,512*4);
+            copies.add(s.snapshot_partial+owner*1024+512,g.partial_gate,512*4);++owner;
         }
     }
-    gpu_check(cudaStreamSynchronize(r.stream.value));s.transaction=std::move(snap);s.transaction_active=true;
+    copies.flush();gpu_check(cudaStreamSynchronize(r.stream.value));s.transaction=std::move(snap);s.transaction_active=true;
     s.transaction_routes_deferred=r.options.dspark_prefix_commit;
     for(auto& routes:s.transaction_routes)routes.clear();
 }
@@ -323,14 +327,14 @@ void Session::commit_verified_prefix(int keep,const std::vector<float>& verified
     std::vector<uint8_t> mask(keep);
     for(const auto& image:s.images)for(int64_t p=std::max(snap.position,image.begin);p<std::min(end,image.begin+image.tokens());++p)mask[p-snap.position]=1;
     const auto history=engram_hash(engram_hash_spec(r.model),r.model.token_map(),ids,mask,snap.history).after;
+    StateCopies copies(state_copy_enabled.load(),r.stream.value);
     const int row_bytes=r.options.arithmetic==Arithmetic::f32?512*4:528;
     for(int layer=0;layer<40;++layer){
         auto* local=s.local[layer].packed?s.local[layer].packed:reinterpret_cast<uint8_t*>(s.local[layer].values);
         // At most eight writes: rejected ring slots cannot alias accepted writes.
         for(int64_t p=end;p<snap.position+total;++p){
             const int slot=p%128;
-            gpu_check(cudaMemcpyAsync(local+slot*row_bytes,s.snapshot_local+(int64_t(layer)*128+slot)*row_bytes,
-                row_bytes,cudaMemcpyDeviceToDevice,r.stream.value));
+            copies.add(local+slot*row_bytes,s.snapshot_local+(int64_t(layer)*128+slot)*row_bytes,row_bytes);
         }
         s.local[layer].position=end;s.local[layer].count=std::min(128,snap.local_count[layer]+keep);
         const auto& own=r.model.ownership()[layer];
@@ -338,14 +342,13 @@ void Session::commit_verified_prefix(int keep,const std::vector<float>& verified
             auto& g=s.global[layer];g.position=end;g.rows=end/own.compression;g.partial=own.compression==2&&end%2;
             if(g.partial){
                 const auto* checkpoint=s.verified_partial+(s.partial_owner[layer]*8+keep-1)*1024;
-                gpu_check(cudaMemcpyAsync(g.partial_kv,checkpoint,512*4,cudaMemcpyDeviceToDevice,r.stream.value));
-                gpu_check(cudaMemcpyAsync(g.partial_gate,checkpoint+512,512*4,cudaMemcpyDeviceToDevice,r.stream.value));
+                copies.add(g.partial_kv,checkpoint,512*4);
+                copies.add(g.partial_gate,checkpoint+512,512*4);
             }
         }
     }
     for(int64_t p=end;p<snap.position+total;++p){const int slot=p%128;
-        gpu_check(cudaMemcpyAsync(s.draft_hidden+int64_t(slot)*15360,s.snapshot_hidden+int64_t(slot)*15360,
-            15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
+        copies.add(s.draft_hidden+int64_t(slot)*15360,s.snapshot_hidden+int64_t(slot)*15360,15360*4);
     }
     s.position=s.encoder_position=s.decoder_position=end;s.history=history;s.tokens.resize(snap.token_count+keep);
     if(s.draft_kv&&s.draft_kv->position>end)s.draft_kv->position=-1;
@@ -354,7 +357,7 @@ void Session::commit_verified_prefix(int keep,const std::vector<float>& verified
     ++s.generation;s.index_epoch=s.candidate_epoch=0;s.index_source=-1;
     if(s.engram_ticket){s.engram_ticket->cancel();s.engram_ticket.reset();}
     if(s.engram_lookahead){s.engram_lookahead->cancel();s.engram_lookahead.reset();}s.lookahead_start=-1;
-    gpu_check(cudaStreamSynchronize(r.stream.value));s.commit_routes(keep);
+    copies.flush();gpu_check(cudaStreamSynchronize(r.stream.value));s.commit_routes(keep);
     // Physical forward/H2D counters include rejected verification work.
     r.experts->adjust_decode(keep,r.stream.value,s.counters);
     s.transaction.reset();s.transaction_active=false;s.transaction_routes_deferred=false;
@@ -363,20 +366,22 @@ void Session::rollback_transaction() {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
     if(!s.transaction_active)throw std::runtime_error("DeepSeek no transaction");
     const auto& snap=*s.transaction;
+    StateCopies copies(state_copy_enabled.load(),r.stream.value);
     const int bytes=r.options.arithmetic==Arithmetic::f32?128*512*4:128*528;int owner=0;
     for(int l=0;l<40;++l){
         s.local[l].position=snap.local_position[l];s.local[l].count=snap.local_count[l];
-        gpu_check(cudaMemcpyAsync(s.local[l].packed?static_cast<void*>(s.local[l].packed):static_cast<void*>(s.local[l].values),s.snapshot_local+int64_t(l)*bytes,bytes,cudaMemcpyDeviceToDevice,r.stream.value));
+        copies.add(s.local[l].packed?static_cast<void*>(s.local[l].packed):static_cast<void*>(s.local[l].values),s.snapshot_local+int64_t(l)*bytes,bytes);
         if(r.model.ownership()[l].owns_global()){
             auto& g=s.global[l];g.position=snap.global_position[l];g.rows=snap.global_rows[l];g.partial=snap.partial[l];
-            gpu_check(cudaMemcpyAsync(g.partial_kv,s.snapshot_partial+owner*1024,512*4,cudaMemcpyDeviceToDevice,r.stream.value));
-            gpu_check(cudaMemcpyAsync(g.partial_gate,s.snapshot_partial+owner*1024+512,512*4,cudaMemcpyDeviceToDevice,r.stream.value));++owner;
+            copies.add(g.partial_kv,s.snapshot_partial+owner*1024,512*4);
+            copies.add(g.partial_gate,s.snapshot_partial+owner*1024+512,512*4);++owner;
         }
     }
     s.position=snap.position;s.encoder_position=snap.encoder;s.decoder_position=snap.decoder;s.history=snap.history;s.tokens.resize(snap.token_count);s.last_logits=snap.last_logits;
     if(s.draft_kv&&s.draft_kv->position>snap.position)s.draft_kv->position=-1;
     r.experts->restore_heat(snap.routing_heat);
     s.draft_capture_position=snap.draft_position;
+    copies.flush();
     gpu_check(cudaMemcpyAsync(s.draft_hidden,s.snapshot_hidden,128*15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
     ++s.generation;s.index_epoch=s.candidate_epoch=0;s.index_source=-1;if(s.engram_ticket)s.engram_ticket->cancel();
     gpu_check(cudaStreamSynchronize(r.stream.value));s.transaction.reset();s.transaction_active=false;s.transaction_routes_deferred=false;
@@ -490,6 +495,8 @@ void Session::load_prefix(const std::string& path,const std::vector<int>& expect
         throw;
     }
 }
+void state_copy_set_enabled(bool enabled){state_copy_enabled.store(enabled);}
+void target_greedy_set_enabled(bool enabled){target_greedy_enabled.store(enabled);}
 std::vector<int> Session::generate(const std::vector<float>& initial,int maximum,const std::vector<int>& eos,
                                   const kernels::SamplerParams& sampling,bool speculative,
                                   const std::function<void(int)>& callback) {
@@ -498,21 +505,31 @@ std::vector<int> Session::generate(const std::vector<float>& initial,int maximum
         (speculative&&!s.runtime.options.dspark))throw std::invalid_argument("DeepSeek generation contract");
     if(speculative&&s.runtime.options.dspark_adaptive_verification&&!(sampling.greedy||sampling.temperature==0))
         throw std::invalid_argument("DSpark adaptive verification currently requires greedy sampling");
-    std::vector<int> output;std::vector<float> current=initial;int pending=-1;
+    const bool gpu_greedy=target_greedy_enabled.load()&&(sampling.greedy||sampling.temperature==0)&&
+        sampling.penalty_repeat==1&&sampling.penalty_freq==0&&sampling.penalty_present==0;
+    struct GreedyCapture {bool& state;bool previous;~GreedyCapture(){state=previous;}} capture{s.greedy_capture,s.greedy_capture};
+    s.greedy_capture=gpu_greedy;
+    auto target=[&](const float* logits,const std::vector<int>& history,int cached){
+        prefill::LedgerScope scope(s.runtime.options.trace,"ds41.sampling.target");
+        if(gpu_greedy&&cached>=0){Distribution d;d.ids={cached};d.probabilities={1};d.proposal_probabilities={1};return d;}
+        return distribution(logits,129280,sampling,history);
+    };
+    std::vector<int> output;std::vector<float> current=initial;int pending=-1,next_greedy=-1;
+    auto advance=[&](int id){current=decode(id);next_greedy=s.last_greedy.empty()?-1:s.last_greedy.back();};
     auto stopped=[&](int id){return std::find(eos.begin(),eos.end(),id)!=eos.end();};
     auto emit=[&](int id){output.push_back(id);if(callback)callback(id);};
     while(static_cast<int>(output.size())<maximum&&s.position<s.runtime.options.context){
         s.check_cancel();
-        const auto p0=distribution(current.data(),129280,sampling,s.tokens);
+        const auto p0=target(current.data(),s.tokens,next_greedy);next_greedy=-1;
         const int first=pending>=0?pending:sample(p0,draw_uniform(sampling.seed,sampling.counter+s.position));pending=-1;
         const int remaining=maximum-output.size();
         if(stopped(first)){emit(first);break;}
         if(!speculative||remaining<2||s.runtime.options.context-s.position<2||s.runtime.experts->until_adjustment()<2){
-            emit(first);if(static_cast<int>(output.size())==maximum)break;current=decode(first);continue;
+            emit(first);if(static_cast<int>(output.size())==maximum)break;advance(first);continue;
         }
         auto proposal=propose(first,sampling);
         if(proposal.tokens.empty()){
-            emit(first);if(static_cast<int>(output.size())==maximum)break;current=decode(first);continue;
+            emit(first);if(static_cast<int>(output.size())==maximum)break;advance(first);continue;
         }
         int count=std::min<int>({int(proposal.tokens.size()),remaining-1,int(s.runtime.options.context-s.position-1),s.runtime.experts->until_adjustment()-1});
         for(int i=0;i<count;++i)if(stopped(proposal.tokens[i])){count=i+1;break;}
@@ -532,12 +549,12 @@ std::vector<int> Session::generate(const std::vector<float>& initial,int maximum
             std::vector<int> history=base_history;history.push_back(first);
             int accepted=0,replacement=-1;
             for(int i=0;i<count;++i){
-                const auto target=distribution(verified.data()+int64_t(i)*129280,129280,sampling,history);
+                const auto selected=target(verified.data()+int64_t(i)*129280,history,i<static_cast<int>(s.last_greedy.size())?s.last_greedy[i]:-1);
                 if(sampling.greedy||sampling.temperature==0){
-                    if(target.ids[0]!=proposal.tokens[i]){replacement=target.ids[0];break;}
+                    if(selected.ids[0]!=proposal.tokens[i]){replacement=selected.ids[0];break;}
                 }else{
                     const auto& q=proposal.distributions[i];
-                    const core::SpecP p{target.ids.data(),target.probabilities.data(),static_cast<int>(target.ids.size())};
+                    const core::SpecP p{selected.ids.data(),selected.probabilities.data(),static_cast<int>(selected.ids.size())};
                     const core::SpecQ draft{q.ids.data(),q.proposal_probabilities.data(),static_cast<int>(q.ids.size())};
                     const uint64_t counter=sampling.counter+base_position+i+1;
                     const auto decision=core::spec_verify_row(p,proposal.tokens[i],draft,
@@ -557,6 +574,8 @@ std::vector<int> Session::generate(const std::vector<float>& initial,int maximum
                 s.counters.verify_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before_replay).count();
                 current.assign(replayed.end()-129280,replayed.end());pending=replacement;
             }else{commit_transaction();active=false;current.assign(verified.end()-129280,verified.end());}
+            if(gpu_greedy&&!s.last_greedy.empty())
+                next_greedy=s.last_greedy[s.runtime.options.dspark_prefix_commit?accepted:s.last_greedy.size()-1];
             s.counters.accepted_tokens+=accepted;
             emit(first);for(int i=0;i<accepted;++i)emit(proposal.tokens[i]);
             if(!output.empty()&&stopped(output.back()))break;

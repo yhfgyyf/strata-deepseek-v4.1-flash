@@ -249,7 +249,7 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         ram_.register_if_needed();
         std::cerr<<"DeepSeek host_memory expert ";ram_.memory_info().write(std::cerr);std::cerr<<'\n';
     }
-    if(options.adaptive_experts)adaptive_=std::make_unique<AdaptiveCache>(cache_,hot_,offsets_,ram_.get(),sizes,options.migration_bytes,options.trace,options.adaptive_groups,ram_.pinned(),options.huge_pinned_memory,&layout_groups);
+    if(options.adaptive_experts)adaptive_=std::make_unique<AdaptiveCache>(cache_,hot_,offsets_,ram_.get(),sizes,options.migration_bytes,options.trace,options.adaptive_groups,ram_.pinned(),options.huge_pinned_memory,&layout_groups,options.adaptive_maya);
 }
 GgufExperts::~GgufExperts() {
 #ifndef _WIN32

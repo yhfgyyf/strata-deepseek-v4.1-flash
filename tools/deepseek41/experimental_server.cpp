@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <sched.h>
 
 namespace d = strata::models::deepseek41;
 namespace strata::models::deepseek41 { int serve(Runtime&, const RuntimeOptions&); }
@@ -41,6 +42,11 @@ int main(int argc, char** argv) {
         o.engram_cache = 8192ull << 20; o.migration_bytes = 3072ull << 20;
         o.ram_experts = (iq ? 160ull : 144ull) << 30; o.host_headroom = 16ull << 30;
         o.experts = d::ExpertMode::hybrid; o.adaptive_experts = true; o.adaptive_groups = true;
+        if(const char* policy=std::getenv("STRATA_DS41_ADAPTIVE_POLICY")){
+            const std::string name=policy;
+            if(name!="legacy"&&name!="maya")throw std::invalid_argument("adaptive expert policy");
+            o.adaptive_maya=name=="maya";
+        }
         o.engram_pipeline = true; o.expert_bf16 = true; o.expert_direct_gemv = true;
         o.expert_pipeline = true; o.adaptive_layer_progress = true; o.pcie_frac = 1;
         o.compact_logits = true; o.compact_workspace = true; o.dense_q8 = true; o.dense_q8_1 = true;
@@ -65,6 +71,10 @@ int main(int argc, char** argv) {
         // Match the established experiment's process-owned runtime lifetime.
         auto* runtime = new d::Runtime(model, o,
             argv[2], vision);
+        // Preserve C37 request placement after runtime workers exist.
+        cpu_set_t request_cpu; CPU_ZERO(&request_cpu); CPU_SET(8, &request_cpu);
+        if (sched_setaffinity(0, sizeof(request_cpu), &request_cpu))
+            throw std::runtime_error("pin request/control thread CPU8");
         using Access = d::PrefetchBlockBenchmark;
         const auto& host = Access::rt(*runtime).experts->host_memory_info();
         host.write(std::cerr); std::cerr << '\n';
@@ -84,6 +94,8 @@ int main(int argc, char** argv) {
         std::cerr << "Experimental service: context=1048576 chunk=8192 work_mib=6720 vision=F32 block_pinned=40 huge_min_percent="
                   << huge_minimum << " draft=5 adaptive=1 shared_pair=1 main_fusion=2 scores_fast=1 dq_fast=1 mixed_fast=" << iq
                   << " iq_short_batch=" << iq << " hot_bytes=" << o.hot_front << " free=" << free << '\n';
+        std::cerr << "C37 serve: request_cpu=8 shared_early_submit=" << o.shared_early_submit
+                  << " route_compact_handoff=" << o.route_compact_handoff << '\n';
         const int result = d::serve(*runtime, o);
         std::cerr << "Experimental IPC finished code=" << result << std::endl;
         std::_Exit(result);

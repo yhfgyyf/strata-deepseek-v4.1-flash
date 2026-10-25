@@ -68,6 +68,15 @@ class ReleaseConfigTests(unittest.TestCase):
         self.cfg["model"] = link.name
         self.assertEqual(self.load()["model"], str(link))
 
+    def test_prefix_cache_budget(self):
+        for value in (True, -1, 4097, "1024", 1.5):
+            self.cfg["prefix_cache_mib"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "prefix_cache_mib"):
+                self.load()
+        for value in (0, 1024, 4096):
+            self.cfg["prefix_cache_mib"] = value
+            self.assertEqual(self.load()["prefix_cache_mib"], value)
+
     def variant_config(self, variant):
         self.cfg = {key: "asset" for key in ("engine", "draft", "tokenizer")}
         self.cfg["variant"] = variant

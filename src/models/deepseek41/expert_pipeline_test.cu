@@ -14,6 +14,65 @@ __global__ void check_raw(const uint8_t* raw,uint8_t expected,int bytes,int* fai
 __global__ void delay_reader(unsigned long long cycles) {
     const auto begin=clock64();while(clock64()-begin<cycles){}
 }
+void cancel_request(d::ExpertPipeline& pipeline,cudaStream_t dequant,cudaStream_t reader) {
+#ifdef DS41_TEST_LEGACY_CANCEL
+    // The deployed C37 cleanup used terminal stop followed by these fences.
+    pipeline.stop();d::gpu_check(cudaStreamSynchronize(dequant));d::gpu_check(cudaStreamSynchronize(reader));
+#else
+    pipeline.cancel(dequant,reader);
+#endif
+}
+void cancelled_generation_reuse() {
+    constexpr int slots=4,stride=4096,payload=4000,jobs=17;
+    strata::core::DeviceArena arena(slots*stride+256);auto* raw=static_cast<uint8_t*>(arena.alloc(slots*stride));
+    auto* failures=static_cast<int*>(arena.alloc(256));d::Pinned scratch(slots*stride),source(jobs*stride);
+    d::Stream upload,dequant,reader;d::ExpertPipeline pipeline(raw,scratch,stride,slots,upload.value);
+    d::gpu_check(cudaMemset(raw,0xa5,slots*stride));d::gpu_check(cudaMemset(failures,0,256));d::gpu_check(cudaStreamSynchronize(nullptr));
+    uint64_t generation=0;std::thread::id issuer;bool same_issuer=true;
+    auto fill=[&](uint64_t g,size_t i,uint8_t* target) {
+        const auto current=std::this_thread::get_id();
+        if(issuer==std::thread::id{})issuer=current;else same_issuer&=issuer==current;
+        std::memset(target,int(g*13+i),payload);
+    };
+    for(int direct=0;direct<2;++direct)for(int boundary=0;boundary<4;++boundary) {
+        const auto cancelled=++generation;
+        if(direct){
+            std::vector<d::ExpertPipeline::Upload> plan;
+            for(int i=0;i<jobs;++i){std::memset(source.data+i*stride,int(cancelled*13+i),payload);plan.push_back({source.data+i*stride,payload});}
+            pipeline.start(cancelled,std::move(plan));
+        }else pipeline.start(cancelled,jobs,payload,[&,cancelled](size_t i,uint8_t* target){fill(cancelled,i,target);});
+        if(boundary==1) {
+            pipeline.wait(slots-1,reader.value); // All raw slots issued, none returned.
+        }else if(boundary==2) {
+            const auto* first=pipeline.wait(0,dequant.value);
+            delay_reader<<<1,1,0,dequant.value>>>(500000);
+            check_raw<<<1,256,0,dequant.value>>>(first,uint8_t(cancelled*13),payload,failures);
+            pipeline.wait(0,reader.value);
+            delay_reader<<<1,1,0,reader.value>>>(500000);
+            check_raw<<<1,256,0,reader.value>>>(first,uint8_t(cancelled*13),payload,failures);
+            d::gpu_check(cudaGetLastError()); // Cancel with both readers in flight and slot unreturned.
+        }else if(boundary==3) {
+            for(int i=0;i<jobs;++i){pipeline.wait(i,reader.value);pipeline.release(i,reader.value);}
+            pipeline.finish(); // Also cover idle cancellation after a completed batch.
+        }
+        cancel_request(pipeline,dequant.value,reader.value);
+        std::memset(source.data,0xee,source.bytes); // Cancel must release all direct-source DMA leases.
+        const auto next=++generation;
+        pipeline.start(next,jobs,payload,[&,next](size_t i,uint8_t* target){fill(next,i,target);});
+        for(int i=0;i<jobs;++i){
+            const auto* data=pipeline.wait(i,reader.value);
+            check_raw<<<1,256,0,reader.value>>>(data,uint8_t(next*13+i),payload,failures);
+            d::gpu_check(cudaGetLastError());pipeline.release(i,reader.value);
+        }
+        pipeline.finish();d::gpu_check(cudaStreamSynchronize(reader.value));
+        need(same_issuer,"cancellation replaced the issuer thread");
+    }
+    int bad=0;d::gpu_check(cudaMemcpy(&bad,failures,4,cudaMemcpyDeviceToHost));need(!bad,"cancel/reuse payload mismatch");
+    std::vector<uint8_t> guard(slots*stride);d::gpu_check(cudaMemcpy(guard.data(),raw,guard.size(),cudaMemcpyDeviceToHost));
+    for(int s=0;s<slots;++s)for(int i=payload;i<stride;++i)need(guard[s*stride+i]==0xa5,"cancel/reuse raw guard overwritten");
+    std::cout<<"CANCEL_REUSE_8_BOUNDARIES_SAME_ISSUER_EXACT_BYTES_GUARDS_PASS\n";
+}
+
 void run(int producer_delay,int consumer_delay) {
     constexpr int slots=4,stride=4096,payload=4000,jobs=17; // > 4 wraps, non-full tail.
     strata::core::DeviceArena arena(slots*stride+256);auto* raw=static_cast<uint8_t*>(arena.alloc(slots*stride));
@@ -191,6 +250,8 @@ void real_direct_sources(const char* path){
         std::memcpy(source.data()+2*expert.projection_bytes,expert.down,expert.projection_bytes);
         d::HostRegistration registration(source.data(),source.size());
         pipeline.start(++generation,std::vector<d::ExpertPipeline::Upload>{{source.data(),source.size()}});
+        pipeline.wait(0,reader.value);cancel_request(pipeline,reader.value,reader.value);
+        pipeline.start(++generation,std::vector<d::ExpertPipeline::Upload>{{source.data(),source.size()}});
         const auto* held=pipeline.wait(0,reader.value);
         d::gpu_check(cudaMemcpyAsync(readback.data(),held,readback.size(),cudaMemcpyDeviceToHost,reader.value));
         pipeline.release(0,reader.value);pipeline.finish();d::gpu_check(cudaStreamSynchronize(reader.value));
@@ -303,6 +364,7 @@ void unused_reclaim_without_compute_dependency(){
 }
 }
 int main(int argc,char** argv){try {
+    cancelled_generation_reuse();
     run(1000,0);run(0,1000);run(100,300);failure_and_cancel();raw_cache_reuse_and_prefill_fence();verification_cache_reserved_slots();direct_variable_sources();discard_unissued_direct();unused_reclaim_without_compute_dependency();
     if(argc==2)real_direct_sources(argv[1]);
     std::cout<<"EXPERT_ISSUER_GENERATION_WRAP_DELAY_RAW_GUARD_CANCEL_FAILURE_PASS\n";return 0;

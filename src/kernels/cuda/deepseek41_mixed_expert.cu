@@ -16,6 +16,11 @@ namespace strata::models::deepseek41 {
 namespace {
 std::atomic<bool> enabled{false};
 std::atomic<bool> short_enabled{false};
+std::atomic<bool> short_vector_enabled{true};
+std::atomic<bool> short_warp_enabled{true};
+std::atomic<bool> projection_warp_enabled{true};
+std::atomic<bool> short_tokens_enabled{true};
+std::atomic<bool> short_down_tokens_enabled{true};
 
 __device__ __forceinline__ float bf16(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
@@ -309,16 +314,323 @@ __global__ void short_down_kernel(ShortBatch batch,size_t down_offset,const floa
         for(int t=0;t<N;++t)parts[int64_t(slots[g.offset+t])*5120+row]=bf16(values[t]);
     }
 }
+// Four adjacent virtual lanes per physical thread; retain each lane's K order
+// and the original 256-thread, two-level reduction tree.
+template<int Count>
+__device__ void short_sum_virtual(float (&values)[Count][4],float (&sums)[Count]) {
+    __shared__ float partial[Count][8];
+    for(int delta=4;delta;delta>>=1) {
+        #pragma unroll
+        for(int c=0;c<Count;++c) {
+            #pragma unroll
+            for(int j=0;j<4;++j)values[c][j]+=__shfl_down_sync(0xffffffff,values[c][j],delta,8);
+        }
+    }
+    if((threadIdx.x&7)==0) {
+        #pragma unroll
+        for(int c=0;c<Count;++c)partial[c][threadIdx.x>>3]=(values[c][0]+values[c][2])+(values[c][1]+values[c][3]);
+    }
+    __syncthreads();
+    #pragma unroll
+    for(int c=0;c<Count;++c)sums[c]=threadIdx.x<8?partial[c][threadIdx.x]:0.f;
+    if(threadIdx.x<32)for(int delta=16;delta;delta>>=1) {
+        #pragma unroll
+        for(int c=0;c<Count;++c)sums[c]+=__shfl_down_sync(0xffffffff,sums[c],delta);
+    }
+}
+template<int Type,bool Fused>
+__global__ void short_gu_vector_kernel(ShortBatch batch,size_t up_offset,const float* x,
+    const int* token_rows,const float* routing,float* gate,float* up,float* activation) {
+    const auto group=batch.group[blockIdx.y];const int row=blockIdx.x;
+    const auto* packed=static_cast<const uint8_t*>(group.packed);
+    float values[2][4]{};
+    for(int col=threadIdx.x*4;col<5120;col+=256) {
+        const float4 input=*reinterpret_cast<const float4*>(x+int64_t(token_rows[group.offset])*5120+col);
+        const float inputs[4]={input.x,input.y,input.z,input.w};
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const int64_t at=int64_t(row)*5120+col+j;
+            values[0][j]+=weight<Type>(packed,at)*inputs[j];
+            values[1][j]+=weight<Type>(packed+up_offset,at)*inputs[j];
+        }
+    }
+    float sums[2];short_sum_virtual(values,sums);
+    if(threadIdx.x==0) {
+        const int64_t out=int64_t(group.offset)*2304+row;
+        if constexpr(!Fused){gate[out]=bf16(sums[0]);up[out]=bf16(sums[1]);}
+        else {
+            const float v=fminf(bf16(sums[0]),10.f),u=fminf(fmaxf(bf16(sums[1]),-10.f),10.f);
+            const float sig=v>=0?1.f/(1.f+expf(-v)):expf(v)/(1.f+expf(v));
+            activation[out]=bf16(v*sig*u*routing[group.offset]);
+        }
+    }
+}
+template<int Type>
+__global__ void short_down_vector_kernel(ShortBatch batch,size_t down_offset,const float* activation,
+    const int* slots,float* parts) {
+    const auto group=batch.group[blockIdx.y];const int row=blockIdx.x;
+    const auto* packed=static_cast<const uint8_t*>(group.packed)+down_offset;
+    float values[1][4]{};
+    for(int col=threadIdx.x*4;col<2304;col+=256) {
+        const float4 input=*reinterpret_cast<const float4*>(activation+int64_t(group.offset)*2304+col);
+        const float inputs[4]={input.x,input.y,input.z,input.w};
+        #pragma unroll
+        for(int j=0;j<4;++j)values[0][j]+=weight<Type>(packed,int64_t(row)*2304+col+j)*inputs[j];
+    }
+    float sums[1];short_sum_virtual(values,sums);
+    if(threadIdx.x==0)parts[int64_t(slots[group.offset])*5120+row]=bf16(sums[0]);
+}
+void launch_short_vector(ShortBatch batch,int count,uint32_t gu_type,uint32_t down_type,
+    size_t up_offset,size_t down_offset,const float* x,const int* token_rows,const float* routing,
+    const int* slots,float* gate,float* up,float* activation,float* parts,cudaStream_t stream) {
+    const bool fused=expert_mixed_gu_activation_selected(gu_type,1);
+    #define GU(T) case T:if(fused)short_gu_vector_kernel<T,true><<<dim3(2304,count),64,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);else short_gu_vector_kernel<T,false><<<dim3(2304,count),64,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);break
+    switch(gu_type){GU(16);GU(17);GU(18);GU(21);GU(22);GU(39);}
+    #undef GU
+    if(!fused)short_activation_kernel<1><<<dim3(9,count),256,0,stream>>>(batch,gate,up,routing,activation);
+    #define DOWN(T) case T:short_down_vector_kernel<T><<<dim3(5120,count),64,0,stream>>>(batch,down_offset,activation,slots,parts);break
+    switch(down_type){DOWN(16);DOWN(17);DOWN(18);DOWN(21);DOWN(22);DOWN(39);}
+    #undef DOWN
+}
+
+// Eight adjacent virtual lanes share scale/sign/codebook decoding. This helper
+// is private to the uncovered N=1 path; existing vector and dequant paths stay.
+template<int Type>
+__device__ __forceinline__ void short_weight8(const void* packed,int64_t index,float (&out)[8]) {
+    if constexpr(Type==16||Type==18||Type==21)weight8<Type>(packed,index,out);
+    else if constexpr(Type==39) {
+        #pragma unroll
+        for(int j=0;j<8;++j)out[j]=weight<Type>(packed,index+j);
+    } else {
+        const int64_t block=index/256;
+        const int ib=(index%256)/32,il=(index%32)/8;
+        float d;uint8_t sign;uint64_t grid;
+        if constexpr(Type==17) {
+            const auto& b=static_cast<const block_iq2_xs*>(packed)[block];
+            const uint16_t q=b.qs[4*ib+il];
+            d=float(b.d)*(0.5f+((b.scales[ib]>>(4*(il/2)))&15))*0.25f;
+            sign=ksigns_iq2xs[q>>9];grid=iq2xs_grid[q&511];
+        } else {
+            static_assert(Type==22);
+            const auto& b=static_cast<const block_iq2_s*>(packed)[block];
+            const int q=b.qs[4*ib+il]|((b.qh[ib]<<(8-2*il))&0x300);
+            d=float(b.d)*(0.5f+((b.scales[ib]>>(4*(il/2)))&15))*0.25f;
+            sign=b.qs[32+4*ib+il];grid=iq2s_grid[q];
+        }
+        #pragma unroll
+        for(int j=0;j<8;++j)out[j]=bf16(d*int((grid>>(8*j))&255)*(sign&(1<<j)?-1.f:1.f));
+    }
+}
+
+// The first two shuffles reproduce virtual deltas16/8; the register additions
+// reproduce4/2/1. Gather the eight old warp totals and retain their old tree.
+template<int Count>
+__device__ __forceinline__ void short_sum_warp(float (&values)[Count][8],float (&sums)[Count]) {
+    const int lane=threadIdx.x&31;
+    for(int delta=2;delta;delta>>=1) {
+        #pragma unroll
+        for(int c=0;c<Count;++c) {
+            #pragma unroll
+            for(int j=0;j<8;++j)values[c][j]+=__shfl_down_sync(0xffffffff,values[c][j],delta,4);
+        }
+    }
+    #pragma unroll
+    for(int c=0;c<Count;++c) {
+        const float partial=((values[c][0]+values[c][4])+(values[c][2]+values[c][6]))+
+                            ((values[c][1]+values[c][5])+(values[c][3]+values[c][7]));
+        const float gathered=__shfl_sync(0xffffffff,partial,(lane&7)*4);
+        sums[c]=lane<8?gathered:0.f;
+    }
+    for(int delta=16;delta;delta>>=1) {
+        #pragma unroll
+        for(int c=0;c<Count;++c)sums[c]+=__shfl_down_sync(0xffffffff,sums[c],delta);
+    }
+}
+template<int Type,bool Fused>
+__global__ void short_gu_warp_kernel(ShortBatch batch,size_t up_offset,const float* x,
+    const int* token_rows,const float* routing,float* gate,float* up,float* activation) {
+    const auto group=batch.group[blockIdx.y];const int row=blockIdx.x*4+(threadIdx.x>>5);
+    const int lane=threadIdx.x&31;
+    const auto* packed=static_cast<const uint8_t*>(group.packed);
+    float values[2][8]{};
+    for(int col=lane*8;col<5120;col+=256) {
+        const float* input=x+int64_t(token_rows[group.offset])*5120+col;
+        const float4 a=*reinterpret_cast<const float4*>(input),b=*reinterpret_cast<const float4*>(input+4);
+        const float inputs[8]={a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w};
+        float g[8],u[8];
+        short_weight8<Type>(packed,int64_t(row)*5120+col,g);
+        short_weight8<Type>(packed+up_offset,int64_t(row)*5120+col,u);
+        #pragma unroll
+        for(int j=0;j<8;++j){values[0][j]+=g[j]*inputs[j];values[1][j]+=u[j]*inputs[j];}
+    }
+    float sums[2];short_sum_warp(values,sums);
+    if(lane==0) {
+        const int64_t out=int64_t(group.offset)*2304+row;
+        if constexpr(!Fused){gate[out]=bf16(sums[0]);up[out]=bf16(sums[1]);}
+        else {
+            const float v=fminf(bf16(sums[0]),10.f),u=fminf(fmaxf(bf16(sums[1]),-10.f),10.f);
+            const float sig=v>=0?1.f/(1.f+expf(-v)):expf(v)/(1.f+expf(v));
+            activation[out]=bf16(v*sig*u*routing[group.offset]);
+        }
+    }
+}
+template<int Type>
+__global__ void short_down_warp_kernel(ShortBatch batch,size_t down_offset,const float* activation,
+    const int* slots,float* parts) {
+    const auto group=batch.group[blockIdx.y];const int row=blockIdx.x*4+(threadIdx.x>>5);
+    const int lane=threadIdx.x&31;
+    const auto* packed=static_cast<const uint8_t*>(group.packed)+down_offset;
+    float values[1][8]{};
+    for(int col=lane*8;col<2304;col+=256) {
+        const float* input=activation+int64_t(group.offset)*2304+col;
+        const float4 a=*reinterpret_cast<const float4*>(input),b=*reinterpret_cast<const float4*>(input+4);
+        const float inputs[8]={a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w};
+        float weights[8];short_weight8<Type>(packed,int64_t(row)*2304+col,weights);
+        #pragma unroll
+        for(int j=0;j<8;++j)values[0][j]+=weights[j]*inputs[j];
+    }
+    float sums[1];short_sum_warp(values,sums);
+    if(lane==0)parts[int64_t(slots[group.offset])*5120+row]=bf16(sums[0]);
+}
+void launch_short_warp(ShortBatch batch,int count,uint32_t gu_type,uint32_t down_type,
+    size_t up_offset,size_t down_offset,const float* x,const int* token_rows,const float* routing,
+    const int* slots,float* gate,float* up,float* activation,float* parts,cudaStream_t stream) {
+    const bool fused=expert_mixed_gu_activation_selected(gu_type,1);
+    #define GU(T) case T:if(fused)short_gu_warp_kernel<T,true><<<dim3(576,count),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);else short_gu_warp_kernel<T,false><<<dim3(576,count),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);break
+    switch(gu_type){GU(16);GU(17);GU(18);GU(21);GU(22);GU(39);}
+    #undef GU
+    if(!fused)short_activation_kernel<1><<<dim3(9,count),256,0,stream>>>(batch,gate,up,routing,activation);
+    #define DOWN(T) case T:short_down_warp_kernel<T><<<dim3(1280,count),128,0,stream>>>(batch,down_offset,activation,slots,parts);break
+    switch(down_type){DOWN(16);DOWN(17);DOWN(18);DOWN(21);DOWN(22);DOWN(39);}
+    #undef DOWN
+}
+
+// A warp retains the eight virtual-lane accumulators of one output row.
+// Two token columns share decoding without the register growth of N columns.
+template<int Type,int N,bool Pair,int Tile=(N==1?1:2)>
+__global__ void projection_warp_kernel(const void* w,const void* wu,const float* x,float* y,float* yu,
+    int rows,int cols,const int* slots) {
+    const int row=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31;
+    const int token=blockIdx.y*Tile;
+    if(row>=rows)return;
+    float values[Tile*(Pair?2:1)][8]{};
+    for(int col=lane*8;col<cols;col+=256) {
+        float gate[8],up[8];
+        short_weight8<Type>(w,int64_t(row)*cols+col,gate);
+        if constexpr(Pair)short_weight8<Type>(wu,int64_t(row)*cols+col,up);
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N) {
+            const float* input=x+int64_t(token+t)*cols+col;
+            const float4 a=*reinterpret_cast<const float4*>(input),b=*reinterpret_cast<const float4*>(input+4);
+            const float v[8]={a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w};
+            #pragma unroll
+            for(int j=0;j<8;++j) {
+                values[t][j]+=gate[j]*v[j];
+                if constexpr(Pair)values[Tile+t][j]+=up[j]*v[j];
+            }
+        }
+    }
+    float sums[Tile*(Pair?2:1)];short_sum_warp(values,sums);
+    if(lane==0) {
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N) {
+            const int destination=slots?slots[token+t]:token+t;
+            y[int64_t(destination)*rows+row]=bf16(sums[t]);
+            if constexpr(Pair)yu[int64_t(token+t)*rows+row]=bf16(sums[Tile+t]);
+        }
+    }
+}
+template<int Type,int N,bool Fused,int Tile=2>
+__global__ void short_gu_tokens_kernel(ShortBatch batch,size_t up_offset,const float* x,
+    const int* token_rows,const float* routing,float* gate,float* up,float* activation) {
+    const auto group=batch.group[blockIdx.y];
+    const int row=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31,token=blockIdx.z*Tile;
+    const auto* packed=static_cast<const uint8_t*>(group.packed);
+    float values[2*Tile][8]{};
+    for(int col=lane*8;col<5120;col+=256) {
+        float g[8],u[8];
+        short_weight8<Type>(packed,int64_t(row)*5120+col,g);
+        short_weight8<Type>(packed+up_offset,int64_t(row)*5120+col,u);
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N) {
+            const float* input=x+int64_t(token_rows[group.offset+token+t])*5120+col;
+            const float4 a=*reinterpret_cast<const float4*>(input),b=*reinterpret_cast<const float4*>(input+4);
+            const float v[8]={a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w};
+            #pragma unroll
+            for(int j=0;j<8;++j){values[t][j]+=g[j]*v[j];values[Tile+t][j]+=u[j]*v[j];}
+        }
+    }
+    float sums[2*Tile];short_sum_warp(values,sums);
+    if(lane==0) {
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N) {
+            const int64_t out=int64_t(group.offset+token+t)*2304+row;
+            if constexpr(!Fused){gate[out]=bf16(sums[t]);up[out]=bf16(sums[Tile+t]);}
+            else {
+                const float v=fminf(bf16(sums[t]),10.f),u=fminf(fmaxf(bf16(sums[Tile+t]),-10.f),10.f);
+                const float sig=v>=0?1.f/(1.f+expf(-v)):expf(v)/(1.f+expf(v));
+                activation[out]=bf16(v*sig*u*routing[group.offset+token+t]);
+            }
+        }
+    }
+}
+template<int Type,int N,int Tile=2>
+__global__ void short_down_tokens_kernel(ShortBatch batch,size_t down_offset,const float* activation,
+    const int* slots,float* parts) {
+    const auto group=batch.group[blockIdx.y];
+    const int row=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31,token=blockIdx.z*Tile;
+    const auto* packed=static_cast<const uint8_t*>(group.packed)+down_offset;
+    float values[Tile][8]{};
+    for(int col=lane*8;col<2304;col+=256) {
+        float weights[8];short_weight8<Type>(packed,int64_t(row)*2304+col,weights);
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N) {
+            const float* input=activation+int64_t(group.offset+token+t)*2304+col;
+            const float4 a=*reinterpret_cast<const float4*>(input),b=*reinterpret_cast<const float4*>(input+4);
+            const float v[8]={a.x,a.y,a.z,a.w,b.x,b.y,b.z,b.w};
+            #pragma unroll
+            for(int j=0;j<8;++j)values[t][j]+=weights[j]*v[j];
+        }
+    }
+    float sums[Tile];short_sum_warp(values,sums);
+    if(lane==0) {
+        #pragma unroll
+        for(int t=0;t<Tile;++t)if(token+t<N)
+            parts[int64_t(slots[group.offset+token+t])*5120+row]=bf16(sums[t]);
+    }
+}
+template<int Type,int N>
+void launch_short_down(ShortBatch batch,int count,size_t down_offset,const float* activation,
+    const int* slots,float* parts,cudaStream_t stream) {
+    if constexpr(N>=2)if(short_down_tokens_enabled.load()&&expert_mixed_short_down_tokens_selected(Type,N,count)&&
+        (reinterpret_cast<uintptr_t>(activation)&15)==0) {
+        short_down_tokens_kernel<Type,N><<<dim3(1280,count,(N+1)/2),128,0,stream>>>(batch,down_offset,activation,slots,parts);
+        return;
+    }
+    short_down_kernel<Type,N><<<dim3(5120,count),256,0,stream>>>(batch,down_offset,activation,slots,parts);
+}
+template<int Type,int N>
+void launch_short_gu(ShortBatch batch,int count,size_t up_offset,const float* x,
+    const int* token_rows,const float* routing,float* gate,float* up,float* activation,bool fused,cudaStream_t stream) {
+    if constexpr(N>=2)if(short_tokens_enabled.load()&&expert_mixed_short_tokens_selected(Type,N,count)&&
+        (reinterpret_cast<uintptr_t>(x)&15)==0) {
+        if(fused)short_gu_tokens_kernel<Type,N,true><<<dim3(576,count,(N+1)/2),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+        else short_gu_tokens_kernel<Type,N,false><<<dim3(576,count,(N+1)/2),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+        return;
+    }
+    if(fused)short_gu_kernel<Type,N,true><<<dim3(2304,count),256,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+    else short_gu_kernel<Type,N,false><<<dim3(2304,count),256,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+}
 template<int N>
 void launch_short(ShortBatch batch,int count,uint32_t gu_type,uint32_t down_type,
     size_t up_offset,size_t down_offset,const float* x,const int* token_rows,const float* routing,
     const int* slots,float* gate,float* up,float* activation,float* parts,cudaStream_t stream) {
     const bool fused=expert_mixed_gu_activation_selected(gu_type,N);
-    #define GU(T) case T:if(fused)short_gu_kernel<T,N,true><<<dim3(2304,count),256,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);else short_gu_kernel<T,N,false><<<dim3(2304,count),256,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);break
+    #define GU(T) case T:launch_short_gu<T,N>(batch,count,up_offset,x,token_rows,routing,gate,up,activation,fused,stream);break
     switch(gu_type){GU(16);GU(17);GU(18);GU(21);GU(22);GU(39);}
     #undef GU
     if(!fused)short_activation_kernel<N><<<dim3((N*2304+255)/256,count),256,0,stream>>>(batch,gate,up,routing,activation);
-    #define DOWN(T) case T:short_down_kernel<T,N><<<dim3(5120,count),256,0,stream>>>(batch,down_offset,activation,slots,parts);break
+    #define DOWN(T) case T:launch_short_down<T,N>(batch,count,down_offset,activation,slots,parts,stream);break
     switch(down_type){DOWN(16);DOWN(17);DOWN(18);DOWN(21);DOWN(22);DOWN(39);}
     #undef DOWN
 }
@@ -342,6 +654,13 @@ __global__ void dequant_kernel(const void* w,uint16_t* output,int64_t n) {
 template<int Type,bool Pair>
 void launch(const void* w,const void* wu,const float* x,float* y,float* yu,
             int rows,int cols,int tokens,const int* slots,cudaStream_t stream) {
+    if(projection_warp_enabled.load()&&expert_mixed_projection_warp_selected(Type,rows,cols,tokens,Pair)&&
+       (reinterpret_cast<uintptr_t>(x)&15)==0) {
+        #define FAST(N) case N:projection_warp_kernel<Type,N,Pair><<<dim3((rows+3)/4,(N+1)/2),128,0,stream>>>(w,wu,x,y,yu,rows,cols,slots);break
+        switch(tokens){FAST(1);FAST(2);FAST(3);FAST(4);FAST(5);FAST(6);FAST(7);FAST(8);}
+        #undef FAST
+        return;
+    }
     #define RUN(N) case N:projection_kernel<Type,N,Pair><<<rows,256,0,stream>>>(w,wu,x,y,yu,rows,cols,slots);break
     switch(tokens){RUN(1);RUN(2);RUN(3);RUN(4);RUN(5);RUN(6);RUN(7);RUN(8);}
     #undef RUN
@@ -362,6 +681,53 @@ void expert_mixed_fast_set_enabled(bool value){enabled.store(value);}
 bool expert_mixed_fast_enabled(){return enabled.load();}
 void expert_mixed_short_set_enabled(bool value){short_enabled.store(value);}
 bool expert_mixed_short_enabled(){return short_enabled.load();}
+void expert_mixed_short_vector_set_enabled(bool value){short_vector_enabled.store(value);}
+void expert_mixed_short_warp_set_enabled(bool value){short_warp_enabled.store(value);}
+void expert_mixed_projection_warp_set_enabled(bool value){projection_warp_enabled.store(value);}
+void expert_mixed_short_tokens_set_enabled(bool value){short_tokens_enabled.store(value);}
+void expert_mixed_short_down_tokens_set_enabled(bool value){short_down_tokens_enabled.store(value);}
+bool expert_mixed_short_down_tokens_selected(uint32_t type,int tokens,int groups) {
+    // A type/N/group bin must pass every real GU/Down pair that uses it.
+    if(tokens<2||tokens>8||groups<1||groups>48/tokens)return false;
+    struct Choice {uint32_t type;uint64_t masks[7];};
+    static constexpr Choice choices[]={
+        {16,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
+        {18,{33554430ull,131054ull,8190ull,1022ull,510ull,126ull,118ull}},
+        {21,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
+    };
+    for(const auto& c:choices)if(c.type==type)return (c.masks[tokens-2]&(uint64_t(1)<<groups))!=0;
+    return false;
+}
+bool expert_mixed_projection_warp_selected(uint32_t type,int rows,int cols,int tokens,bool pair) {
+    // Real-weight median ABBA passed all IQ shapes; MXFP4 Down regressed.
+    if(tokens<1||tokens>8)return false;
+    return pair?(rows==2304&&cols==5120&&(type==16||type==17||type==18||type==22)):
+                (rows==5120&&cols==2304&&(type==16||type==18||type==21));
+}
+bool expert_mixed_short_tokens_selected(uint32_t gu,int tokens,int groups) {
+    // Preserve N1. IQ2_XS N5/group1 gained only3.60%; retain its old path.
+    if(gu==17&&tokens==5&&groups==1)return false;
+    return tokens>=2&&tokens<=8&&groups>=1&&groups*tokens<=48&&
+           (gu==16||gu==17||gu==18||gu==22);
+}
+bool expert_mixed_short_warp_selected(uint32_t gu,uint32_t down,int groups) {
+    // The original48 vector bins retain priority. These seven real format pairs
+    // cover every independently checked group size1..48 in the new path.
+    const bool pair=(gu==16&&(down==16||down==18))||(gu==17&&down==39)||
+        (gu==18&&(down==18||down==21))||(gu==22&&(down==21||down==39));
+    return pair&&groups>=1&&groups<=48&&!expert_mixed_short_vector_selected(gu,down,groups);
+}
+bool expert_mixed_short_vector_selected(uint32_t gu,uint32_t down,int groups) {
+    if(groups<1||groups>48)return false;
+    uint64_t mask=0;
+    if(gu==16&&down==16)mask=285942833484152ull;
+    if(gu==16&&down==18)mask=285942833484156ull;
+    if(gu==17&&down==39)mask=285942833479680ull;
+    if(gu==18&&down==21)mask=1090781184ull;
+    if(gu==22&&down==21)mask=281544786972672ull;
+    if(gu==22&&down==39)mask=285942833483840ull;
+    return (mask&(uint64_t(1)<<groups))!=0;
+}
 bool expert_mixed_short_selected(uint32_t gu,uint32_t down,int tokens,int groups,bool uniform) {
     // Real-weight ABBA includes metadata copies. Zero keeps the cumulative path;
     // uniform means every resident expert is used by every token in this window.
@@ -398,6 +764,14 @@ cudaError_t expert_mixed_short_gpu(const VerifyExpertGroup* groups,int count,
         ShortBatch batch{};int size=0;
         for(int i=0;i<count;++i)if(groups[i].tokens==n)batch.group[size++]=groups[i];
         if(!size)continue;
+        if(n==1&&short_vector_enabled.load()&&expert_mixed_short_vector_selected(gu_type,down_type,size)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(activation))&15)==0) {
+            launch_short_vector(batch,size,gu_type,down_type,up_offset,down_offset,x,token_rows,routing,slots,gate,up,activation,parts,stream);
+            continue;
+        }
+        if(n==1&&short_warp_enabled.load()&&expert_mixed_short_warp_selected(gu_type,down_type,size)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(activation))&15)==0) {
+            launch_short_warp(batch,size,gu_type,down_type,up_offset,down_offset,x,token_rows,routing,slots,gate,up,activation,parts,stream);
+            continue;
+        }
         #define RUN(N) case N:launch_short<N>(batch,size,gu_type,down_type,up_offset,down_offset,x,token_rows,routing,slots,gate,up,activation,parts,stream);break
         switch(n){RUN(1);RUN(2);RUN(3);RUN(4);RUN(5);RUN(6);RUN(7);RUN(8);}
         #undef RUN

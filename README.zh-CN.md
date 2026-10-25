@@ -40,6 +40,8 @@
 
 **已测最大 prefill：6,080.745 tokens/s**，使用 UD-Q2_K_XL、原格式 DSpark、131,072 输入、chunk 32768。这是无 profiler 的单次正式结果；同配置三次均值为 **6,037.613 tokens/s**。
 
+**已测最大 decode：77.483 tokens/s**，来自 2026-10-25 的 UD-Q2_K_XL、原格式 DSpark、16,180 输入、chunk 8192、固定完整 512 输出。该无 profiler 结果包含生成与最终自适应迁移收尾；三次均值为 **76.760 tokens/s**。Prefill 和 decode 峰值来自不同轮次与输入长度。
+
 以下为 2026-10-23 测试：单请求，每档一次预热＋三次正式测量，贪心解码，固定完整 512 输出。输入由同一 LongSWE token 流重复拼接和截取，用于长度测试。数值为均值 ± 样本标准差。
 
 | 输入 tokens | Chunk | 常驻专家数 | Prefill tokens/s | Decode tokens/s |
@@ -50,6 +52,14 @@
 | 524,288 | 32,768 | 4221 | 4,499.192 ± 3.861 | 42.216 ± 0.038 |
 
 Prefill 按引擎原生 prompt 时间统计；decode 按 DSpark 生成时间统计。测速使用校准后的专家排序与热度，chunk 和常驻专家数见上表。
+
+2026-10-25 的累计优化版本使用同一台机器，LongSWE 一次预热＋三次正式测量，贪心解码，启动常驻 5571 个专家，并保留 Maya 在线自适应。每个请求新建 session，不复用对话前缀；专家热度在连续测量之间保留。
+
+| 输入 tokens | 输出 tokens | Chunk | Prefill tokens/s | Decode tokens/s |
+|---:|---:|---:|---:|---:|
+| 16,180 | 512 | 8,192 | 4,231.216 ± 5.476 | **76.760 ± 1.054** |
+
+本组 prefill 使用原生时间，decode 包含生成与最终自适应迁移收尾，反映该输入和已适应专家缓存下的实测速度。
 
 ## 初始专家 profile 与内存搬运
 
@@ -97,9 +107,9 @@ python tools/deepseek41/serve_experimental.py --config examples/local.json
 | 原生 DeepSeek runtime | 压缩/索引注意力、KV 所有权、超连接、路由专家及 CED prompt/tail replay。 |
 | 原始 Unsloth GGUF | 七分片读取、IQ3/Q2_K/Q6_K 混合专家格式、主模型与草稿共享词表张量、原 BF16 视觉文件。 |
 | DSpark | 最多 5-token 草稿、置信度自适应贪心验证、增量 KV、接受前缀提交、词表行选择。 |
-| SM120 算子 | 混合格式解量化、有界 grouped GEMM、IQ 短窗口验证、边界融合、indexer 和 CAKE 注意力。 |
-| CUDA Graph | 已采用的 decode 输出/router 分段，保留动态路由与迁移边界。 |
-| 专家与 Engram | 在线自适应格式分组、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
-| API 与图片 | DeepSeek 消息/tokenizer、thinking/工具编码、图片预处理及原生视觉编码器。 |
+| SM120 算子 | 混合格式解量化、有界 grouped GEMM、IQ/MMVQ 短窗口验证、分组投影、边界融合、indexer 和 CAKE 注意力。 |
+| CUDA Graph | 已采用的 decode 输出/router 分段、共享专家提前提交与精简路由交接，保留动态路由与迁移边界。 |
+| 专家与 Engram | 格式分组内的 Maya 在线自适应、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
+| API 与图片 | DeepSeek 消息/tokenizer、thinking/工具编码、文本前缀自动检查点、取消后恢复、图片预处理及原生视觉编码器。 |
 
 专家缓存、异构卸载、推测解码、图片输入和兼容 API 已存在于上游 Strata；此处说明的是 DeepSeek 专项实现与接入。[第三方声明](docs/THIRD_PARTY.md) · [MIT 许可证](LICENSE)。

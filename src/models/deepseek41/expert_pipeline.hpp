@@ -37,6 +37,9 @@ public:
     // upload stream so retiring unused speculation cannot stall compute.
     void retire_unused(size_t sequence);
     void finish();
+    // Called by the execution owner after abandoning this generation. Drain
+    // every reader before reusing slots; retain the issuer thread and affinity.
+    void cancel(cudaStream_t dequant,cudaStream_t reader);
     void stop();
 private:
     struct Slot { Event copied,used;uint64_t generation=0;size_t sequence=0;bool issued=false,returned=false; };
@@ -58,7 +61,7 @@ private:
     bool have_uploaded_=false;
     int device_id_=0;
     std::exception_ptr error_;
-    bool stopped_=false,pending_=false,working_=false;
+    bool stopped_=false,pending_=false,working_=false,cancelling_=false;
     struct Diagnostics {
         bool enabled=false,reported=false;
         size_t owned=0,peak=0,submitted=0,returned=0,copy_pending=0,discarded=0;

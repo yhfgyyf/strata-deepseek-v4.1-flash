@@ -17,13 +17,15 @@ inline int adaptive_group(int layer){return layer<14?0:1;}
 
 // Selection is CPU-only so the same policy can be checked independently of DMA.
 // The caller assigns identical IDs only to identical NativeFmt layouts.
+// A recent mask selects Maya heat/hysteresis, within Strata's existing DMA budget.
 inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
     const std::array<uint64_t,40>& sizes,const std::vector<double>& heat,
     const std::vector<int32_t>& slots,const std::vector<uint64_t>& offsets,
-    bool grouped,uint64_t capacity,uint64_t budget,const std::array<int,40>* layout_groups=nullptr){
+    bool grouped,uint64_t capacity,uint64_t budget,const std::array<int,40>* layout_groups=nullptr,
+    const std::vector<uint8_t>* recent=nullptr){
     constexpr int keys=40*384;
     constexpr auto no_ram=std::numeric_limits<uint64_t>::max();
-    if(heat.size()!=keys||slots.size()!=keys||offsets.size()!=keys)
+    if(heat.size()!=keys||slots.size()!=keys||offsets.size()!=keys||(recent&&recent->size()!=keys))
         throw std::invalid_argument("adaptive selection table sizes");
     struct Ranked { double value;ExpertKey key; };
     std::array<std::vector<Ranked>,40> candidates,victims;
@@ -32,7 +34,7 @@ inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
         if(g<0||g>=40)throw std::invalid_argument("adaptive format group ID");
         if(!std::isfinite(heat[k])||heat[k]<0)throw std::invalid_argument("adaptive nonfinite/negative heat");
         if(slots[k]>=0)victims[g].push_back({heat[k],{l,e}});
-        else if(heat[k]>=2.0&&offsets[k]!=no_ram)candidates[g].push_back({heat[k],{l,e}});
+        else if((recent?recent->at(k)!=0:heat[k]>=2.0)&&offsets[k]!=no_ram)candidates[g].push_back({heat[k],{l,e}});
     }
     std::vector<AdaptiveExchange> choices;
     for(int g=0;g<40;++g){
@@ -40,7 +42,7 @@ inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
         std::sort(in.begin(),in.end(),[](auto a,auto b){return a.value!=b.value?a.value>b.value:a.key<b.key;});
         std::sort(out.begin(),out.end(),[](auto a,auto b){return a.value!=b.value?a.value<b.value:a.key<b.key;});
         for(size_t i=0;i<std::min(in.size(),out.size());++i){
-            if(in[i].value<out[i].value+1.5)break;
+            if(recent?in[i].value<=out[i].value*1.25+1.0:in[i].value<out[i].value+1.5)break;
             const auto a=in[i].key,b=out[i].key;
             if(!sizes[a.first]||sizes[a.first]!=sizes[b.first]||offsets[adaptive_index(b)]!=no_ram)
                 throw std::logic_error("adaptive incompatible exchange ownership/size");

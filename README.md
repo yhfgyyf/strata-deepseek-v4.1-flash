@@ -40,6 +40,8 @@ Both variants are from **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**.
 
 **Maximum measured prefill: 6,080.745 tokens/s**, at 131,072 input tokens, chunk 32768, with UD-Q2_K_XL and original DSpark. This is one formal, profiler-free run; the corresponding three-run mean is **6,037.613 tokens/s**.
 
+**Maximum measured decode: 77.483 tokens/s**, with UD-Q2_K_XL, original DSpark, 16,180 input tokens, chunk 8192 and exactly 512 output tokens on October 25. This profiler-free run includes generation and final adaptive drain; the three-run mean is **76.760 tokens/s**. The prefill and decode peaks come from separate runs and input lengths.
+
 October 23 measurements below use one request, one warmup plus three formal runs per length, greedy decoding and exactly 512 output tokens. The input is a repeated/truncated LongSWE token stream for length testing. Rates are means ± sample standard deviations.
 
 | Input tokens | Chunk | Resident experts | Prefill tokens/s | Decode tokens/s |
@@ -50,6 +52,14 @@ October 23 measurements below use one request, one warmup plus three formal runs
 | 524,288 | 32,768 | 4221 | 4,499.192 ± 3.861 | 42.216 ± 0.038 |
 
 Prefill uses native prompt time; decode uses DSpark generation time. The measurements use a calibrated expert ranking and heat, with chunk sizes and resident expert counts shown above.
+
+The October 25 cumulative runtime uses the same machine, one warmup plus three formal LongSWE runs, greedy decoding, 5571 startup resident experts and online Maya residency adaptation. Each request starts a new session without conversation-prefix reuse; expert heat carries across runs.
+
+| Input tokens | Output tokens | Chunk | Prefill tokens/s | Decode tokens/s |
+|---:|---:|---:|---:|---:|
+| 16,180 | 512 | 8,192 | 4,231.216 ± 5.476 | **76.760 ± 1.054** |
+
+These rates use native prefill time and generation plus final adaptive drain for decode. They describe the measured workload and its adapted expert cache.
 
 ## Expert profile and memory transfers
 
@@ -97,9 +107,9 @@ Supports **OpenAI Chat Completions / Responses** and **Anthropic Messages** comp
 | Native DeepSeek runtime | Compressed/indexed attention, KV ownership, hyper-connections, routed experts and CED prompt/tail replay. |
 | Original Unsloth GGUF support | Seven-shard loading, mixed IQ3/Q2_K/Q6_K expert formats, shared main/draft vocabulary tensors and original BF16 vision files. |
 | DSpark | Five-token proposals, confidence-adaptive greedy verification, incremental KV, accepted-prefix commit and selected vocabulary rows. |
-| SM120 operators | Mixed-format expert dequantization, bounded grouped GEMM, short-row IQ verification, boundary fusions, indexer and CAKE attention paths. |
-| CUDA Graphs | Accepted decode output/router segments, with dynamic routing and migration boundaries retained. |
-| Residency and Engram | Online adaptive format groups, expert lookahead, SSD row cache, asynchronous I/O and 40-segment block-pinned memory with 100% huge-page admission. |
-| APIs and images | DeepSeek message/tokenizer integration, thinking/tool encoding, image preprocessing and native vision encoder. |
+| SM120 operators | Mixed-format expert dequantization, bounded grouped GEMM, short-row IQ/MMVQ verification, grouped projections, boundary fusions, indexer and CAKE attention paths. |
+| CUDA Graphs | Accepted decode output/router segments, shared-expert early submission and compact route handoff, with dynamic routing and migration boundaries retained. |
+| Residency and Engram | Online Maya adaptation within format groups, expert lookahead, SSD row cache, asynchronous I/O and 40-segment block-pinned memory with 100% huge-page admission. |
+| APIs and images | DeepSeek message/tokenizer integration, thinking/tool encoding, automatic text-prefix checkpoints, cancellation recovery, image preprocessing and native vision encoder. |
 
 Expert caching, offload, speculation, image input and compatible APIs already exist in upstream Strata. These are DeepSeek-specific implementations and integrations. [third-party notices](docs/THIRD_PARTY.md) · [MIT license](LICENSE).

@@ -8,10 +8,72 @@
 #include "deepseek41_rotary_shared.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <math_constants.h>
 #include <cmath>
+#include <atomic>
 
 namespace strata::models::deepseek41 {
 namespace {
+std::atomic<bool> hc_vector_enabled{true};
+// Stable expert order, then original token/slot order; at most48 selected slots.
+__global__ void route_group_short_kernel(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int count) {
+    __shared__ int selected[48];
+    const int i=int(threadIdx.x);
+    if(i<count)selected[i]=ids[i];
+    __syncthreads();
+    if(i>=count)return;
+    int at=0;
+    for(int j=0;j<count;++j)at+=selected[j]<selected[i]||(selected[j]==selected[i]&&j<i);
+    rows[at]=i/6;slots[at]=i;grouped[at]=weights[i];
+}
+
+__global__ void route_handoff_short_kernel(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int* handoff,int count) {
+    __shared__ int selected[48],invalid[48];
+    const int i=int(threadIdx.x);
+    float weight=0;
+    if(i<count){
+        selected[i]=ids[i];weight=weights[i];handoff[i]=selected[i];
+        invalid[i]=selected[i]<0||selected[i]>=384||!isfinite(weight)?i:count;
+    }
+    __syncthreads();
+    if(i==0){
+        int first=count;
+        for(int j=0;j<count;++j)first=min(first,invalid[j]);
+        handoff[count]=first==count?-1:first;
+    }
+    if(i>=count)return;
+    int at=0;
+    for(int j=0;j<count;++j)at+=selected[j]<selected[i]||(selected[j]==selected[i]&&j<i);
+    rows[at]=i/6;slots[at]=i;grouped[at]=weight;
+}
+
+__global__ void target_greedy_kernel(const float* logits,int* output,int vocab) {
+    const int row=int(blockIdx.x),tid=int(threadIdx.x),lane=tid&31,warp=tid/32;
+    float best=-CUDART_INF_F;int id=0x7fffffff,bad=0;
+    for(int i=tid;i<vocab;i+=256){const float value=logits[int64_t(row)*vocab+i];
+        bad|=isnan(value)||value==CUDART_INF_F;
+        if(value>best||(value==best&&i<id)){best=value;id=i;}}
+    for(int delta=16;delta;delta/=2){const float v=__shfl_xor_sync(0xffffffff,best,delta);
+        const int j=__shfl_xor_sync(0xffffffff,id,delta);bad|=__shfl_xor_sync(0xffffffff,bad,delta);
+        if(v>best||(v==best&&j<id)){best=v;id=j;}}
+    __shared__ float values[8];__shared__ int ids[8],invalid[8];
+    if(!lane){values[warp]=best;ids[warp]=id;invalid[warp]=bad;}__syncthreads();
+    if(warp)return;
+    best=lane<8?values[lane]:-CUDART_INF_F;id=lane<8?ids[lane]:0x7fffffff;bad=lane<8?invalid[lane]:0;
+    for(int delta=16;delta;delta/=2){const float v=__shfl_xor_sync(0xffffffff,best,delta);
+        const int j=__shfl_xor_sync(0xffffffff,id,delta);bad|=__shfl_xor_sync(0xffffffff,bad,delta);
+        if(v>best||(v==best&&j<id)){best=v;id=j;}}
+    if(!lane)output[row]=bad||best==-CUDART_INF_F?-1:id;
+}
+
+__global__ void state_copy_kernel(StateCopyBatch batch) {
+    int lo=0,hi=batch.count;
+    while(lo+1<hi){const int mid=(lo+hi)/2;if(batch.jobs[mid].first_block<=int(blockIdx.x))lo=mid;else hi=mid;}
+    const auto job=batch.jobs[lo];
+    const unsigned offset=(unsigned(blockIdx.x)-job.first_block)*4096+unsigned(threadIdx.x)*16;
+    if(offset<job.bytes)reinterpret_cast<uint4*>(job.destination)[offset/16]=reinterpret_cast<const uint4*>(job.source)[offset/16];
+}
+
 __device__ float half_value(const uint8_t* p) { return __half2float(*reinterpret_cast<const __half*>(p)); }
 __device__ float weight_value(const uint8_t* p, int type, int64_t i) {
     if (type == 0) return reinterpret_cast<const float*>(p)[i];
@@ -506,6 +568,45 @@ __global__ void route_parallel_kernel(const float* logits,const float* bias,cons
     }
     if(e<top_k)weights[token*top_k+e]=(selected[e]/(total+1e-20f))*scale;
 }
+// Four contiguous scalar lanes per physical thread. Each virtual lane retains
+// the original K stride and the original 256-thread reduction tree.
+__device__ float hc_sum_virtual256(float (&v)[4]) {
+    __shared__ float partial[8];
+    #pragma unroll
+    for(int delta=4;delta;delta>>=1) {
+        #pragma unroll
+        for(int j=0;j<4;++j)v[j]+=__shfl_down_sync(0xffffffff,v[j],delta,8);
+    }
+    const float even=v[0]+v[2],odd=v[1]+v[3];
+    if((threadIdx.x&7)==0)partial[threadIdx.x>>3]=even+odd;
+    __syncthreads();
+    float sum=threadIdx.x<8?partial[threadIdx.x]:0.f;
+    if(threadIdx.x<32)for(int delta=16;delta;delta>>=1)
+        sum+=__shfl_down_sync(0xffffffff,sum,delta);
+    return sum;
+}
+__global__ void hc_project_vector_kernel(const float* x,const float* fn,float* mixes,int hidden,float eps) {
+    const int row=blockIdx.x,token=blockIdx.y,width=hidden*4;
+    float square[4]{},dot[4]{};
+    for(int col=threadIdx.x*4;col<width;col+=256) {
+        const float4 value=*reinterpret_cast<const float4*>(x+int64_t(token)*width+col);
+        const float4 weight=*reinterpret_cast<const float4*>(fn+int64_t(row)*width+col);
+        const float values[4]={value.x,value.y,value.z,value.w};
+        const float weights[4]={weight.x,weight.y,weight.z,weight.w};
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            square[j]+=values[j]*values[j];
+            dot[j]+=values[j]*weights[j];
+        }
+    }
+    const float sum=hc_sum_virtual256(square);
+    __shared__ float inverse;
+    if(!threadIdx.x)inverse=rsqrtf(sum/width+eps);
+    __syncthreads();
+    const float product=hc_sum_virtual256(dot);
+    if(!threadIdx.x)mixes[token*24+row]=product*inverse;
+}
+
 __global__ void hc_project_kernel(const float* x, const float* fn, float* mixes, int hidden, float eps) {
     const int row = blockIdx.x, token = blockIdx.y, width = hidden * 4;
     float sum = 0, dot = 0;
@@ -797,9 +898,36 @@ cudaError_t route_parallel_gpu(const float* x,const float* b,const float* vl,con
         return cudaErrorInvalidValue;
     route_parallel_kernel<<<tokens,512,0,stream>>>(x,b,vl,image,ids,weights,experts,top_k,scale);return cudaGetLastError();
 }
+cudaError_t state_copy_gpu(const StateCopyBatch& batch,cudaStream_t stream) {
+    if(batch.count<1||batch.count>96||batch.blocks<1)return cudaErrorInvalidValue;
+    unsigned blocks=0;
+    for(int i=0;i<batch.count;++i){const auto& j=batch.jobs[i];
+        if(!j.destination||!j.source||!j.bytes||j.bytes>256*1024||j.first_block!=blocks||
+           ((reinterpret_cast<uintptr_t>(j.destination)|reinterpret_cast<uintptr_t>(j.source)|j.bytes)&15))return cudaErrorInvalidValue;
+        blocks+=(j.bytes+4095)/4096;
+    }
+    if(blocks!=unsigned(batch.blocks))return cudaErrorInvalidValue;
+    state_copy_kernel<<<blocks,256,0,stream>>>(batch);return cudaGetLastError();
+}
+cudaError_t target_greedy_gpu(const float* logits,int* ids,int vocab,int tokens,cudaStream_t stream) {
+    if(!logits||!ids||vocab<1||vocab>129280||tokens<1||tokens>8)return cudaErrorInvalidValue;
+    target_greedy_kernel<<<tokens,256,0,stream>>>(logits,ids,vocab);return cudaGetLastError();
+}
+cudaError_t route_group_short_gpu(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int tokens,cudaStream_t stream) {
+    if(!ids||!weights||!rows||!slots||!grouped||tokens<2||tokens>8)return cudaErrorInvalidValue;
+    route_group_short_kernel<<<1,64,0,stream>>>(ids,weights,rows,slots,grouped,tokens*6);return cudaGetLastError();
+}
+cudaError_t route_handoff_short_gpu(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int* handoff,int tokens,cudaStream_t stream) {
+    if(!ids||!weights||!rows||!slots||!grouped||!handoff||tokens<1||tokens>8)return cudaErrorInvalidValue;
+    route_handoff_short_kernel<<<1,64,0,stream>>>(ids,weights,rows,slots,grouped,handoff,tokens*6);return cudaGetLastError();
+}
+void hc_project_vector_set_enabled(bool value){hc_vector_enabled.store(value);}
 cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hidden, int tokens, float eps, cudaStream_t s) {
     if (hidden < 1 || tokens < 1 || tokens > 65535 || eps <= 0) return cudaErrorInvalidValue;
-    hc_project_kernel<<<dim3(24,tokens),256,0,s>>>(x,fn,mixes,hidden,eps); return cudaGetLastError();
+    if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0)
+        hc_project_vector_kernel<<<dim3(24,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
+    else hc_project_kernel<<<dim3(24,tokens),256,0,s>>>(x,fn,mixes,hidden,eps);
+    return cudaGetLastError();
 }
 cudaError_t hc_split_gpu(const float* x, const float* scale, const float* base, float* pre, float* post, float* comb,
                          int tokens, float eps, int iterations, cudaStream_t s) {

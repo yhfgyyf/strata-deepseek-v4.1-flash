@@ -43,6 +43,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <cstdio>
@@ -1339,6 +1340,160 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     }
 }
 
+// Two physical warps per row keep the four original warp accumulators.
+// Warp0 owns original0/2; warp1 supplies1/3. The addition order stays0+1+2+3.
+bool g_multi_warp = true;
+template<typename F,int N,bool Pair=false>
+__launch_bounds__(128,4)
+__global__ void native_mmvq_multi_two_warp_kernel(const typename F::Block* __restrict__ w,
+    const Q81Block* __restrict__ x,float* __restrict__ y,int n_in,int n_out,
+    const typename F::Block* __restrict__ w2=nullptr,float* __restrict__ y2=nullptr) {
+    const int lane=threadIdx.x,part=threadIdx.y&1,local_row=threadIdx.y>>1;
+    int row=2*int(blockIdx.x)+local_row;
+    if constexpr(Pair)if(row>=n_out){row-=n_out;w=w2;y=y2;}
+    const int blocks=n_in/F::DIV,stride=n_in/Q8K;
+    float values[N][2]{};
+    if(row<n_out)for(int base=0;base<blocks;base+=F::BPI) {
+        #pragma unroll
+        for(int v=0;v<2;++v) {
+            const int tid=lane+32*(part+2*v),k=base+tid/F::T,qs=F::kqs(tid);
+            if(k<blocks) {
+                const auto weight=F::load(w+size_t(row)*blocks+k,qs);
+                #pragma unroll
+                for(int t=0;t<N;++t)values[t][v]+=F::apply(weight,x+size_t(t)*stride+k*F::KBY,qs);
+            }
+        }
+    }
+    __shared__ float partial[2][2][N][32];
+    if(part) {
+        #pragma unroll
+        for(int t=0;t<N;++t) {
+            partial[local_row][0][t][lane]=values[t][0];
+            partial[local_row][1][t][lane]=values[t][1];
+        }
+    }
+    __syncthreads();
+    if(part||row>=n_out)return;
+    #pragma unroll
+    for(int t=0;t<N;++t) {
+        float sum=values[t][0]+partial[local_row][0][t][lane];
+        sum+=values[t][1];sum+=partial[local_row][1][t][lane];
+        sum=warp_sum(sum);
+        if(lane==0)y[size_t(t)*n_out+row]=sum;
+    }
+}
+
+// Derived from native_mmvq_multi_kernel: same exact arithmetic; eight output-A groups.
+// Input Q8_1 layout is [token][8 groups][4096]; output is [token][8 groups][1024].
+template<typename F,int NCOLS>
+__launch_bounds__(WARPS*WARP,4)
+__global__ void output_a_grouped_kernel(const typename F::Block* __restrict__ w,
+    const Q81Block* STRATA_PDL_RESTRICT x,float* STRATA_PDL_RESTRICT y) {
+    constexpr int NW=WARPS,ROWS=2;
+    constexpr bool TS=false;
+    constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    constexpr int n_in=4096,n_out=1024;
+    const int bxi=int(blockIdx.x),group=int(blockIdx.y);
+    const int row0 = ROWS * bxi;
+    const int blocks_per_row = n_in / F::DIV;
+    w += std::size_t(group)*n_out*blocks_per_row;
+    x += group*n_in/Q8K;
+    y += group*n_out;
+    const int x_stride = 8*n_in / Q8K;                   // Q8_1 blocks per activation column
+    float tmp[NCOLS][ROWS] = {};
+    int kbx = tid / F::T;
+    if constexpr (kPdlPrefetch) {
+        // PDL (pdl.hpp): the first block's weights are loaded before waiting for the activations, then that block
+        // is applied exactly as the loop below would apply it (the same rows, columns and order)
+        typename F::W w0[ROWS];
+        const int kqs = F::kqs(tid);
+        if (kbx < blocks_per_row) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+        }
+        pdl_trigger();
+        pdl_wait();
+        if (kbx < blocks_per_row) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)
+                        tmp[j][i] += F::apply(w0[i], x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+        kbx += BPI;
+    }
+    for (; kbx < blocks_per_row; kbx += BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const typename F::W wv = F::load(w + block, kqs);      // once per (row, block)
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j)                         // then per column
+                    tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+    if constexpr (TS) {
+        constexpr int V = NCOLS * ROWS, P = s26ts::pow2_ceil(V);
+        float v[P];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+                v[j * ROWS + i] = tmp[j][i];
+            }
+#pragma unroll
+        for (int k = V; k < P; ++k) v[k] = 0.0f;
+        const float sum = s26ts::tsum<P>(v, int(threadIdx.x));
+        const int k = s26ts::tsum_token<P>(int(threadIdx.x));
+        const int j = k / ROWS, i = k % ROWS;
+        if (int(threadIdx.x) == s26ts::tsum_lane<P>(k) && k < V && row0 + i < n_out) y[std::size_t(j) * 8192 + row0 + i] = sum;
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * 8192 + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template<typename F,int N>
+void launch_output_a_n(const void* w,const void* x,float* y,cudaStream_t stream) {
+    launch_pdl(output_a_grouped_kernel<F,N>,dim3(512,8),dim3(WARP,WARPS),0,stream,
+        static_cast<const typename F::Block*>(w),static_cast<const Q81Block*>(x),y);
+}
+template<typename F>
+void launch_output_a(const void* w,const void* x,float* y,int tokens,cudaStream_t stream) {
+    #define RUN(N) case N:launch_output_a_n<F,N>(w,x,y,stream);break
+    switch(tokens){RUN(2);RUN(3);RUN(4);RUN(5);RUN(6);RUN(7);RUN(8);}
+    #undef RUN
+}
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -1350,6 +1505,14 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
                    (const typename F::Block*) nullptr, (float*) nullptr);
         return;
     }
+#if !defined(__HIPCC__)
+    constexpr int type=std::is_same_v<F,SmallTraits<Q80Block,8>>?8:std::is_same_v<F,Q6KTraits>?14:-1;
+    if constexpr(type==8||type==14)if(g_multi_warp&&native_mmvq_multi_warp_selected(type,n_in,n_out,NCOLS,false)) {
+        if constexpr(std::is_same_v<F,Q6KTraits>)q6_row_warp(weights,x_q8_1,y,n_in,n_out,NCOLS,s);
+        else native_mmvq_multi_two_warp_kernel<F,NCOLS><<<unsigned((n_out+1)/2),dim3(32,4),0,s>>>(w,x,y,n_in,n_out);
+        return;
+    }
+#endif
     const dim3 threads(WARP, WARPS);
     // the PAIR arguments, unused here (launch_pdl passes every parameter)
     const typename F::Block* const no_w2 = nullptr;
@@ -2211,6 +2374,45 @@ void native_q6_k_unpack(const void* weights) {
     registry.erase(found);
 }
 
+bool native_deepseek_output_a_batch(int type,const void* weights,const float* x,void* scratch,float* out,int tokens,void* stream) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if ((type!=8&&type!=14)||tokens<2||tokens>8||!g_multi_exact||s26_tsum_on()||!weights||!x||!scratch||!out||!stream) return false;
+    static const bool rows1=[] {const char* v=std::getenv("STRATA_NO_MMVQ_ROWS2");return v&&v[0]&&v[0]!='0';}();
+    if(rows1) return false;
+    const int row_bytes=type==8?4096/32*34:4096/256*210;
+    for(int group=0;group<8;++group) {
+        const void* w=static_cast<const uint8_t*>(weights)+std::size_t(group)*1024*row_bytes;
+        if(q8_packed_registry().count(w)||q6_packed_registry().count(w))return false;
+    }
+    native_quantize_q8_1(x,scratch,32768,tokens,stream);
+    if(type==8)launch_output_a<SmallTraits<Q80Block,8>>(weights,scratch,out,tokens,static_cast<cudaStream_t>(stream));
+    else launch_output_a<Q6KTraits>(weights,scratch,out,tokens,static_cast<cudaStream_t>(stream));
+    launch_check();return true;
+#endif
+}
+
+void native_mmvq_multi_warp_set_enabled(bool value){g_multi_warp=value;}
+bool native_mmvq_multi_warp_selected(int type,int ni,int no,int n,bool pair) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool rows1=[] {const char* v=std::getenv("STRATA_NO_MMVQ_ROWS2");return v&&v[0]&&v[0]!='0';}();
+    if(n<2||n>8||!g_multi_exact||s26_tsum_on()||pdl_scope()||rows1)return false;
+    // Passed independent fixed and eight-matrix rotation checks; other bins keep33.
+    struct Choice {int type,ni,no;bool pair;unsigned mask;};
+    static constexpr Choice choices[]={
+        {8,1280,32768,false,4u},
+        {8,8192,5120,false,32u},
+        {14,2304,5120,false,64u},
+        {14,5120,2304,false,16u},
+    };
+    for(const auto& c:choices)if(c.type==type&&c.ni==ni&&c.no==no&&c.pair==pair)return (c.mask&(1u<<n))!=0;
+    return false;
+#endif
+}
+
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
@@ -2540,6 +2742,12 @@ template<int NCOLS>
 void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x, float* y1, float* y2, int n_in, int n_out,
                       cudaStream_t s) {
     using F = SmallTraits<Q80Block, 8>;
+#if !defined(__HIPCC__)
+    if(g_multi_warp&&native_mmvq_multi_warp_selected(8,n_in,n_out,NCOLS,true)) {
+        native_mmvq_multi_two_warp_kernel<F,NCOLS,true><<<unsigned((2*n_out+1)/2),dim3(32,4),0,s>>>(w1,x,y1,n_in,n_out,w2,y2);
+        return;
+    }
+#endif
     const dim3 threads(WARP, WARPS);
     if (s26_tsum_on())
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);

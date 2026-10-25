@@ -67,7 +67,7 @@ int main(int argc,char** argv) {
                     <<"  --profile FILE --hot-auto --hot-front-bytes N --hot-front-gib N --hot-back-gib N\n"
                     <<"  --work-mib N --state-mib N --gpu-headroom-mib N\n"
                     <<"  --adaptive-experts --adaptive-layer-progress --migration-mib N (single-slot hybrid)\n"
-                    <<"  --adaptive-expert-scope layer|format-group --expert-profile-save FILE (optional, separate from --profile)\n"
+                    <<"  --adaptive-expert-policy legacy|maya --adaptive-expert-scope layer|format-group --expert-profile-save FILE (optional, separate from --profile)\n"
                     <<"  --engram-pipeline --expert-bf16 --expert-direct-gemv --expert-pipeline --pcie-frac F\n"
                     <<"  --compact-logits --compact-workspace\n"
                     <<"  --dense-q8 --dense-q8-1 --expert-gu-mode 0|1|2 --cpu-gu-q8-0\n"
@@ -102,6 +102,10 @@ int main(int argc,char** argv) {
             else if(a=="--adaptive-expert-scope"){
                 const auto scope=next();if(scope!="layer"&&scope!="format-group")throw std::invalid_argument("adaptive expert scope");
                 options.adaptive_groups=scope=="format-group";
+            }
+            else if(a=="--adaptive-expert-policy"){
+                const auto policy=next();if(policy!="legacy"&&policy!="maya")throw std::invalid_argument("adaptive expert policy");
+                options.adaptive_maya=policy=="maya";
             }
             else if(a=="--expert-profile-save")options.expert_profile_save=next();
             else if(a=="--engram-pipeline")options.engram_pipeline=true;

@@ -16,6 +16,8 @@ struct PrefetchBlockBenchmark {
         std::vector<uint8_t*> sources;
         std::array<std::vector<uint8_t*>,2> spares;
         uint64_t windows,direct,rotated,prepare,commit;
+        uint64_t decay_rows;
+        std::vector<uint8_t> recent;
     };
     static Runtime::Impl& rt(Runtime& r){return *r.impl_;}
     static Session::Impl& session_impl(Session& s){return *s.impl_;}
@@ -34,7 +36,7 @@ struct PrefetchBlockBenchmark {
     static Snapshot snapshot(AdaptiveCache& a){
         if(a.state_!=AdaptiveCache::State::idle)throw std::logic_error("snapshot requires idle adaptive cache");
         a.record_exchanges_=true;a.committed_exchanges_.clear();
-        return {a.hot_,a.offsets_,a.heat_,a.previous_,a.learned_,a.rows_,a.since_pick_,a.batches_,a.published_,a.host_copy_ms_,a.sources_,a.spares_,a.windows_,a.direct_bytes_,a.rotated_,a.avoided_prepare_,a.avoided_commit_};
+        return {a.hot_,a.offsets_,a.heat_,a.previous_,a.learned_,a.rows_,a.since_pick_,a.batches_,a.published_,a.host_copy_ms_,a.sources_,a.spares_,a.windows_,a.direct_bytes_,a.rotated_,a.avoided_prepare_,a.avoided_commit_,a.decay_rows_,a.recent_};
     }
     static void restore(AdaptiveCache& a,const Snapshot& s,cudaStream_t readers,ExecutionStats& stats,bool grouped){
         a.drain(readers,stats);gpu_check(cudaDeviceSynchronize());
@@ -70,7 +72,7 @@ struct PrefetchBlockBenchmark {
         a.heat_=s.heat;a.previous_=s.previous;a.learned_=s.learned;
         a.rows_=s.rows;a.since_pick_=s.since;a.batches_=s.batches;a.published_=s.published;a.host_copy_ms_=s.host_ms;
         a.grouped_=grouped;a.windows_=s.windows;a.direct_bytes_=s.direct;a.rotated_=s.rotated;
-        a.avoided_prepare_=s.prepare;a.avoided_commit_=s.commit;
+        a.avoided_prepare_=s.prepare;a.avoided_commit_=s.commit;a.decay_rows_=s.decay_rows;a.recent_=s.recent;
         if(std::any_of(a.overrides_.begin(),a.overrides_.end(),[](auto p){return p!=nullptr;})||
            std::any_of(a.unavailable_.begin(),a.unavailable_.end(),[](auto n){return n!=0;}))
             throw std::logic_error("rewind left transient owners");
@@ -134,7 +136,8 @@ struct PrefetchBlockBenchmark {
     static void learning_boundary(AdaptiveCache& a){
         if(a.state_!=AdaptiveCache::State::idle)throw std::logic_error("learning boundary requires drained cache");
         std::fill(a.previous_.begin(),a.previous_.end(),0);
-        a.rows_=a.windows_=a.since_pick_=a.batches_=a.published_=0;
+        a.rows_=a.windows_=a.since_pick_=a.batches_=a.published_=a.decay_rows_=0;
+        std::fill(a.recent_.begin(),a.recent_.end(),0);
         a.direct_bytes_=a.rotated_=a.avoided_prepare_=a.avoided_commit_=0;a.host_copy_ms_=0;
     }
     static void aligned(AdaptiveCache& a,bool value){

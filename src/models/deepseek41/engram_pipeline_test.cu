@@ -40,8 +40,8 @@ void run(int type) {
     d::Matrix matrix{weights,30,25600,6144,uint64_t(25600)*6144};d::Stream main;
     {
         d::EngramPipeline pipeline(work,d::Arithmetic::production,false,true,type);
-        for(uint64_t sequence=1;sequence<=12;++sequence) {
-            const int count=sequence%3==0?128:sequence%3==1?1:17;
+        for(uint64_t sequence=1;sequence<=22;++sequence) {
+            const int counts[]={1,2,3,4,5,6,7,8,9,17,128};const int count=counts[(sequence-1)%11];
             d::EngramQuery query;query.image.resize(count);if(count>1)query.image[1]=1;query.rows.resize(count*48);
             for(int t=0;t<count;++t)for(int h=0;h<48;++h)query.rows[t*48+h]=(t*7+h*11+sequence)%64;
             auto ticket=reader.submit(query,sequence,true);pipeline.start(ticket,sequence,count,matrix,matrix);
@@ -70,4 +70,4 @@ void run(int type) {
     std::cout<<"ENGRAM_LAYER_PREPARE_GENERATION_WRAP_IMAGE_TAIL_CANCEL_FAILURE_PASS\n";
 }
 }
-int main(){try{run(8);run(13);run(14);return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{for(bool candidate:{false,true}){d::engram_short_set_enabled(candidate);run(8);run(13);run(14);}std::cout<<"{\"kind\":\"summary\",\"types\":6,\"failures\":0}\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

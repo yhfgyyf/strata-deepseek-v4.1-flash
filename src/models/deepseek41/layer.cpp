@@ -1,5 +1,6 @@
 #include "runtime_internal.hpp"
 #include "expert_pipeline.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/prefill/ledger_scope.hpp"
 #include <algorithm>
 #include <chrono>
@@ -8,7 +9,10 @@
 #include <numeric>
 
 namespace strata::models::deepseek41 {
+#include "hc_overlap.hpp"
 namespace {
+std::atomic<bool> hc_overlap_enabled{true};
+std::atomic<bool> output_a_batch_enabled{true};
 CacheLayout contiguous(uint8_t* data,int64_t rows,int row_bytes,int page_size) {
     return {data,((rows+page_size-1)/page_size)*page_size*row_bytes,int64_t(page_size)*row_bytes,row_bytes,page_size};
 }
@@ -24,6 +28,8 @@ void store_window(uint8_t* destination,const uint8_t* source,int begin,int rows,
     if(first<rows)gpu_check(cudaMemcpyAsync(destination,source+int64_t(first)*row_bytes,int64_t(rows-first)*row_bytes,cudaMemcpyDeviceToDevice,stream));
 }
 }
+void output_a_batch_set_enabled(bool value){output_a_batch_enabled.store(value);}
+void hc_overlap_set_enabled(bool value){hc_overlap_enabled.store(value);}
 void Session::Impl::dump(const std::string& name,const float* data,const std::vector<int64_t>& shape) {
     capture.put(name,data,shape,runtime.stream.value);
 }
@@ -142,12 +148,13 @@ void Runtime::Impl::decode_segment(int part,int layer,int tokens,Workspace& w,bo
 }
 void Session::Impl::attention_input(int layer,int count,const std::function<void()>& before_q) {
     const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
+    HcOverlap fork(hc_overlap_enabled.load()&&(count<=9||count==128),stream,runtime.hc_stream.value,runtime.hc_ready.value,runtime.hc_done.value);
     auto mixes=[&](const char* stage,float* pre){
-        gpu_check(hc_project_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,5120,count,g.norm_eps,stream));
+        gpu_check(hc_project_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,5120,count,g.norm_eps,fork.stream()));
         gpu_check(hc_split_gpu(work.mixes,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_scale").data),
-            static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_base").data),pre,work.post,work.comb,count,g.hc_eps,g.sinkhorn_iters,stream));
+            static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_base").data),pre,work.post,work.comb,count,g.hc_eps,g.sinkhorn_iters,fork.stream()));
     };
-    mixes("attn",work.attn_pre);
+    mixes("attn",work.attn_pre);fork.produced();
     gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.pre,work.x,5120,count,stream));
     dump("hc_attn_pre-"+std::to_string(layer),work.x,{count,5120});
     gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),work.x,5120,count,g.norm_eps,stream));
@@ -157,11 +164,16 @@ void Session::Impl::attention_input(int layer,int count,const std::function<void
     gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),work.qr,1280,count,g.norm_eps,stream));
     dump("qr-"+std::to_string(layer),work.qr,{count,1280});
     runtime.matmul(runtime.tensor(layer,"attn_q_b"),work.qr,work.q,count,work);
+    fork.join();
 }
 void Session::Impl::attention_output(int layer,int count,bool with_routes) {
     const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
     const auto& wo=runtime.tensor(layer,"attn_output_a");
-    for(int group=0;group<8;++group)runtime.matmul(wo,work.q+group*4096,work.o_low+group*1024,count,work,
+    const bool grouped=output_a_batch_enabled.load()&&wo.packed_bf16&&wo.cols==4096&&wo.rows==8192&&
+        runtime.options.arithmetic==Arithmetic::production&&runtime.options.dense_q8_1&&runtime.options.dense_q8_batch&&
+        kernels::native_deepseek_output_a_batch(wo.type,wo.data,work.q,work.dense_weight,work.o_low,count,stream);
+    if(grouped)gpu_check(round_bf16_gpu(work.o_low,int64_t(count)*8192,stream));
+    else for(int group=0;group<8;++group)runtime.matmul(wo,work.q+group*4096,work.o_low+group*1024,count,work,
         1024,32768,8192,int64_t(group)*1024*4096);
     runtime.matmul(runtime.tensor(layer,"attn_output_b"),work.o_low,work.branch,count,work);
     dump("attn_out-"+std::to_string(layer),work.branch,{count,5120});
@@ -177,7 +189,7 @@ void Session::Impl::attention_output(int layer,int count,bool with_routes) {
     dump("hc_ffn_pre-"+std::to_string(layer),work.x,{count,5120});
     gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,5120,count,g.norm_eps,stream));
     dump("ffn_norm-"+std::to_string(layer),work.x,{count,5120});
-    if(with_routes)runtime.route(layer,count,work);
+    if(with_routes)runtime.route(layer,count,work,2);
 }
 void Session::Impl::attention(int layer,int count,int64_t start) {
     const auto& g=runtime.model.geometry();const auto& own=runtime.model.ownership()[layer];
@@ -333,11 +345,15 @@ std::vector<float> Session::Impl::logits(int count,bool all) {
     dump("result_norm",work.x,{count,5120});
     const int rows=all||capture.enabled()?count:1;
     std::vector<float> result(int64_t(rows)*129280);
+    const bool greedy=greedy_capture&&all&&rows<=8;
+    last_greedy.clear();if(greedy)last_greedy.resize(rows);
     const float* input=rows==count?work.x:work.x+int64_t(count-1)*5120;
     for(int first=0;first<rows;first+=work.max_logit_tokens) {
         const int nt=std::min(work.max_logit_tokens,rows-first);
         runtime.matmul(runtime.weights->at("output.weight"),input+int64_t(first)*5120,work.logits,nt,work,0,0,0,0,false);
+        if(greedy)gpu_check(target_greedy_gpu(work.logits,work.ids,129280,nt,stream));
         gpu_check(cudaMemcpyAsync(result.data()+int64_t(first)*129280,work.logits,int64_t(nt)*129280*4,cudaMemcpyDeviceToHost,stream));
+        if(greedy)gpu_check(cudaMemcpyAsync(last_greedy.data()+first,work.ids,nt*sizeof(int),cudaMemcpyDeviceToHost,stream));
     }
     gpu_check(cudaStreamSynchronize(stream));
     if(capture.enabled())capture.put_host("result_output",result,{rows,129280});

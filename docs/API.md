@@ -42,4 +42,8 @@ Use `thinking.type=disabled` to disable thinking, or enable thinking with a budg
 
 Image input uses each endpoint's image-content format and requires the `mmproj` model path in the configuration.
 
+## Conversation prefixes
+
+Send the complete conversation on each request. With `prefix_cache_mib` enabled, text requests automatically reuse the longest exact token prefix from completed checkpoints. Set `cache_prompt: false` to bypass automatic reads and writes for a request. Image requests bypass this cache. Cancelled requests preserve earlier checkpoints; the next request can continue using the same runtime.
+
 Authentication is optional on loopback. A non-loopback bind requires `api_key`; clients then supply the configured key. Do not commit real API keys in configuration examples.

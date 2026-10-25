@@ -24,9 +24,9 @@ uint64_t AdaptiveCache::staging_bytes(const std::array<uint64_t,40>& sizes,uint6
 }
 AdaptiveCache::AdaptiveCache(core::ExpertCache& cache,std::vector<ExpertKey>& hot,std::vector<uint64_t>& offsets,
                              uint8_t* ram,const std::array<uint64_t,40>& sizes,uint64_t budget,bool trace,bool grouped,bool pinned_ram,bool huge_pinned,
-                             const std::array<int,40>* layout_groups)
+                             const std::array<int,40>* layout_groups,bool maya)
     :cache_(cache),hot_(hot),offsets_(offsets),ram_(ram),sizes_(sizes),budget_(budget),stride_(largest(sizes)),
-     capacity_(std::min<uint64_t>(96,budget/2/stride_)),trace_(trace),grouped_(grouped),pinned_ram_(pinned_ram),
+     capacity_(std::min<uint64_t>(96,budget/2/stride_)),trace_(trace),grouped_(grouped),pinned_ram_(pinned_ram),maya_(maya),recent_(keys),
      staging_(std::make_unique<Pinned>(staging_bytes(sizes,budget),false,huge_pinned)),heat_(keys),previous_(keys),learned_(keys),
      generations_(hot.size()),overrides_(keys),sources_(keys),unavailable_(keys){
     if(!ram_||offsets_.size()!=keys||hot_.size()!=static_cast<size_t>(cache_.slots()))throw std::invalid_argument("adaptive cache ownership");
@@ -71,16 +71,16 @@ void AdaptiveCache::choose(cudaStream_t readers,ExecutionStats& stats){
     std::vector<int32_t> slots(keys);
     for(int k=0;k<keys;++k)slots[k]=cache_.slot_of(k/384,k%384);
     swaps_.clear();std::array<size_t,40> spare{};
-    for(const auto& choice:choose_adaptive_exchanges(sizes_,heat_,slots,offsets_,grouped_,capacity_,budget_,&groups_)){
+    for(const auto& choice:choose_adaptive_exchanges(sizes_,heat_,slots,offsets_,grouped_,capacity_,budget_,&groups_,maya_?&recent_:nullptr)){
         Swap s;static_cast<AdaptiveExchange&>(s)=choice;
         s.generation=generations_.at(s.slot);s.source=sources_.at(adaptive_index(s.in));
-        s.direct=aligned_&&pinned_ram_;s.rotate=aligned_&&rotation_eligible_;
+        s.direct=(aligned_||maya_)&&pinned_ram_;s.rotate=(aligned_||maya_)&&rotation_eligible_;
         s.spare=spare[groups_[s.in.first]]++;
         s.saved=s.rotate?spares_[groups_[s.in.first]].at(s.spare):saved(swaps_.size());
         validate(s);swaps_.push_back(s);
     }
     since_pick_=0;
-    for(int k=0;k<keys;++k){if(aligned_)learned_[k]+=heat_[k];heat_[k]*=.7;}
+    if(!maya_)for(int k=0;k<keys;++k){if(aligned_)learned_[k]+=heat_[k];heat_[k]*=.7;}
     if(swaps_.empty())return;
     prefill::LedgerScope trace(trace_,"ds41.adapt.d2h.submit");
     // Keep the old GPU expert readable during the copy back. H2D is a later state.
@@ -178,20 +178,26 @@ void AdaptiveCache::observe(int tokens,const std::vector<double>& counts,bool wi
     for(int k=0;k<keys;++k){
         if(!std::isfinite(counts[k])||counts[k]<previous_[k])throw std::logic_error("adaptive routes went backwards/nonfinite");
         const double delta=counts[k]-previous_[k];heat_[k]+=delta;
-        if(!window)learned_[k]+=delta;
+        if(!window||maya_)learned_[k]+=delta;
+        if(maya_)recent_[k]=delta>0;
         previous_[k]=counts[k];
     }
     rows_+=tokens;since_pick_+=window?1:tokens;
     if(window)++windows_;
+    if(maya_){
+        decay_rows_+=tokens;
+        // Match Maya's whole-window boundary: reset the counter after decay.
+        if(decay_rows_>=256){for(auto& h:heat_)h*=.9;decay_rows_=0;}
+    }
 }
 void AdaptiveCache::observe_window(int tokens,const std::vector<double>& counts){
-    if(aligned_)observe(tokens,counts,true);
+    if(aligned_||maya_)observe(tokens,counts,true);
 }
 void AdaptiveCache::tick(int tokens,const std::vector<double>& counts,cudaStream_t readers,ExecutionStats& stats){
     prefill::LedgerScope trace(trace_,"ds41.adapt.tick");const auto start=std::chrono::steady_clock::now();
     advance(readers,stats,false);
-    if(!aligned_)observe(tokens,counts,false);
-    if(state_==State::idle&&since_pick_>=4)choose(readers,stats);
+    if(!aligned_&&!maya_)observe(tokens,counts,false);
+    if(state_==State::idle&&since_pick_>=(maya_?1:4))choose(readers,stats);
     stats.phase_dynamic_ms+=elapsed(start);
 }
 void AdaptiveCache::progress(cudaStream_t readers,ExecutionStats& stats){
@@ -202,16 +208,17 @@ void AdaptiveCache::progress(cudaStream_t readers,ExecutionStats& stats){
 void AdaptiveCache::drain(cudaStream_t readers,ExecutionStats& stats){while(state_!=State::idle)advance(readers,stats,true);}
 void AdaptiveCache::begin_request(cudaStream_t readers,ExecutionStats& stats){
     drain(readers,stats);std::fill(previous_.begin(),previous_.end(),0);
-    if(!aligned_)rows_=since_pick_=0;
+    if(maya_){since_pick_=0;std::fill(recent_.begin(),recent_.end(),0);}
+    else if(!aligned_)rows_=since_pick_=0;
 }
 void AdaptiveCache::write_status(std::ostream& out)const{
     const char* name=state_==State::idle?"idle":state_==State::saving?"saving":state_==State::loading?"loading":"committing";
     out<<"{\"scope\":\""<<(grouped_?"format-group":"layer")<<"\",\"state\":\""<<name<<"\",\"pending_swaps\":"<<swaps_.size()<<",\"batches\":"<<batches_<<",\"published_swaps\":"<<published_
        <<",\"observed_rows\":"<<rows_<<",\"migration_budget_bytes\":"<<budget_<<",\"host_staging_bytes\":"<<staging_->bytes
-       <<",\"host_copy_worker_ms\":"<<host_copy_ms_<<",\"period\":4,\"period_unit\":\""<<(aligned_?"verify_window":"accepted_row")<<"\",\"decay\":0.7"
+       <<",\"host_copy_worker_ms\":"<<host_copy_ms_<<",\"policy\":\""<<(maya_?"maya":"legacy")<<"\",\"period\":"<<(maya_?1:4)<<",\"period_unit\":\""<<((aligned_||maya_)?"verify_window":"accepted_row")<<"\",\"decay\":"<<(maya_?.9:.7)<<",\"decay_rows\":"<<decay_rows_
        <<",\"windows\":"<<windows_<<",\"exchange_limit\":"<<capacity_<<",\"pinned_direct_bytes\":"<<direct_bytes_
        <<",\"rotated_exchanges\":"<<rotated_<<",\"avoided_prepare_bytes\":"<<avoided_prepare_<<",\"avoided_commit_bytes\":"<<avoided_commit_
-       <<",\"minimum_candidate_heat\":"<<candidate_heat<<",\"minimum_gain\":"<<migration_gain
+       <<",\"minimum_candidate_heat\":"<<(maya_?0:candidate_heat)<<",\"minimum_gain\":"<<(maya_?1:migration_gain)<<",\"relative_margin\":"<<(maya_?1.25:1.0)
        <<",\"heat_sum\":"<<std::accumulate(heat_.begin(),heat_.end(),0.0)<<",\"previous_sum\":"<<std::accumulate(previous_.begin(),previous_.end(),0.0)
        <<",\"cpu_overrides\":"<<std::count_if(overrides_.begin(),overrides_.end(),[](auto p){return p!=nullptr;})
        <<",\"unavailable_slots\":"<<std::count(unavailable_.begin(),unavailable_.end(),1)<<'}';

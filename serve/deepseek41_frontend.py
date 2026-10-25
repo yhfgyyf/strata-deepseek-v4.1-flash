@@ -10,7 +10,7 @@ from serve import deepseek41_encoding as codec
 from serve.deepseek41_images import expand_images, preprocess
 from serve.frontend import Event, ToolCall, _object_list, _parts_of, _tool_list, _text_of, tool_choice_of
 from serve.responses import ResponsesError
-from serve.server import Detokenizer, EngineStarting, Service, StopMatcher, Vision, stop_strings
+from serve.server import Detokenizer, EngineStarting, Service, StopMatcher, Vision, request_timings, stop_strings
 
 
 def effort_kwargs(req, shared=None):
@@ -273,16 +273,27 @@ class DeepSeekService(Service):
                 if held:
                     yield "event", Event("content", held)
                 last = getattr(self.engine, "last_for_thread", lambda: getattr(self.engine, "last", None))() or {}
+                timings = None
+                prompt_ms, decode_ms = last.get("prompt_ms", 0), last.get("decode_ms", 0)
+                if "prefill_wall_ms" in last:
+                    prompt_ms = last["prefill_wall_ms"]
+                    decode_ms = last["generation_wall_ms"] + last["cleanup_wall_ms"]
+                    timings = request_timings(len(ids), n, {**last, "prompt_ms": prompt_ms, "decode_ms": decode_ms})
+                    timings.update(generation_ms=last["generation_wall_ms"], cleanup_ms=last["cleanup_wall_ms"],
+                                   target_forward_ms=last["decode_ms"], prefill_forward_ms=last["prompt_ms"])
                 with self.status_lock:
                     self.totals["requests"] += 1
                     self.totals["prompt_tokens"] += len(ids)
+                    self.totals["reused"] += last.get("reused", 0)
                     self.totals["output_tokens"] += n
-                    self.totals["prompt_ms"] += last.get("prompt_ms", 0)
-                    self.totals["decode_ms"] += last.get("decode_ms", 0)
+                    self.totals["prompt_ms"] += prompt_ms
+                    self.totals["decode_ms"] += decode_ms
+                    self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
                     self.latencies.observe((state["first_token"] - state["started"]) if state["first_token"] else None,
-                                           n, last.get("decode_ms", 0) / 1000, time.time() - state["started"])
-                yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_n}
+                                           n, decode_ms / 1000, time.time() - state["started"])
+                yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_n,
+                               "reused": last.get("reused", 0), "timings": timings}
         finally:
             with self.status_lock:
                 self.live_reqs.pop(id(state), None)

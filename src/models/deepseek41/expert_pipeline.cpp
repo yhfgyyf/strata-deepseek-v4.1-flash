@@ -116,9 +116,10 @@ void ExpertPipeline::run(){
                     std::unique_lock<std::mutex> lock(mutex_);
                     const bool discarded=!uploads_.empty() && !uploads_[i].bytes;
                     const int64_t blocked=diagnostics_.enabled && !discarded && slot.issued && !slot.returned?ring_now():0;
-                    changed_.wait(lock,[&]{return stopped_ || (!uploads_.empty() && !uploads_[i].bytes) || !slot.issued || slot.returned;});
+                    changed_.wait(lock,[&]{return stopped_ || cancelling_ || (!uploads_.empty() && !uploads_[i].bytes) || !slot.issued || slot.returned;});
                     if(blocked)diagnostics_.producer_waits.emplace_back(blocked,ring_now());
                     if(stopped_)return;
+                    if(cancelling_)break;
                     claimed_=i+1;
                     if(!uploads_.empty()){
                         direct=uploads_[i];
@@ -137,7 +138,7 @@ void ExpertPipeline::run(){
                 uint64_t payload=bytes;
                 if(!direct.source)fill(i,host_.data+offset);
                 else {source=direct.source;payload=direct.bytes;}
-                { std::lock_guard<std::mutex> lock(mutex_);if(stopped_)return; }
+                { std::lock_guard<std::mutex> lock(mutex_);if(stopped_)return;if(cancelling_)break; }
                 const std::string label=direct.trace_layer<0?"":"ds41.expert.h2d.layer."+std::to_string(direct.trace_layer)+
                     ".expert."+std::to_string(direct.trace_expert)+".generation."+std::to_string(generation)+".sequence."+std::to_string(i);
                 {prefill::LedgerScope trace(direct.trace_layer>=0,label.c_str());
@@ -205,6 +206,24 @@ void ExpertPipeline::finish() {
     }
     report_diagnostics();
 }
+void ExpertPipeline::cancel(cudaStream_t dequant,cudaStream_t reader) {
+    {
+        std::unique_lock<std::mutex> lock(mutex_);cancelling_=true;changed_.notify_all();
+        changed_.wait(lock,[&]{return stopped_ || (!working_ && (!pending_ || error_));});
+    }
+    // Cleanup can run while unwinding a cancelled request. Preserve a CUDA
+    // failure for the next caller instead of throwing from PrefetchGuard.
+    const auto uploaded=cudaStreamSynchronize(upload_);
+    const auto dequantized=cudaStreamSynchronize(dequant);
+    const auto consumed=cudaStreamSynchronize(reader);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto failure=uploaded!=cudaSuccess?uploaded:(dequantized!=cudaSuccess?dequantized:consumed);
+    if(failure!=cudaSuccess && !error_)error_=std::make_exception_ptr(std::runtime_error(cudaGetErrorString(failure)));
+    if(stopped_ || error_)return;
+    for(auto& slot:slots_){slot->issued=false;slot->returned=false;slot->generation=0;slot->sequence=0;}
+    uploads_.clear();fill_={};jobs_=0;claimed_=0;have_uploaded_=false;pending_=false;
+    diagnostics_={};cancelling_=false;
+}
 void ExpertPipeline::stop() {
     { std::lock_guard<std::mutex> lock(mutex_);stopped_=true; }
     changed_.notify_all();if(worker_.joinable())worker_.join();
@@ -264,7 +283,8 @@ void Runtime::Impl::end_expert_prefetch() {
 }
 void Runtime::Impl::cancel_expert_prefetch() {
     if(!prefetch_active)return;
-    expert_pipeline->stop();cudaStreamSynchronize(dequant_stream.value);cudaStreamSynchronize(stream.value);
+    expert_pipeline->cancel(dequant_stream.value,stream.value);
     prefetch_active=false;prefetch_sizes.clear();
+    std::cerr<<"DeepSeek expert prefetch cancelled generation="<<expert_generation<<'\n';
 }
 } // namespace strata::models::deepseek41

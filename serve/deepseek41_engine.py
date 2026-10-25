@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import itertools
 import contextlib
+from array import array
 import math
 from pathlib import Path
 import queue
@@ -26,6 +27,9 @@ TIMING_FIELDS = (
     ("phase_ready_waits", int), ("phase_prepare_ms", float), ("phase_host_wait_ms", float),
     ("phase_restore_submit_ms", float), ("phase_dynamic_ms", float),
 )
+WALL_TIMING_FIELDS = (
+    ("prefill_wall_ms", float), ("generation_wall_ms", float), ("cleanup_wall_ms", float),
+)
 
 
 def sampling_params(sampling, prompt_tokens):
@@ -34,6 +38,8 @@ def sampling_params(sampling, prompt_tokens):
         sampling = {}
     if not isinstance(sampling, dict):
         raise ValueError("DeepSeek sampling must be an object")
+    if "cache_prompt" in sampling and type(sampling["cache_prompt"]) is not bool:
+        raise ValueError("DeepSeek cache_prompt must be a boolean")
     if any(sampling.get(k) for k in ("gumbel", "logit_bias", "grammar")):
         raise ValueError("DeepSeek gumbel/logit_bias/grammar sampling is not implemented")
     defaults = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0.0, "seed": 0,
@@ -75,14 +81,69 @@ def quote(text):
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+class PrefixCache:
+    """Private, bounded checkpoints; the single request slot owns all mutations."""
+    def __init__(self, directory, budget):
+        self.directory, self.budget = Path(directory), budget
+        self.directory.mkdir(mode=0o700)
+        self.entries = []
+
+    @staticmethod
+    def starts_with(ids, prefix):
+        return len(ids) >= len(prefix) and all(a == b for a, b in zip(ids, prefix))
+
+    def discard(self, path):
+        path = Path(path)
+        self.entries = [entry for entry in self.entries if entry[0] != path]
+        for name in (path, Path(str(path) + ".tmp")):
+            with contextlib.suppress(FileNotFoundError):
+                name.unlink()
+
+    def match(self, ids):
+        best = None
+        for entry in list(self.entries):
+            path, prefix, size = entry
+            if not path.is_file() or path.stat().st_size != size:
+                self.discard(path)
+            elif self.starts_with(ids, prefix) and (best is None or len(prefix) > len(best[1])):
+                best = entry
+        if best is not None:
+            self.entries.remove(best)
+            self.entries.append(best)
+        return best
+
+    def publish(self, path, prefix):
+        path = Path(path)
+        if not path.is_file():
+            return
+        size = path.stat().st_size
+        if size > self.budget:
+            self.discard(path)
+            return
+        for old, ids, _ in list(self.entries):
+            if len(ids) == len(prefix) and self.starts_with(prefix, ids):
+                self.discard(old)
+        # Retain the earliest checkpoint of the conversation being extended,
+        # then evict other entries in LRU order. The byte bound takes priority.
+        ancestors = [e for e in self.entries if self.starts_with(prefix, e[1])]
+        root = min(ancestors, key=lambda e: len(e[1])) if ancestors else None
+        while self.entries and (len(self.entries) >= 4 or sum(e[2] for e in self.entries) + size > self.budget):
+            victim = next((e for e in self.entries if e is not root), self.entries[0])
+            self.discard(victim[0])
+        self.entries.append((path, array("i", prefix), size))
+
+
 class DeepSeekEngine:
     def __init__(self, command, context=32768, slots=1, ced=True, speculative=False,
-                 log_path=None, directory=None, ready_timeout=900):
+                 log_path=None, directory=None, ready_timeout=900, prefix_cache_mib=0):
         if slots not in (1, 2) or context < 1:
             raise ValueError("invalid DeepSeek context or slots")
+        if type(prefix_cache_mib) is not int or not 0 <= prefix_cache_mib <= 4096 or (prefix_cache_mib and slots != 1):
+            raise ValueError("DeepSeek prefix cache requires one slot and a 0..4096 MiB integer budget")
         self.max_context = self.known_ctx = context
         self.batch, self.ced, self.speculative = slots, ced, speculative
         self.info = {"architecture": "deepseek-v4.1", "version": "experimental", "validated_context": 0}
+        self.info["prefix_cache_mib"] = prefix_cache_mib
         self.waiting, self.last, self.progress = 0, None, None
         self._slots = threading.BoundedSemaphore(slots)
         self._ids = itertools.count(1)
@@ -92,6 +153,7 @@ class DeepSeekEngine:
         self._ready = queue.Queue()
         self._temporary = tempfile.TemporaryDirectory(prefix="strata-ds41-", dir=directory)
         self.dir = Path(self._temporary.name)
+        self.prefix_cache = PrefixCache(self.dir / "prefixes", prefix_cache_mib << 20) if prefix_cache_mib else None
         self.log_path = str(log_path or self.dir / "engine.log")
         self.log_start = Path(self.log_path).stat().st_size if Path(self.log_path).exists() else 0
         try:
@@ -117,7 +179,7 @@ class DeepSeekEngine:
                 if fields[:1] == ["READY"] and len(fields) == 3:
                     self._ready.put((int(fields[1]), int(fields[2])))
                     continue
-                if not fields or fields[0] not in ("T", "D", "E") or len(fields) < 3:
+                if not fields or fields[0] not in ("T", "D", "E", "R") or len(fields) < 3:
                     raise EngineDied("invalid native DeepSeek IPC output")
                 rid = int(fields[1])
                 if rid == 0:
@@ -158,6 +220,24 @@ class DeepSeekEngine:
     def last_for_thread(self):
         return getattr(self._local, "last", None)
 
+    def _record_timings(self, data, prompt_tokens, original_prompt_tokens, reused=0):
+        fields = TIMING_FIELDS
+        if len(data) == len(TIMING_FIELDS) + len(WALL_TIMING_FIELDS):
+            fields += WALL_TIMING_FIELDS
+        if len(data) != len(fields):
+            raise EngineDied("invalid native DeepSeek timing record")
+        try:
+            last = {name: cast(value) for (name, cast), value in zip(fields, data)}
+            if any(value < 0 or (cast is int and value >= 2**64) or
+                   (cast is float and not math.isfinite(value))
+                   for name, cast in fields for value in (last[name],)):
+                raise ValueError("invalid timing value")
+        except (ValueError, OverflowError):
+            raise EngineDied("invalid native DeepSeek timing record") from None
+        last.update(prompt_tokens=prompt_tokens, original_prompt_tokens=original_prompt_tokens, reused=reused)
+        self._local.last = last
+        self.last = last
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, original_prompt_length=None,
                  prefix_load="", prefix_save=""):
         if type(max_new) is not int or not ids or max_new < 0 or len(ids) + max_new > self.max_context:
@@ -167,6 +247,9 @@ class DeepSeekEngine:
         original_prompt_length = len(ids) if original_prompt_length is None else original_prompt_length
         if type(original_prompt_length) is not int or not 1 <= original_prompt_length <= len(ids):
             raise ValueError("DeepSeek original prompt length must be within its history")
+        cache_prompt = (sampling or {}).get("cache_prompt", True) if isinstance(sampling, (dict, type(None))) else True
+        if type(cache_prompt) is not bool:
+            raise ValueError("DeepSeek cache_prompt must be a boolean")
         sampling = sampling_params(sampling, len(ids))
         prefix_paths = quote(prefix_load), quote(prefix_save)
         embeddings = list(embeddings or [])
@@ -192,12 +275,27 @@ class DeepSeekEngine:
                 self.waiting -= 1
         rid, channel = next(self._ids), queue.Queue()
         terminal, sent, cancelled = False, False, False
+        completed, reused, reuse_seen, failed = False, 0, False, False
+        cached = pending_prefix = None
         self._local.last = None
         with self._lock:
             self._channels[rid] = channel
             self._active[rid] = len(ids)
         temporary = None
         try:
+            # A preceding turn's final thinking-header token is rewritten by the
+            # official template. Checkpoint before it; exact token matching is
+            # still required. Images and explicit backend checkpoint calls bypass
+            # this text-only cache. Publish only after successful native DONE.
+            automatic = self.prefix_cache is not None and cache_prompt and not embeddings and not prefix_load and not prefix_save
+            save_tokens = original_prompt_length - 1
+            if automatic and save_tokens > 0:
+                cached = self.prefix_cache.match(ids[:save_tokens])
+                prefix_load = str(cached[0]) if cached else ""
+                if cached is None or len(cached[1]) < save_tokens:
+                    pending_prefix = self.prefix_cache.directory / f"request-{rid}.prefix"
+                    prefix_save = str(pending_prefix)
+                prefix_paths = quote(prefix_load), quote(prefix_save)
             temporary = tempfile.TemporaryDirectory(prefix="request-", dir=self.dir)
             with contextlib.nullcontext(temporary.name) as directory:
                 image_lines = []
@@ -211,6 +309,15 @@ class DeepSeekEngine:
                           sampling["seed"], sampling["repetition_penalty"], sampling["frequency_penalty"],
                           sampling["presence_penalty"], sampling["penalty_last_n"], len(image_lines),
                           *prefix_paths, original_prompt_length]
+                if automatic and save_tokens > 0:
+                    header += [len(cached[1]) if cached else 0, save_tokens if pending_prefix else 0]
+                def record_reuse(data):
+                    nonlocal reused, reuse_seen
+                    if reuse_seen or len(data) != 1 or not data[0].isdigit() or not 0 <= int(data[0]) <= original_prompt_length:
+                        raise EngineDied("invalid native DeepSeek prefix reuse record")
+                    if automatic and int(data[0]) != (len(cached[1]) if cached else 0):
+                        raise EngineDied("native DeepSeek prefix reuse count mismatch")
+                    reused, reuse_seen = int(data[0]), True
                 self._send(" ".join(map(str, header)) + "\n" + " ".join(map(str, ids)) +
                            ("\n" + "\n".join(image_lines) if image_lines else ""))
                 sent = True
@@ -225,24 +332,19 @@ class DeepSeekEngine:
                             raise EngineDied("native DeepSeek died during a request")
                         yield None
                         continue
-                    if kind == "T":
+                    if kind == "R":
+                        record_reuse(data)
+                    elif kind == "T":
+                        if automatic and not reuse_seen:
+                            raise EngineDied("native DeepSeek did not acknowledge prefix reuse")
                         if not cancelled:
                             yield int(data[0])
                     elif kind == "D":
                         terminal = True
-                        if len(data) != len(TIMING_FIELDS):
-                            raise EngineDied("invalid native DeepSeek timing record")
-                        try:
-                            last = {name: cast(value) for (name, cast), value in zip(TIMING_FIELDS, data)}
-                            if any(value < 0 or (cast is int and value >= 2**64) or
-                                   (cast is float and not math.isfinite(value))
-                                   for name, cast in TIMING_FIELDS for value in (last[name],)):
-                                raise ValueError("invalid timing value")
-                        except (ValueError, OverflowError):
-                            raise EngineDied("invalid native DeepSeek timing record") from None
-                        last.update(prompt_tokens=len(ids), original_prompt_tokens=original_prompt_length, reused=0)
-                        self._local.last = last
-                        self.last = last
+                        if automatic and not reuse_seen:
+                            raise EngineDied("native DeepSeek did not acknowledge prefix reuse")
+                        self._record_timings(data, len(ids), original_prompt_length, reused)
+                        completed = True
                         break
                     elif kind == "E":
                         terminal = True
@@ -252,10 +354,16 @@ class DeepSeekEngine:
                     elif kind == "F":
                         terminal = True
                         raise data
+        except GeneratorExit:
+            raise
+        except BaseException:
+            failed = True
+            raise
         finally:
             try:
                 if sent and not terminal and self.alive():
                     self._send(f"CANCEL {rid}")
+                    cancelled = True
                     deadline = time.monotonic() + 90
                     while True:
                         remaining = deadline - time.monotonic()
@@ -263,18 +371,32 @@ class DeepSeekEngine:
                             self.proc.terminate()
                             raise EngineSilent("native DeepSeek did not acknowledge cancellation")
                         try:
-                            kind, _ = channel.get(timeout=min(0.2, remaining))
+                            kind, data = channel.get(timeout=min(0.2, remaining))
                         except queue.Empty:
                             continue
+                        if kind == "R":
+                            record_reuse(data)
                         if kind in ("D", "E", "F"):
+                            if kind == "D":
+                                self._record_timings(data, len(ids), original_prompt_length, reused)
+                                completed = True
                             break
             finally:
-                with self._lock:
-                    self._channels.pop(rid, None)
-                    self._active.pop(rid, None)
-                if temporary is not None:
-                    temporary.cleanup()
-                self._slots.release()
+                try:
+                    if pending_prefix is not None:
+                        if completed and not failed and not cancel.is_set() and reuse_seen:
+                            self.prefix_cache.publish(pending_prefix, ids[:save_tokens])
+                        else:
+                            self.prefix_cache.discard(pending_prefix)
+                    if cached is not None and failed:
+                        self.prefix_cache.discard(cached[0])
+                finally:
+                    with self._lock:
+                        self._channels.pop(rid, None)
+                        self._active.pop(rid, None)
+                    if temporary is not None:
+                        temporary.cleanup()
+                    self._slots.release()
 
     def close(self):
         if hasattr(self, "proc") and self.alive():

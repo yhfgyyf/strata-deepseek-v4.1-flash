@@ -59,8 +59,18 @@ cudaError_t swiglu_gpu(const float* gate, const float* up, const float* routing_
                        float* out, int width, int tokens, float limit, cudaStream_t stream);
 cudaError_t route_gpu(const float* logits, const float* bias, const float* vl_bias, const uint8_t* image_mask,
                       int* ids, float* weights, int experts, int top_k, int tokens, float scale, cudaStream_t stream);
+struct StateCopyJob {void* destination;const void* source;unsigned bytes,first_block;};
+struct StateCopyBatch {StateCopyJob jobs[96]{};int count=0,blocks=0;};
+cudaError_t state_copy_gpu(const StateCopyBatch& batch,cudaStream_t stream);
+// Lowest ID wins ties; -1 marks a nonfinite or empty row, checked when consumed.
+cudaError_t target_greedy_gpu(const float* logits,int* ids,int vocab,int tokens,cudaStream_t stream);
+cudaError_t route_group_short_gpu(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int tokens,cudaStream_t stream);
+// handoff holds tokens*6 IDs followed by the first invalid slot, or -1.
+cudaError_t route_handoff_short_gpu(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int* handoff,int tokens,cudaStream_t stream);
 cudaError_t route_parallel_gpu(const float* logits, const float* bias, const float* vl_bias, const uint8_t* image_mask,
                               int* ids,float* weights,int experts,int top_k,int tokens,float scale,cudaStream_t stream);
+// Change only while the runtime is drained; exact HC vector candidate.
+void hc_project_vector_set_enabled(bool enabled);
 cudaError_t hc_project_gpu(const float* residual, const float* fn, float* mixes, int hidden, int tokens,
                            float eps, cudaStream_t stream);
 cudaError_t hc_split_gpu(const float* mixes, const float* scale, const float* base, float* pre,

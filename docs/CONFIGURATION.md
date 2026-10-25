@@ -19,7 +19,9 @@ Both [UD-Q2_K_XL](../examples/rtxpro6000.ud-q2-k-xl.json) and [UD-IQ3_XXS](../ex
 | Shared Q8 pair / main MoE fusion | Enabled / mode 2 |
 | Decode Graph segments | Output/router mask 2 |
 | Sampling | Greedy, temperature 0, top_k 1, seed 1234 |
-| Residency | Format groups and online accepted-row adaptation |
+| Residency | Format groups and online Maya accepted-row adaptation |
+| Request/control thread | CPU 8, pinned after runtime workers are created |
+| Text prefix cache | Example configs: 4 completed checkpoints, up to 1024 MiB |
 | Vision | Matching BF16 mmproj; optional |
 
 ## JSON fields
@@ -32,4 +34,8 @@ To reuse calibrated startup assets, provide both `profile` and `heat`. An explic
 
 `host`, `port`, `alias`, `log` and private `api_key` control the frontend. The defaults are localhost, 30011 and `deepseek-v4.1`. Non-loopback binding requires authentication. Paths are relative to the config file, while the supplied first-shard directory spelling is preserved for intentional symlink assemblies.
 
+`prefix_cache_mib` enables exact-token text-prefix reuse in the single request slot. The examples use 1024; an omitted value or 0 disables it, and valid integer budgets are 0–4096 MiB. Up to four completed checkpoints are retained in a private temporary directory, with the matching conversation root kept while other entries follow LRU. The byte/count limits take priority; one pending checkpoint can temporarily use additional space. Image requests bypass automatic caching, and normal shutdown removes the cache. Clients still send the full conversation history.
+
 The launcher sets `STRATA_DS41_BLOCK_SEGMENTS=40`, `STRATA_DS41_BLOCK_HUGE_MIN_PERCENT=100` and `STRATA_DS41_DECODE_SEGMENTS=2`, and defaults `CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX=0`, matching the adopted profile. It does not change system configuration. `--check-config` only checks paths and executable permissions; startup checks generated metadata and full model identity.
+
+It also defaults `STRATA_DS41_ADAPTIVE_POLICY=maya`, `OMP_NUM_THREADS=6` and `OPENBLAS_NUM_THREADS=1`. Set the policy to `legacy` to select the earlier residency policy. The experimental starter requires CPU 8 to be available in the process CPU set.

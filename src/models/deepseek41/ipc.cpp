@@ -1,6 +1,7 @@
 #include "strata/models/deepseek41/runtime.hpp"
 #include "strata/prefill/ledger_scope.hpp"
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <fstream>
@@ -15,7 +16,7 @@ namespace {
 struct ImageRequest { int64_t begin=0; int height=0,width=0; std::string path; };
 struct Request {
     uint64_t id=0;
-    int maximum=0,original_prompt=0;
+    int maximum=0,original_prompt=0,prefix_load_tokens=0,prefix_save_tokens=0;
     bool ced=true,spec=false;
     kernels::SamplerParams sampling;
     std::vector<int> tokens;
@@ -39,10 +40,24 @@ std::shared_ptr<Request> parse(std::istringstream& header,int context) {
          >>std::quoted(r->prefix_load)>>std::quoted(r->prefix_save)>>r->original_prompt))throw std::invalid_argument("DeepSeek IPC GEN header");
     p.temperature=temperature;p.top_p=top_p;p.min_p=min_p;p.penalty_repeat=repeat;
     p.penalty_freq=frequency;p.penalty_present=presence;
-    header>>std::ws;if(!header.eof())throw std::invalid_argument("DeepSeek IPC unexpected GEN fields");
+    r->prefix_load_tokens=r->prefix_load.empty()?0:r->original_prompt;
+    r->prefix_save_tokens=r->prefix_save.empty()?0:r->original_prompt;
+    header>>std::ws;
+    if(!header.eof()){
+        if(!(header>>r->prefix_load_tokens>>r->prefix_save_tokens))throw std::invalid_argument("DeepSeek IPC prefix bounds");
+        header>>std::ws;if(!header.eof())throw std::invalid_argument("DeepSeek IPC unexpected GEN fields");
+    }
     if(!r->id||count<1||count>context||r->maximum<0||r->maximum>context-count||
        r->original_prompt<1||r->original_prompt>count||(ced!=0&&ced!=1)||(spec!=0&&spec!=1)||
        nimages<0||nimages>64)throw std::invalid_argument("DeepSeek IPC GEN bounds");
+    if(r->prefix_load_tokens<0||r->prefix_load_tokens>r->original_prompt||
+       r->prefix_save_tokens<0||r->prefix_save_tokens>r->original_prompt||
+       (r->prefix_load.empty()!=(r->prefix_load_tokens==0))||
+       (r->prefix_save.empty()!=(r->prefix_save_tokens==0))||
+       (r->prefix_save_tokens&&r->prefix_save_tokens<r->prefix_load_tokens))
+        throw std::invalid_argument("DeepSeek IPC prefix bounds");
+    if(nimages&&r->prefix_save_tokens&&r->prefix_save_tokens!=r->original_prompt)
+        throw std::invalid_argument("DeepSeek partial prefix checkpoint does not support images");
     if(!std::isfinite(p.temperature)||p.temperature<0||!std::isfinite(p.top_p)||p.top_p<=0||p.top_p>1||
        !std::isfinite(p.min_p)||p.min_p<0||p.min_p>1||!std::isfinite(p.penalty_repeat)||p.penalty_repeat<=0||
        !std::isfinite(p.penalty_freq)||!std::isfinite(p.penalty_present))throw std::invalid_argument("DeepSeek IPC sampling bounds");
@@ -119,13 +134,24 @@ int serve(Runtime& runtime,const RuntimeOptions& options) {
                         if(!file||file.peek()!=EOF)throw std::runtime_error("DeepSeek image patch file size");
                         images.push_back(runtime.encode_image(patches,image.height,image.width,image.begin));
                     }
+                    using Clock=std::chrono::steady_clock;
+                    const auto prefill_begin=Clock::now();
                     if(!request->prefix_load.empty())session->load_prefix(request->prefix_load,
-                        std::vector<int>(request->tokens.begin(),request->tokens.begin()+request->original_prompt));
-                    auto logits=session->resume_history(request->tokens,request->original_prompt,request->ced,images,request->prefix_save);
+                        std::vector<int>(request->tokens.begin(),request->tokens.begin()+request->prefix_load_tokens));
+                    say("R "+std::to_string(request->id)+" "+std::to_string(session->position()));
+                    const bool split=request->prefix_save_tokens&&request->prefix_save_tokens<request->original_prompt;
+                    if(split){
+                        const std::vector<int> prefix(request->tokens.begin(),request->tokens.begin()+request->prefix_save_tokens);
+                        session->resume_history(prefix,request->prefix_save_tokens,request->ced,images,request->prefix_save);
+                    }
+                    auto logits=session->resume_history(request->tokens,request->original_prompt,request->ced,images,
+                        split?std::string{}:request->prefix_save);
+                    const auto generation_begin=Clock::now();
                     session->generate(logits,request->maximum,eos_ids,request->sampling,request->spec,[&](int token){
                         if(request->cancelled)throw std::runtime_error("DeepSeek request cancelled");
                         say("T "+std::to_string(request->id)+" "+std::to_string(token));
                     });
+                    const auto cleanup_begin=Clock::now();
                     const auto stats=session->stats();
                     std::ostringstream done;done<<std::setprecision(12)<<"D "<<request->id<<' '<<stats.prefill_ms<<' '<<stats.decode_ms<<' '
                         <<stats.proposed_tokens<<' '<<stats.accepted_tokens<<' '<<stats.engram_wait_ms<<' '<<stats.expert_gpu<<' '
@@ -138,7 +164,12 @@ int serve(Runtime& runtime,const RuntimeOptions& options) {
                         <<' '<<stats.phase_restore_submit_ms<<' '<<stats.phase_dynamic_ms;
                     // Release the slot before publishing DONE: the next request may arrive immediately.
                     {std::lock_guard<std::mutex> lock(control);request->session=nullptr;}
-                    session.reset();runtime.save_learned_profile();request->done=true;say(done.str());
+                    session.reset();runtime.save_learned_profile();
+                    const auto cleanup_end=Clock::now();
+                    done<<' '<<std::chrono::duration<double,std::milli>(generation_begin-prefill_begin).count()
+                        <<' '<<std::chrono::duration<double,std::milli>(cleanup_begin-generation_begin).count()
+                        <<' '<<std::chrono::duration<double,std::milli>(cleanup_end-cleanup_begin).count();
+                    request->done=true;say(done.str());
                 }catch(const std::exception& e){
                     {std::lock_guard<std::mutex> lock(control);request->session=nullptr;}
                     session.reset();request->done=true;error(request->id,e.what());
