@@ -16,7 +16,7 @@ UD 两种版本来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**；**GSQ-RCO-IQ
 |---|---|---|---|
 | **UD-IQ3_XXS** | [UD-IQ3_XXS 目录](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [文件列表，选择 UD-IQ3_XXS](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-iq3-xxs.json](examples/rtxpro6000.ud-iq3-xxs.json) |
 | **UD-Q2_K_XL** | [UD-Q2_K_XL 目录](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [文件列表，选择 UD-Q2_K_XL](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-q2-k-xl.json](examples/rtxpro6000.ud-q2-k-xl.json) |
-| **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS＋IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | — | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
+| **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS＋IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | [GSQ-RCO-IQ2_XS＋IQ4_NL Engram](https://www.modelscope.cn/models/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
 
 | 模型 | 总权重（GB） | 主模型，不含 Engram（GB） | Engram（GB） |
 |---|---:|---:|---:|
@@ -38,15 +38,15 @@ UD 两种版本来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**；**GSQ-RCO-IQ
 | 内存 | 192GB DDR5，配置为 4800 MT/s |
 | 存储 | 本地 NVMe SSD，承载 GGUF 和 Engram 读取 |
 | 软件 | Ubuntu Linux、CUDA Toolkit 13.2、NVIDIA 驱动 595.104.02 |
-| 显卡链路 | 10 月 23 日及 26 日测试期间采样为 PCIe 5.0 ×16 |
+| 显卡链路 | 吞吐测试期间采样为 PCIe 5.0 ×16 |
 
 ## 吞吐
 
-**已测最大 prefill：6,261.998 tokens/s**，使用 GSQ-RCO-IQ2_XS、原格式 DSpark、32,768 输入、chunk 32768，测于 2026-10-26。这是无 profiler 的单次正式结果；同配置三次均值为 **6,245.142 tokens/s**。
+**已测最大 prefill：6,261.998 tokens/s**，使用 GSQ-RCO-IQ2_XS、原格式 DSpark、32,768 输入、chunk 32768。这是无 profiler 的单次正式结果；同配置三次均值为 **6,245.142 tokens/s**。
 
-**已测最大 decode：114.472 tokens/s**，来自 2026-10-26 的 GSQ-RCO-IQ2_XS、原格式 DSpark、524,288 输入、chunk 32768、固定完整 512 输出。该无 profiler 结果包含生成与最终自适应迁移收尾／同步；三次均值为 **112.323 tokens/s**。两个峰值分别从正式测量中选取。
+**已测最大 decode：114.472 tokens/s**，来自 GSQ-RCO-IQ2_XS、原格式 DSpark、524,288 输入、chunk 32768、固定完整 512 输出。该无 profiler 结果包含生成与最终自适应迁移收尾／同步；三次均值为 **112.323 tokens/s**。两个峰值分别从正式测量中选取。
 
-以下为 2026-10-23 测试：单请求，每档一次预热＋三次正式测量，贪心解码，固定完整 512 输出。输入由同一 LongSWE token 流重复拼接和截取，用于长度测试。数值为均值 ± 样本标准差。
+以下为较早的 UD-Q2_K_XL 配置测试：单请求，每档一次预热＋三次正式测量，贪心解码，固定完整 512 输出。输入由同一 LongSWE token 流重复拼接和截取，用于长度测试。数值为均值 ± 样本标准差。
 
 | 输入 tokens | Chunk | 常驻专家数 | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|
@@ -57,7 +57,7 @@ UD 两种版本来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**；**GSQ-RCO-IQ
 
 Prefill 按引擎原生 prompt 时间统计；decode 按 DSpark 生成时间统计。测速使用校准后的专家排序与热度，chunk 和常驻专家数见上表。
 
-2026-10-25 的累计优化版本使用同一台机器，LongSWE 一次预热＋三次正式测量，贪心解码，启动常驻 5571 个专家，并保留 Maya 在线自适应。每个请求新建 session，不复用对话前缀；专家热度在连续测量之间保留。
+UD-Q2_K_XL 累计优化版本使用同一台机器，LongSWE 一次预热＋三次正式测量，贪心解码，启动常驻 5571 个专家，并保留 Maya 在线自适应。每个请求新建 session，不复用对话前缀；专家热度在连续测量之间保留。
 
 | 输入 tokens | 输出 tokens | Chunk | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|
@@ -65,7 +65,7 @@ Prefill 按引擎原生 prompt 时间统计；decode 按 DSpark 生成时间统�
 
 本组 prefill 使用原生时间，decode 包含生成与最终自适应迁移收尾，反映该输入和已适应专家缓存下的实测速度。
 
-10 月 26 日的 GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和累计运行时。每档输入独立启动进程，1 次预热＋3 次正式测量；每次新建 session，不复用前缀，贪心解码忽略 EOS 以固定完整 512 输出。Maya 专家热度在同进程的四次请求间延续。
+GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和累计运行时。每档输入独立启动进程，1 次预热＋3 次正式测量；每次新建 session，不复用前缀，贪心解码忽略 EOS 以固定完整 512 输出。Maya 专家热度在同进程的四次请求间延续。
 
 | 输入 tokens | 输出 tokens | Chunk | 启动常驻专家数 | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|---:|

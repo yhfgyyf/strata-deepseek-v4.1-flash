@@ -16,7 +16,7 @@ The UD variants are from **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**; **GSQ-RCO-
 |---|---|---|---|
 | **UD-IQ3_XXS** | [UD-IQ3_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [Model files — select UD-IQ3_XXS](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-iq3-xxs.json](examples/rtxpro6000.ud-iq3-xxs.json) |
 | **UD-Q2_K_XL** | [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [Model files — select UD-Q2_K_XL](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-q2-k-xl.json](examples/rtxpro6000.ud-q2-k-xl.json) |
-| **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS + IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | — | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
+| **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS + IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | [GSQ-RCO-IQ2_XS + IQ4_NL Engram](https://www.modelscope.cn/models/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
 
 | Model | Total weights (GB) | Main model excluding Engram (GB) | Engram (GB) |
 |---|---:|---:|---:|
@@ -38,15 +38,15 @@ Sizes are decimal GB of the main GGUF files and Engram file, excluding DSpark an
 | RAM | 192GB DDR5, configured at 4800 MT/s |
 | Storage | Local NVMe SSD for GGUF and Engram reads |
 | Software | Ubuntu Linux, CUDA Toolkit 13.2, NVIDIA driver 595.104.02 |
-| GPU link | PCIe 5.0 ×16 observed in the October 23 and 26 runs |
+| GPU link | PCIe 5.0 ×16 observed during throughput measurements |
 
 ## Throughput
 
-**Maximum measured prefill: 6,261.998 tokens/s**, at 32,768 input tokens, chunk 32768, with GSQ-RCO-IQ2_XS and original DSpark on October 26. This is one formal, profiler-free run; the corresponding three-run mean is **6,245.142 tokens/s**.
+**Maximum measured prefill: 6,261.998 tokens/s**, at 32,768 input tokens, chunk 32768, with GSQ-RCO-IQ2_XS and original DSpark. This is one formal, profiler-free run; the corresponding three-run mean is **6,245.142 tokens/s**.
 
-**Maximum measured decode: 114.472 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark, 524,288 input tokens, chunk 32768 and exactly 512 output tokens on October 26. This profiler-free run includes generation and final adaptive drain/synchronization; the three-run mean is **112.323 tokens/s**. The peaks are selected independently from the formal runs.
+**Maximum measured decode: 114.472 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark, 524,288 input tokens, chunk 32768 and exactly 512 output tokens. This profiler-free run includes generation and final adaptive drain/synchronization; the three-run mean is **112.323 tokens/s**. The peaks are selected independently from the formal runs.
 
-October 23 measurements below use one request, one warmup plus three formal runs per length, greedy decoding and exactly 512 output tokens. The input is a repeated/truncated LongSWE token stream for length testing. Rates are means ± sample standard deviations.
+The earlier UD-Q2_K_XL measurements below use one request, one warmup plus three formal runs per length, greedy decoding and exactly 512 output tokens. The input is a repeated/truncated LongSWE token stream for length testing. Rates are means ± sample standard deviations.
 
 | Input tokens | Chunk | Resident experts | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|
@@ -57,7 +57,7 @@ October 23 measurements below use one request, one warmup plus three formal runs
 
 Prefill uses native prompt time; decode uses DSpark generation time. The measurements use a calibrated expert ranking and heat, with chunk sizes and resident expert counts shown above.
 
-The October 25 cumulative runtime uses the same machine, one warmup plus three formal LongSWE runs, greedy decoding, 5571 startup resident experts and online Maya residency adaptation. Each request starts a new session without conversation-prefix reuse; expert heat carries across runs.
+The cumulative UD-Q2_K_XL runtime uses the same machine, one warmup plus three formal LongSWE runs, greedy decoding, 5571 startup resident experts and online Maya residency adaptation. Each request starts a new session without conversation-prefix reuse; expert heat carries across runs.
 
 | Input tokens | Output tokens | Chunk | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|
@@ -65,7 +65,7 @@ The October 25 cumulative runtime uses the same machine, one warmup plus three f
 
 These rates use native prefill time and generation plus final adaptive drain for decode. They describe the measured workload and its adapted expert cache.
 
-The October 26 GSQ-RCO-IQ2_XS measurements keep the same machine, original DSpark, 1M context capacity and cumulative runtime. Each input length uses a fresh process, one warmup and three formal runs, a new session per request and no prefix reuse. Greedy decoding ignores EOS to produce exactly 512 output tokens. Maya expert heat carries across the four requests within each process.
+The GSQ-RCO-IQ2_XS measurements keep the same machine, original DSpark, 1M context capacity and cumulative runtime. Each input length uses a fresh process, one warmup and three formal runs, a new session per request and no prefix reuse. Greedy decoding ignores EOS to produce exactly 512 output tokens. Maya expert heat carries across the four requests within each process.
 
 | Input tokens | Output tokens | Chunk | Startup resident experts | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|---:|
