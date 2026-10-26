@@ -1,5 +1,7 @@
 # Build and model setup
 
+For guided installation and service management, run `./start.sh` from the repository root. The browser manager handles a private Python environment, the build and resumable model downloads. See [Launcher and GUI](LAUNCHER.md) or [AI setup](AI_SETUP.md). The manual equivalent remains below.
+
 ## Requirements
 
 Tested on Linux x86-64, GCC 11.4, Python 3.10, CMake 3.27.8, CUDA Toolkit 13.2.51, driver 595.104.02 and one RTX PRO 6000 Blackwell 96GB, with i7-14700KF and 192GB DDR5-4800. Python runtime packages are in [requirements.txt](../requirements.txt).

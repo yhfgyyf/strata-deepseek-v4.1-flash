@@ -71,30 +71,25 @@ GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和�
 ```bash
 git clone https://github.com/yhfgyyf/strata-deepseek-v4.1-flash.git
 cd strata-deepseek-v4.1-flash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc \
-  -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DEEPSEEK41_TESTS=ON
-cmake --build build --parallel 2 --target \
-  strata-deepseek41 strata-deepseek41-experimental strata-deepseek41-inspect
+./start.sh
 ```
 
-选择一个模型配置，填写 model/draft/tokenizer/mmproj 路径，然后用**同一脚本启动**：
+浏览器会打开 **http://127.0.0.1:30010** 管理页。选择模型和存放目录，点**按模型和目录填写路径**保存，再查看准备计划并点**准备并启动**。工具会创建独立 Python 环境、编译引擎、续传缺少的文件并校验 SHA256；也可以直接填写已有文件路径。页面提供启停、进度、日志和聊天入口。
+
+终端或 AI 可使用非交互命令：
 
 ```bash
-cp examples/rtxpro6000.gsq-rco-iq2-xs.json examples/local.json
-# UD 模型改为复制 examples/rtxpro6000.ud-q2-k-xl.json
-# 或 examples/rtxpro6000.ud-iq3-xxs.json。
-# 编辑 /path/to 路径；纯文本可删除 mmproj 字段。
-python tools/deepseek41/serve_experimental.py --config examples/local.json
+./start.sh configure --model GSQ-RCO-IQ2_XS --data-dir /path/to/models
+./start.sh plan --json
+./start.sh launch --yes --json
+# 后续：./start.sh start | status | stop | logs
 ```
+
+默认从 ModelScope 下载；可明确指定 `--source huggingface` 或 `--source hf-mirror`，都必须通过同一组摘要校验。管理页仅监听本机，下载中断保留断点，启停仅针对本工具创建的服务。API 与原有 Web 聊天默认使用 **30011** 端口。原 `serve_experimental.py --config FILE` 入口继续可用。
 
 支持 **OpenAI Chat Completions / Responses** 和 **Anthropic Messages** 兼容接口。
 
-[安装说明](docs/INSTALL.md) · [配置说明](docs/CONFIGURATION.md) · [API 示例](docs/API.md)。
+[启动与图形管理](docs/LAUNCHER.md) · [AI 自主部署](docs/AI_SETUP.md) · [手动安装](docs/INSTALL.md) · [配置说明](docs/CONFIGURATION.md) · [API 示例](docs/API.md)。
 
 ## 相对上游 Strata 的 DeepSeek 专项适配
 
@@ -108,5 +103,6 @@ python tools/deepseek41/serve_experimental.py --config examples/local.json
 | CUDA Graph | 已采用的 decode 输出/router 分段、共享专家提前提交与精简路由交接，保留动态路由与迁移边界。 |
 | 专家与 Engram | 格式分组内的 Maya 在线自适应、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
 | API 与图片 | DeepSeek 消息/tokenizer、thinking/工具编码、文本前缀自动检查点、取消后恢复、图片预处理及原生视觉编码器。 |
+| 安装与管理 | CLI 与浏览器共用配置、断点下载与摘要校验、本机构建、服务进程身份记录、健康检查、启停和日志。 |
 
 专家缓存、异构卸载、推测解码、图片输入和兼容 API 已存在于上游 Strata；此处说明的是 DeepSeek 专项实现与接入。[第三方声明](docs/THIRD_PARTY.md) · [MIT 许可证](LICENSE)。

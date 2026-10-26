@@ -31,6 +31,7 @@ build*/
 .DS_Store
 /examples/local*.json
 /examples/runtime/
+*.json.bak.*
 
 # Token-ID selection maps; contain no model weights or request tokens.
 !/data/draft-input-vocab-114801.bin

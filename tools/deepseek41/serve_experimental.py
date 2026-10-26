@@ -95,6 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--check-config", action="store_true", help="check local paths without starting inference")
+    parser.add_argument("--ready-file", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.check_config:
@@ -135,6 +136,10 @@ def main():
         service.set_shared({"max_tokens": 32768})
         service.api_key = cfg.get("api_key", "")
         server = serve(service, cfg.get("host", "127.0.0.1"), cfg.get("port", 30011))
+        if args.ready_file:
+            from tools.deepseek41.download_assets import private_json
+            private_json(args.ready_file, {"pid": os.getpid(), "host": server.server_address[0],
+                                           "port": server.server_address[1]})
         print("DeepSeek ready on {}:{}".format(*server.server_address[:2]), flush=True)
         while not stop.wait(1):
             if not engine.alive():

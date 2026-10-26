@@ -71,30 +71,25 @@ The tested target is Linux x86-64, Python 3.10+, a C++20 compiler, CMake 3.24+, 
 ```bash
 git clone https://github.com/yhfgyyf/strata-deepseek-v4.1-flash.git
 cd strata-deepseek-v4.1-flash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc \
-  -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DEEPSEEK41_TESTS=ON
-cmake --build build --parallel 2 --target \
-  strata-deepseek41 strata-deepseek41-experimental strata-deepseek41-inspect
+./start.sh
 ```
 
-Choose a model's configuration, edit its model/draft/tokenizer/mmproj paths, and run **the same script**:
+The local management page opens at **http://127.0.0.1:30010**. Choose a model and storage directory, click **按模型和目录填写路径** to save its paths, inspect the download plan, then select **准备并启动** (Prepare and start). It creates a private Python environment, builds the engine, resumes missing downloads and verifies SHA256. Existing files can be selected in the same page. Start/stop, progress, logs and the chat link remain available there.
+
+For a terminal or AI agent:
 
 ```bash
-cp examples/rtxpro6000.gsq-rco-iq2-xs.json examples/local.json
-# For a UD model, copy examples/rtxpro6000.ud-q2-k-xl.json
-# or examples/rtxpro6000.ud-iq3-xxs.json instead.
-# Edit the /path/to entries. Remove mmproj for text-only service.
-python tools/deepseek41/serve_experimental.py --config examples/local.json
+./start.sh configure --model GSQ-RCO-IQ2_XS --data-dir /path/to/models
+./start.sh plan --json
+./start.sh launch --yes --json
+# Later: ./start.sh start | status | stop | logs
 ```
+
+Downloads default to ModelScope; `--source huggingface` and `--source hf-mirror` are explicit alternatives with the same required hashes. The manager stays on localhost, preserves interrupted downloads and controls only its own service. The API and existing web chat use port **30011** by default. The original `serve_experimental.py --config FILE` entry remains supported.
 
 Supports **OpenAI Chat Completions / Responses** and **Anthropic Messages** compatible APIs.
 
-[Installation](docs/INSTALL.md) · [configuration](docs/CONFIGURATION.md) · [API examples](docs/API.md).
+[Launcher and GUI](docs/LAUNCHER.md) · [AI setup](docs/AI_SETUP.md) · [manual installation](docs/INSTALL.md) · [configuration](docs/CONFIGURATION.md) · [API examples](docs/API.md).
 
 ## DeepSeek-specific additions to Strata
 
@@ -108,5 +103,6 @@ Supports **OpenAI Chat Completions / Responses** and **Anthropic Messages** comp
 | CUDA Graphs | Accepted decode output/router segments, shared-expert early submission and compact route handoff, with dynamic routing and migration boundaries retained. |
 | Residency and Engram | Online Maya adaptation within format groups, expert lookahead, SSD row cache, asynchronous I/O and 40-segment block-pinned memory with 100% huge-page admission. |
 | APIs and images | DeepSeek message/tokenizer integration, thinking/tool encoding, automatic text-prefix checkpoints, cancellation recovery, image preprocessing and native vision encoder. |
+| Setup and management | Shared CLI/browser configuration, resumable verified downloads, local build, identified service processes, health checks, start/stop and logs. |
 
 Expert caching, offload, speculation, image input and compatible APIs already exist in upstream Strata. These are DeepSeek-specific implementations and integrations. [third-party notices](docs/THIRD_PARTY.md) · [MIT license](LICENSE).

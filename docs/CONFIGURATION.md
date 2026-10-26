@@ -1,5 +1,7 @@
 # Runtime configuration
 
+`./start.sh` manages `config.local.json` by default. Select an existing file with `./start.sh gui --config FILE`; the same `--config FILE` works for `plan`, `install`, `start`, `status`, `stop`, `logs` and `doctor`. The management page can edit DeepSeek paths and settings while its service is stopped. It preserves unedited fields and creates a timestamped private backup before saving. The chat page's inherited generic `/config` editor is separate and is not used for DeepSeek configuration. See [management commands](LAUNCHER.md).
+
 [UD-Q2_K_XL](../examples/rtxpro6000.ud-q2-k-xl.json), [UD-IQ3_XXS](../examples/rtxpro6000.ud-iq3-xxs.json) and [GSQ-RCO-IQ2_XS](../examples/rtxpro6000.gsq-rco-iq2-xs.json) use `tools/deepseek41/serve_experimental.py --config FILE`. `rtxpro6000.experimental.json` is a compatibility copy of the Q2_K_XL example.
 
 ## Fixed starter settings
