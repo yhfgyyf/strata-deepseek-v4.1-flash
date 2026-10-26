@@ -165,6 +165,10 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     if (o.hot_auto) { options.hot_front=capacity; options.hot_back=0; }
     if (options.hot_front > UINT64_MAX-options.hot_back) throw std::overflow_error("DeepSeek expert budget overflow");
     const uint64_t wanted_hot=o.arithmetic==Arithmetic::f32?0:options.hot_front+options.hot_back;
+    std::cerr<<"DeepSeek capacity free_after_weights="<<free<<" main_dense="<<weights->bytes()
+             <<" draft="<<(draft_weights?draft_weights->bytes():0)<<" vision="<<(vision_weights?vision_weights->bytes():0)
+             <<" ring="<<ring_bytes<<" work="<<o.work<<" state="<<o.state<<" headroom="<<o.gpu_headroom
+             <<" expert_budget="<<wanted_hot<<" auto="<<o.hot_auto<<'\n';
     if (wanted_hot > capacity)
         throw std::runtime_error("DeepSeek GPU weight/ring/work/state/headroom budgets do not fit");
     experts=std::make_unique<GgufExperts>(model,options,upload.value);
@@ -200,10 +204,10 @@ void matrix_product(const Matrix& m,const float* x,float* out,int tokens,cublasH
     if (!ldy) ldy=n;
     if (tokens < 1 || n < 1 || k < 1 || ldx < k || ldy < n ||
         weight_offset + uint64_t(n)*k > m.elements) throw std::invalid_argument("DeepSeek matrix view");
-    if(m.type!=0&&m.type!=30&&m.type!=8&&m.type!=14)throw std::invalid_argument("DeepSeek matrix storage type");
-    const int block=m.type==14?256:32;
-    if((m.type==8||m.type==14) && (weight_offset%block||k%block||tokens>8))throw std::invalid_argument("DeepSeek packed matrix requires a short row window");
-    const uint64_t byte_offset=m.type==14?weight_offset/256*210:m.type==8?weight_offset/32*34:weight_offset*(m.type==0?4:2);
+    if(m.type!=0&&m.type!=30&&m.type!=8&&m.type!=13&&m.type!=14)throw std::invalid_argument("DeepSeek matrix storage type");
+    const int block=(m.type==13||m.type==14)?256:32;
+    if((m.type==8||m.type==13||m.type==14) && (weight_offset%block||k%block||tokens>8))throw std::invalid_argument("DeepSeek packed matrix requires a short row window");
+    const uint64_t byte_offset=m.type==13?weight_offset/256*176:m.type==14?weight_offset/256*210:m.type==8?weight_offset/32*34:weight_offset*(m.type==0?4:2);
     const void* weights=static_cast<const uint8_t*>(m.data)+byte_offset;
     // Match single-token and short verification reductions; strided grouped output uses the BLAS contract.
     if (verify_batch && tokens>1 && tokens<=8) {
@@ -246,9 +250,9 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
     if(m.type==30 && tokens>8 && m.cols>w.max_bf_input_cols)throw std::invalid_argument("DeepSeek matrix exceeds BF16 input scratch");
     if(m.packed_bf16) {
         const int n=rows?rows:m.rows,k=m.cols;
-        const int block=m.type==14?256:32,block_bytes=m.type==14?210:34;
+        const int block=(m.type==13||m.type==14)?256:32,block_bytes=m.type==13?176:m.type==14?210:34;
         if(!ldx)ldx=k;if(!ldy)ldy=n;
-        if((m.type!=8&&m.type!=14) || n<1 || k<1 || k>8192 || k%block || weight_offset%block || weight_offset+uint64_t(n)*k>m.elements || ldx<k || ldy<n)
+        if((m.type!=8&&m.type!=13&&m.type!=14) || n<1 || k<1 || k>8192 || k%block || weight_offset%block || weight_offset+uint64_t(n)*k>m.elements || ldx<k || ldy<n)
             throw std::invalid_argument("DeepSeek packed projection view");
         const auto* packed=static_cast<const uint8_t*>(m.data)+weight_offset/block*block_bytes;
         if(tokens<=8) {
@@ -276,9 +280,9 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
         }
         return;
     }
-    if((m.type==8||m.type==14)&&tokens>8){
+    if((m.type==8||m.type==13||m.type==14)&&tokens>8){
         const int n=rows?rows:m.rows,k=m.cols;
-        const int block=m.type==14?256:32,block_bytes=m.type==14?210:34;
+        const int block=(m.type==13||m.type==14)?256:32,block_bytes=m.type==13?176:m.type==14?210:34;
         if(!ldx)ldx=k;
         if(!ldy)ldy=n;
         if(weight_offset%block||k%block)throw std::invalid_argument("DeepSeek packed matrix offset");

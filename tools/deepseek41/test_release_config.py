@@ -62,6 +62,25 @@ class ReleaseConfigTests(unittest.TestCase):
         self.cfg["hot_bytes"] = 64 << 30
         self.assertEqual(self.load()["hot_bytes"], 64 << 30)
 
+    def test_automatic_hot_budget_is_accepted(self):
+        self.cfg["hot_bytes"] = "auto"
+        self.assertEqual(self.load()["hot_bytes"], "auto")
+
+    def test_text_only_api_can_keep_vision_weights_loaded(self):
+        self.cfg.update(mmproj="asset", vision=False)
+        result = self.load()
+        self.assertFalse(result["vision"])
+        self.assertEqual(result["mmproj"], str(self.root / "asset"))
+        for value in (0, 1, "false", None):
+            self.cfg["vision"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "vision"):
+                self.load()
+
+    def test_vision_api_requires_vision_weights(self):
+        self.cfg["vision"] = True
+        with self.assertRaisesRegex(ValueError, "vision"):
+            self.load()
+
     def test_split_model_symlink_directory_is_preserved(self):
         link = self.root / "first-shard.gguf"
         link.symlink_to(self.root / "asset")
@@ -87,7 +106,8 @@ class ReleaseConfigTests(unittest.TestCase):
                 self.cfg["model"] = name
 
     def test_both_variants_need_only_original_model_assets(self):
-        for variant, hot_bytes in VARIANTS.items():
+        for variant in ("UD-IQ3_XXS", "UD-Q2_K_XL"):
+            hot_bytes = VARIANTS[variant]
             with self.subTest(variant=variant):
                 self.variant_config(variant)
                 cfg = self.load()
@@ -136,7 +156,7 @@ class ReleaseConfigTests(unittest.TestCase):
         self.assertFalse((self.root / "runtime").exists())
 
     def test_prepare_hashes_original_files_and_reuses_only_same_identity(self):
-        for variant in VARIANTS:
+        for variant in ("UD-IQ3_XXS", "UD-Q2_K_XL"):
             with self.subTest(variant=variant):
                 self.variant_config(variant)
                 self.cfg["runtime_dir"] = "runtime/" + variant

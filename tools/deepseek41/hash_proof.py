@@ -37,14 +37,33 @@ Q2K_XL_SHA256 = [
 ]
 
 
-def approved_files(paths, main_q2_k_xl=False, sidecars_1017=False):
+GSQ_RCO_SHA256 = [
+    "4c65307992ab586c527ca1f6f64062aa96a33b23c02b7fed103f45f75e854798",
+    "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e",
+    "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240",
+    "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf",
+    "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a",
+]
+GSQ_ENGRAM_FILE = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+
+
+def approved_files(paths, main_q2_k_xl=False, sidecars_1017=False, main_gsq_rco=False):
+    if main_q2_k_xl and main_gsq_rco:
+        raise ValueError("choose one main model variant")
     result = []
-    expected = {**EXPECTED, **(SIDECARS_1017 if sidecars_1017 else {})}
+    expected = {**EXPECTED, **(SIDECARS_1017 if sidecars_1017 or main_gsq_rco else {})}
     for kind, path in paths.items():
         if not path:
             continue
         match = re.fullmatch(r"(.*)-(\d{5})-of-(\d{5})\.gguf", path.name)
-        if kind == "main" and match:
+        if kind == "main" and main_gsq_rco:
+            if not match or int(match[3]) != 4 or not 1 <= int(match[2]) <= 4:
+                raise ValueError("GSQ-RCO requires four main shards and external Engram")
+            result.extend(
+                ("main." + str(i), path.with_name(f"{match[1]}-{i:05d}-of-00004.gguf"), digest)
+                for i, digest in enumerate(GSQ_RCO_SHA256[:4], 1))
+            result.append(("engram", path.with_name(GSQ_ENGRAM_FILE), GSQ_RCO_SHA256[4]))
+        elif kind == "main" and match:
             if int(match[3]) != 7 or not 1 <= int(match[2]) <= 7:
                 raise ValueError("unapproved DeepSeek main shard count")
             result.extend(
@@ -64,9 +83,9 @@ def identity(path):
     return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
 
 
-def verify(paths, output, main_q2_k_xl=False, sidecars_1017=False):
+def verify(paths, output, main_q2_k_xl=False, sidecars_1017=False, main_gsq_rco=False):
     records = []
-    for kind, path, expected in approved_files(paths, main_q2_k_xl, sidecars_1017):
+    for kind, path, expected in approved_files(paths, main_q2_k_xl, sidecars_1017, main_gsq_rco):
         before = identity(path)
         digest = hashlib.sha256()
         started = time.monotonic()
@@ -95,8 +114,11 @@ if __name__ == "__main__":
     parser.add_argument("--sidecars-1017", action="store_true",
                         help="verify the 1017 Q8_0 DSpark and BF16 vision checkpoint")
     parser.add_argument("--main-q2-k-xl", action="store_true", help="verify the approved 1017 UD-Q2_K_XL seven-shard checkpoint")
+    parser.add_argument("--main-gsq-rco", action="store_true", help="verify the approved 1017 GSQ-RCO IQ2_XS four-shard checkpoint and its external Engram")
     args = parser.parse_args()
     if args.quantized_draft:
+        if args.main_gsq_rco:
+            parser.error("--main-gsq-rco requires the original 1017 draft")
         if not args.draft:
             parser.error("--quantized-draft requires --draft")
         EXPECTED["draft"] = "9269e73cbd04c493d2510d3513da85429441949f6f10ed8130392ae0de2a949b"
@@ -105,4 +127,5 @@ if __name__ == "__main__":
             parser.error("--sidecars-1017 conflicts with --quantized-draft")
         EXPECTED["draft"] = "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"
         EXPECTED["vision"] = "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"
-    verify({kind: getattr(args, kind) for kind in EXPECTED}, args.output, args.main_q2_k_xl)
+    verify({kind: getattr(args, kind) for kind in EXPECTED}, args.output, args.main_q2_k_xl,
+           args.sidecars_1017, args.main_gsq_rco)

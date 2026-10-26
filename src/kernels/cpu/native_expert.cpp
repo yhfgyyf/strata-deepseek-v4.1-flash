@@ -113,7 +113,8 @@ bool native_enable_bf16_gu(NativeFmt& f, std::string& err) {
 
 bool native_enable_bf16_down(NativeFmt& f, std::string& err) {
     if ((f.d_type != GGML_TYPE_Q2_K && f.d_type != GGML_TYPE_Q3_K && f.d_type != GGML_TYPE_MXFP4 &&
-         f.d_type != GGML_TYPE_IQ3_S && f.d_type != GGML_TYPE_IQ2_XXS && f.d_type != GGML_TYPE_IQ3_XXS) ||
+         f.d_type != GGML_TYPE_IQ3_S && f.d_type != GGML_TYPE_IQ2_XXS && f.d_type != GGML_TYPE_IQ3_XXS &&
+         f.d_type != GGML_TYPE_IQ2_XS && f.d_type != GGML_TYPE_IQ2_S) ||
         f.n_ff < 1 || !ggml_get_type_traits((ggml_type) f.d_type)->to_float ||
         !traits(GGML_TYPE_BF16)->from_float || !traits(GGML_TYPE_BF16)->vec_dot) {
         err = "native BF16 down requires a supported DeepSeek expert";

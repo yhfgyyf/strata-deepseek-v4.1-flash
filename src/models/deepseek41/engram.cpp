@@ -38,15 +38,15 @@ struct NativeAio {
 EngramHashSpec read_spec(const Model& m) {
     EngramHashSpec s;
     auto copy = [&](const char* key, auto& out) {
-        const auto* v = m.file().get(std::string("deepseek41.") + key);
-        if (!v || v->items.size() != out.size()) throw std::runtime_error("Engram metadata array");
-        for (size_t i = 0; i < out.size(); ++i) out[i] = v->items[i].u;
+        const auto values=m.engram_hash_values(key);
+        if (values.size() != out.size()) throw std::runtime_error("Engram metadata array");
+        for (size_t i = 0; i < out.size(); ++i) out[i] = values[i];
     };
-    copy(m.ple_engram()?"ple.layer_multipliers":"engram.multipliers", s.multipliers);
-    copy(m.ple_engram()?"ple.head_vocab_sizes":"engram.primes", s.primes);
-    copy(m.ple_engram()?"ple.head_offsets":"engram.offsets", s.offsets);
+    copy("multipliers", s.multipliers);
+    copy("primes", s.primes);
+    copy("offsets", s.offsets);
     if(m.ple_engram())for(int h=24;h<48;++h)s.offsets[h]-=384006168;
-    s.pad = m.token_map().at(m.file().get("deepseek41.engram.pad_token_id")->u);
+    s.pad = m.token_map().at(m.engram_pad_token());
     return s;
 }
 struct PageEntry {
@@ -171,7 +171,7 @@ struct EngramReader::Impl {
          uint64_t budget, size_t limit,bool continuous,bool native_aio,uint64_t packed_row_bytes)
         : offsets(o), rows(r), row_bytes(packed_row_bytes), cache(budget), queue_limit(limit),continuous_reads(continuous) {
         if (!limit) throw std::invalid_argument("Engram zero queue limit");
-        if(row_bytes!=272 && row_bytes!=210 && row_bytes!=176)throw std::invalid_argument("Engram packed row bytes");
+        if(row_bytes!=272 && row_bytes!=210 && row_bytes!=176 && row_bytes!=144)throw std::invalid_argument("Engram packed row bytes");
         std::string error;
         if (!file.open(path, error,native_aio)) throw std::runtime_error("Engram direct read: " + error);
         if(native_aio){

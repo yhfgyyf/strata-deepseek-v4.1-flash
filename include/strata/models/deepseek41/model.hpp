@@ -74,10 +74,13 @@ public:
     static std::unique_ptr<Model> operator_weights_only(const std::string& path);
     bool main_complete() const { return main_complete_; }
     bool ple_engram() const { return ple_engram_; }
+    bool gsq_rco_1017() const { return gsq_rco_1017_; }
     bool draft_shares_embeddings() const { return draft_shared_embeddings_; }
     std::string checkpoint_identity() const;
-    uint32_t engram_type() const { return ple_engram_ ? tensor("per_layer_token_embd.weight").info->type : 8; }
-    uint64_t engram_row_bytes() const { return ple_engram_ ? tensor("per_layer_token_embd.weight").row_bytes : 272; }
+    uint32_t engram_type() const { return tensor(ple_engram_ ? "per_layer_token_embd.weight" : "blk.1.engram_embd.weight").info->type; }
+    uint64_t engram_row_bytes() const { return tensor(ple_engram_ ? "per_layer_token_embd.weight" : "blk.1.engram_embd.weight").row_bytes; }
+    std::vector<uint64_t> engram_hash_values(const std::string& key) const;
+    uint64_t engram_pad_token() const;
     bool has_vision() const { return vision_ != nullptr; }
     bool has_draft() const { return draft_ != nullptr; }
     const Geometry& geometry() const { return geometry_; }
@@ -102,9 +105,9 @@ private:
     void validate_file(const GgufFile& file, Views& views, bool draft, bool vision);
     Geometry geometry_;
     std::array<LayerOwnership, 40> ownership_ = layer_ownership();
-    std::unique_ptr<GgufFile> main_, draft_, vision_;
+    std::unique_ptr<GgufFile> main_, draft_, vision_, external_engram_;
     std::vector<std::unique_ptr<GgufFile>> main_shards_;
-    bool main_complete_ = true, ple_engram_ = false, draft_shared_embeddings_ = false;
+    bool main_complete_ = true, ple_engram_ = false, gsq_rco_1017_ = false, draft_shared_embeddings_ = false;
     Views tensors_, draft_tensors_, vision_tensors_;
     std::vector<int32_t> token_map_;
 };

@@ -692,8 +692,10 @@ bool expert_mixed_short_down_tokens_selected(uint32_t type,int tokens,int groups
     struct Choice {uint32_t type;uint64_t masks[7];};
     static constexpr Choice choices[]={
         {16,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
+        {17,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
         {18,{33554430ull,131054ull,8190ull,1022ull,510ull,126ull,118ull}},
         {21,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
+        {22,{33554430ull,131070ull,8190ull,1022ull,510ull,126ull,126ull}},
     };
     for(const auto& c:choices)if(c.type==type)return (c.masks[tokens-2]&(uint64_t(1)<<groups))!=0;
     return false;
@@ -702,7 +704,7 @@ bool expert_mixed_projection_warp_selected(uint32_t type,int rows,int cols,int t
     // Real-weight median ABBA passed all IQ shapes; MXFP4 Down regressed.
     if(tokens<1||tokens>8)return false;
     return pair?(rows==2304&&cols==5120&&(type==16||type==17||type==18||type==22)):
-                (rows==5120&&cols==2304&&(type==16||type==18||type==21));
+                (rows==5120&&cols==2304&&(type==16||type==17||type==18||type==21||type==22));
 }
 bool expert_mixed_short_tokens_selected(uint32_t gu,int tokens,int groups) {
     // Preserve N1. IQ2_XS N5/group1 gained only3.60%; retain its old path.
@@ -714,7 +716,10 @@ bool expert_mixed_short_warp_selected(uint32_t gu,uint32_t down,int groups) {
     // The original48 vector bins retain priority. These seven real format pairs
     // cover every independently checked group size1..48 in the new path.
     const bool pair=(gu==16&&(down==16||down==18))||(gu==17&&down==39)||
-        (gu==18&&(down==18||down==21))||(gu==22&&(down==21||down==39));
+        (gu==18&&(down==18||down==21))||(gu==22&&(down==21||down==39))||
+        (gu==16&&(down==17||down==22))||
+        (gu==17&&(down==16||down==17||down==18||down==22))||
+        (gu==22&&(down==16||down==17||down==22));
     return pair&&groups>=1&&groups<=48&&!expert_mixed_short_vector_selected(gu,down,groups);
 }
 bool expert_mixed_short_vector_selected(uint32_t gu,uint32_t down,int groups) {
@@ -746,6 +751,22 @@ bool expert_mixed_short_selected(uint32_t gu,uint32_t down,int tokens,int groups
         const int minimum=(uniform?c.uniform:c.mixed)[tokens-1];
         return minimum&&groups>=minimum;
     }
+    // GSQ bins pass every measured layout in fixed/rotating real-weight ABBA.
+    // Use exact group masks; do not extrapolate rejected or unmeasured bins.
+    struct GsqChoice {uint32_t gu,down;uint64_t uniform[8],mixed[8];};
+    static constexpr GsqChoice gsq_choices[]={
+        {16,17,{124ull,124ull,126ull,124ull,124ull,124ull,124ull,124ull},{0ull,8190ull,524286ull,33554422ull,2147483646ull,137438953470ull,8796093022202ull,562949953421306ull}},
+        {16,22,{124ull,124ull,126ull,124ull,124ull,124ull,124ull,120ull},{0ull,8190ull,524286ull,33554426ull,2147483646ull,137438953470ull,8796093022202ull,562949953421306ull}},
+        {17,16,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,126ull},{0ull,8190ull,524286ull,33554426ull,2147483646ull,137438953470ull,8246337208314ull,562949953421310ull}},
+        {17,17,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,126ull},{0ull,8190ull,524286ull,33554430ull,2147483646ull,137438953470ull,8796093022202ull,562949953421310ull}},
+        {17,18,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,118ull},{0ull,8190ull,524286ull,33554430ull,2147483646ull,137438953470ull,8796093022202ull,562949953421310ull}},
+        {17,22,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,126ull},{0ull,8190ull,524286ull,33554426ull,2147483646ull,137438953470ull,8796093022202ull,562949953421294ull}},
+        {22,16,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,124ull},{0ull,8190ull,524286ull,33554426ull,2147483642ull,137438953466ull,8796093022202ull,562949953421306ull}},
+        {22,17,{126ull,126ull,110ull,124ull,124ull,124ull,124ull,124ull},{0ull,8190ull,524286ull,33554430ull,2147483646ull,137438953466ull,8796067856378ull,562949953421306ull}},
+        {22,22,{126ull,124ull,126ull,124ull,124ull,124ull,124ull,124ull},{0ull,8190ull,524286ull,33554426ull,2147483646ull,137438953466ull,8796093022202ull,562949953421306ull}},
+    };
+    for(const auto& c:gsq_choices)if(c.gu==gu&&c.down==down)
+        return ((uniform?c.uniform:c.mixed)[tokens-1]&(uint64_t(1)<<groups))!=0;
     return false;
 }
 bool expert_mixed_type(uint32_t type){

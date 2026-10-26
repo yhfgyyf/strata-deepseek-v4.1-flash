@@ -14,12 +14,13 @@ namespace strata::models::deepseek41 { int serve(Runtime&, const RuntimeOptions&
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "Usage: strata-deepseek41-experimental MODEL DRAFT VISION_OR_DASH PROOF PROFILE HEAT COSTS INPUT_VOCAB OUTPUT_VOCAB [HOT_BYTES]\n";
+            std::cout << "Usage: strata-deepseek41-experimental MODEL DRAFT VISION_OR_DASH PROOF PROFILE HEAT COSTS INPUT_VOCAB OUTPUT_VOCAB [HOT_BYTES|auto]\n";
             return 0;
         }
         if (argc != 10 && argc != 11) throw std::invalid_argument("expected nine asset paths and optional hot bytes; use --help");
         const std::string model = argv[1];
-        const bool iq = strata::gguf_split_paths(model).size() == 7;
+        const auto shards = strata::gguf_split_paths(model).size();
+        const bool iq = shards == 7 || shards == 4;
         const std::string vision = std::string(argv[3]) == "-" ? "" : argv[3];
         d::RuntimeOptions o;
         o.integrity_file = argv[4];
@@ -32,10 +33,14 @@ int main(int argc, char** argv) {
         o.hot_front = iq ? 64ull << 30 : 72596914176ull; o.hot_back = 0; o.hot_auto = false;
         if (argc == 11) {
             const std::string value = argv[10];
-            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
-                throw std::invalid_argument("HOT_BYTES must be a positive integer");
-            o.hot_front = std::stoull(value);
-            if (!o.hot_front) throw std::invalid_argument("HOT_BYTES must be positive");
+            if (value == "auto") {
+                o.hot_auto = true;
+            } else {
+                if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::invalid_argument("HOT_BYTES must be a positive integer or auto");
+                o.hot_front = std::stoull(value);
+                if (!o.hot_front) throw std::invalid_argument("HOT_BYTES must be positive");
+            }
         }
         o.work = 6720ull << 20; o.state = 1024ull << 20; o.gpu_headroom = 700ull << 20;
         o.profile = argv[5];
@@ -76,6 +81,7 @@ int main(int argc, char** argv) {
         if (sched_setaffinity(0, sizeof(request_cpu), &request_cpu))
             throw std::runtime_error("pin request/control thread CPU8");
         using Access = d::PrefetchBlockBenchmark;
+        o.hot_front = Access::rt(*runtime).options.hot_front;
         const auto& host = Access::rt(*runtime).experts->host_memory_info();
         host.write(std::cerr); std::cerr << '\n';
         const unsigned huge_minimum = d::block_huge_min_percent();
@@ -93,7 +99,7 @@ int main(int argc, char** argv) {
         if (free < (700ull << 20)) throw std::runtime_error("GPU free-memory guard");
         std::cerr << "Experimental service: context=1048576 chunk=8192 work_mib=6720 vision=F32 block_pinned=40 huge_min_percent="
                   << huge_minimum << " draft=5 adaptive=1 shared_pair=1 main_fusion=2 scores_fast=1 dq_fast=1 mixed_fast=" << iq
-                  << " iq_short_batch=" << iq << " hot_bytes=" << o.hot_front << " free=" << free << '\n';
+                  << " iq_short_batch=" << iq << " hot_bytes=" << o.hot_front << " hot_auto=" << o.hot_auto << " free=" << free << '\n';
         std::cerr << "C37 serve: request_cpu=8 shared_early_submit=" << o.shared_early_submit
                   << " route_compact_handoff=" << o.route_compact_handoff << '\n';
         const int result = d::serve(*runtime, o);

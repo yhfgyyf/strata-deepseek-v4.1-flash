@@ -1506,8 +1506,8 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         return;
     }
 #if !defined(__HIPCC__)
-    constexpr int type=std::is_same_v<F,SmallTraits<Q80Block,8>>?8:std::is_same_v<F,Q6KTraits>?14:-1;
-    if constexpr(type==8||type==14)if(g_multi_warp&&native_mmvq_multi_warp_selected(type,n_in,n_out,NCOLS,false)) {
+    constexpr int type=std::is_same_v<F,SmallTraits<Q80Block,8>>?8:std::is_same_v<F,Q5KTraits>?13:std::is_same_v<F,Q6KTraits>?14:-1;
+    if constexpr(type==8||type==13||type==14)if(g_multi_warp&&native_mmvq_multi_warp_selected(type,n_in,n_out,NCOLS,false)) {
         if constexpr(std::is_same_v<F,Q6KTraits>)q6_row_warp(weights,x_q8_1,y,n_in,n_out,NCOLS,s);
         else native_mmvq_multi_two_warp_kernel<F,NCOLS><<<unsigned((n_out+1)/2),dim3(32,4),0,s>>>(w,x,y,n_in,n_out);
         return;
@@ -2403,6 +2403,9 @@ bool native_mmvq_multi_warp_selected(int type,int ni,int no,int n,bool pair) {
     // Passed independent fixed and eight-matrix rotation checks; other bins keep33.
     struct Choice {int type,ni,no;bool pair;unsigned mask;};
     static constexpr Choice choices[]={
+        {13,1280,32768,false,32u},
+        {13,8192,5120,false,352u},
+        {13,2304,5120,false,104u},
         {8,1280,32768,false,4u},
         {8,8192,5120,false,32u},
         {14,2304,5120,false,64u},

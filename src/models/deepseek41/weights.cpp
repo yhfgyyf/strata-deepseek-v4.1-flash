@@ -24,11 +24,13 @@ bool packed_projection(const std::string& name) {
 }
 int storage_type(const TensorView& v,const std::string& name,Arithmetic arithmetic,const Model& model,bool draft,bool dense_q8) {
     if(draft&&(v.info->type==2||(v.info->type==8&&model.expert(0,0,true).type!=39)))return v.info->type;
-    if(dense_q8 && arithmetic==Arithmetic::production && (v.info->type==8||v.info->type==14) && packed_projection(name))return v.info->type;
+    if(dense_q8 && arithmetic==Arithmetic::production && (v.info->type==8||v.info->type==13||v.info->type==14) && packed_projection(name))return v.info->type;
     // Read the large vocabulary heads in native Q8_0/Q6_K with FP32 activations. This preserves their weights and
     // avoids a 2.65 GB FP32 copy; the fixed five-row DSpark head and Markov tables use the same contract.
-    if((v.info->type==8||v.info->type==14) && (name=="output.weight" || (draft &&
+    if((v.info->type==8||v.info->type==13||v.info->type==14) && (name=="output.weight" || (draft &&
         (name=="token_embd.weight"||name=="markov_w1.weight"||name=="markov_w2.weight"))))return v.info->type;
+    if(name.find("engram_q.weight")!=std::string::npos || name.find("engram_k.weight")!=std::string::npos ||
+       name.find("ffn_gate_inp.weight")!=std::string::npos)return 0;
     const bool compressor_f32=name.find("attn_compressor_")!=std::string::npos &&
         model.ownership()[std::stoi(name.substr(4))].compression>1;
     if (arithmetic == Arithmetic::f32 || v.info->type == 0 || v.info->shape.size()==1 || name == "output.weight" || compressor_f32) return 0;
@@ -47,16 +49,16 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
         const auto& t = *v.info;
         if (!include_weight(v.role)) continue;
         Matrix m; m.type = storage_type(v,t.name,arithmetic,model,draft,dense_q8); m.cols = t.shape[0]; m.elements = 1;
-        m.packed_bf16=(dense_q8&&(m.type==8||m.type==14)&&packed_projection(t.name))||(draft&&(m.type==2||m.type==8)&&!vocab_weight(t.name));
+        m.packed_bf16=(dense_q8&&(m.type==8||m.type==13||m.type==14)&&packed_projection(t.name))||(draft&&(m.type==2||m.type==8)&&!vocab_weight(t.name));
         for (auto dim : t.shape) m.elements *= dim;
         m.rows = m.elements / m.cols;
         const auto* selected=(t.name=="token_embd.weight"||t.name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
         if(selected&&vocab_weight(t.name)){
-            if((m.type!=8&&m.type!=2&&m.type!=14&&!(t.type==30&&(m.type==30||m.type==0)))||
+            if((m.type!=8&&m.type!=2&&m.type!=13&&m.type!=14&&!(t.type==30&&(m.type==30||m.type==0)))||
                t.shape.size()!=2||m.rows!=129280)throw std::runtime_error("draft vocabulary tensor layout");
             m.rows=selected->size();m.elements=m.rows*m.cols;
         }
-        bytes += aligned(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));matrices_.emplace(t.name,m);
+        bytes += aligned(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==13?m.elements/256*176:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));matrices_.emplace(t.name,m);
     }
     arena_ = std::make_unique<core::DeviceArena>(bytes);
     core::DeviceArena temporary(128ull << 20);
@@ -65,7 +67,7 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
     int last_layer = -1;
     for (auto& [name,m] : matrices_) {
         const auto& v = model.tensor(name,draft,vision);
-        m.data=arena_->alloc(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));
+        m.data=arena_->alloc(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==13?m.elements/256*176:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));
         const auto* selected_bf16=(name=="token_embd.weight"||name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
         if(selected_bf16&&vocab_weight(name)&&v.info->type==30){
             const uint64_t row_bytes=uint64_t(m.cols)*2,rows_per_chunk=(32ull<<20)/row_bytes;
@@ -87,10 +89,10 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
             }
             continue;
         }
-        if(m.type==8||m.type==2||m.type==14){
+        if(m.type==8||m.type==2||m.type==13||m.type==14){
             const auto* selected=(name=="token_embd.weight"||name=="markov_w1.weight")?draft_input_vocab:draft_vocab;
             if(selected&&vocab_weight(name)){
-                const uint64_t row_bytes=m.type==14?m.cols/256*210:m.cols/32*(m.type==2?18:34),rows_per_chunk=(32ull<<20)/row_bytes;
+                const uint64_t row_bytes=m.type==13?m.cols/256*176:m.type==14?m.cols/256*210:m.cols/32*(m.type==2?18:34),rows_per_chunk=(32ull<<20)/row_bytes;
                 std::vector<uint8_t> rows(rows_per_chunk*row_bytes);
                 for(uint64_t begin=0;begin<selected->size();begin+=rows_per_chunk){
                     const auto count=std::min<uint64_t>(rows_per_chunk,selected->size()-begin);

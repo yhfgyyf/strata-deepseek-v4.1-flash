@@ -5,7 +5,8 @@ import struct
 
 from tools.deepseek41 import hash_proof
 
-VARIANTS = {"UD-IQ3_XXS": 67636039680, "UD-Q2_K_XL": 68664950784}
+GSQ_VARIANT = "GSQ-RCO-IQ2_XS"
+VARIANTS = {"UD-IQ3_XXS": 67636039680, "UD-Q2_K_XL": 68664950784, GSQ_VARIANT: "auto"}
 TOKENIZER_SHA256 = "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
 
 
@@ -53,9 +54,10 @@ def prepare(cfg):
         paths = {"main": Path(cfg["model"]), "draft": Path(cfg["draft"]),
                  "vision": Path(cfg["mmproj"]) if cfg.get("mmproj") else None}
         q2 = cfg["variant"] == "UD-Q2_K_XL"
-        approved = hash_proof.approved_files(paths, q2, sidecars_1017=True)
+        gsq = cfg["variant"] == GSQ_VARIANT
+        approved = hash_proof.approved_files(paths, q2, sidecars_1017=True, main_gsq_rco=gsq)
         output = Path(cfg["integrity"])
         if not proof_matches(output, approved):
             output.parent.mkdir(parents=True, exist_ok=True)
             print("Verifying all GGUF files with full SHA-256. The first launch can take several minutes.", flush=True)
-            hash_proof.verify(paths, output, q2, sidecars_1017=True)
+            hash_proof.verify(paths, output, q2, sidecars_1017=True, main_gsq_rco=gsq)

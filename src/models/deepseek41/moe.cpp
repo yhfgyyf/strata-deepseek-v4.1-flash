@@ -39,7 +39,9 @@ bool Runtime::Impl::compact_routes(int tokens,int phase) const {
 void Runtime::Impl::route(int layer,int tokens,Workspace& w,int phase) {
     matmul(tensor(layer,"ffn_gate_inp"),w.x,w.branch,tokens,w,0,0,0,0,false);
     const auto& bias=weights->at("blk."+std::to_string(layer)+".exp_probs_b.bias");
-    const auto& vl=weights->at("blk."+std::to_string(layer)+".exp_probs_b_vl.bias");
+    // GSQ-RCO's text checkpoint does not contain the image routing bias.
+    // Session rejects image inputs for that checkpoint before reaching routing.
+    const auto& vl=model.gsq_rco_1017()?bias:weights->at("blk."+std::to_string(layer)+".exp_probs_b_vl.bias");
     gpu_check((options.parallel_router?route_parallel_gpu:route_gpu)(w.branch,static_cast<const float*>(bias.data),static_cast<const float*>(vl.data),w.image,
         w.route_ids,w.route_weights,384,6,tokens,1.5f,stream.value));
     if(compact_routes(tokens,phase)){

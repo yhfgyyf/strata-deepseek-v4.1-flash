@@ -1,6 +1,7 @@
 #include "strata/models/deepseek41/model.hpp"
 #include "strata/models/deepseek41/iq3xxs_digests.hpp"
 #include "strata/models/deepseek41/q2k_xl_digests.hpp"
+#include "strata/models/deepseek41/gsq_rco_1017_digests.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,24 @@ namespace strata::models::deepseek41 {
 namespace {
 const MetaValue& meta(const GgufFile& f, const std::string& key) {
     const auto* v = f.get(key);
+    // ISTA's 1017 converter uses the checkpoint's names for these quantities.
+    if (!v && f.get("deepseek41.engram.file")) {
+        static const std::map<std::string,std::string> aliases{
+            {"attention.indexer.candidate_source_layer","attention.candidate_source_layer_id"},
+            {"attention.indexer.candidate_top_k_blocks","attention.candidate_topk_blocks"},
+            {"attention.indexer.candidate_block_size","attention.candidate_block_size"},
+            {"attention.kv_source_layers","kv_source_layer_ids"},
+            {"attention.index_source_layers","index_source_layer_ids"},
+            {"engram.layers","engram.layer_ids"}, {"engram.ngram_size","engram_max_ngram_size"},
+            {"engram.head_count","engram_n_heads"}, {"engram.head_dim","engram_head_dim"},
+            {"engram.compressed_vocab_size","engram_compressed_vocab_size"},
+            {"engram.pad_token_id","engram_pad_token_id"}};
+        const std::string prefix="deepseek41.";
+        if (key.rfind(prefix,0)==0) {
+            const auto it=aliases.find(key.substr(prefix.size()));
+            if(it!=aliases.end())v=f.get(prefix+it->second);
+        }
+    }
     if (!v) throw std::runtime_error("DeepSeek: missing metadata " + key);
     return *v;
 }
@@ -169,6 +188,14 @@ void Model::open_main(const std::string& path, bool operator_only) {
     const auto paths = gguf_split_paths(path, !operator_only);
     main_ = std::make_unique<GgufFile>(paths.front());
     ple_engram_ = main_->get("deepseek41.ple.layers") != nullptr;
+    gsq_rco_1017_ = main_->get("deepseek41.engram.file") != nullptr;
+    if(gsq_rco_1017_) {
+        if(ple_engram_ || paths.size()!=4 || meta(*main_,"deepseek41.engram.file").s!=gsq_rco_1017_engram_file)
+            throw std::runtime_error("DeepSeek: unsupported GSQ-RCO shard/Engram layout");
+        external_engram_=std::make_unique<GgufFile>((std::filesystem::path(path).parent_path()/gsq_rco_1017_engram_file).string());
+        if(meta(*main_,"deepseek41.engram.source").s!=meta(*external_engram_,"deepseek41.engram.source").s)
+            throw std::runtime_error("DeepSeek: GSQ-RCO Engram source mismatch");
+    }
     if (paths.size() > 1) {
         equal(*main_, "split.no", 0);
         equal(*main_, "split.count", paths.size());
@@ -201,7 +228,7 @@ void Model::load_main() {
         throw std::runtime_error("DeepSeek: main GGUF must have architecture deepseek41");
     const std::string p = "deepseek41.";
     for (const auto& [key, expected] : std::vector<std::pair<std::string, uint64_t>>{
-        {"block_count",40}, {"embedding_length",5120}, {"embedding_length_out",20480},
+        {"block_count",40}, {"embedding_length",5120},
         {"expert_count",384}, {"expert_used_count",6}, {"expert_feed_forward_length",2304},
         {"expert_shared_count",1}, {"expert_gating_func",4}, {"attention.head_count",64},
         {"attention.head_count_kv",1}, {"attention.key_length",512}, {"attention.value_length",512},
@@ -212,6 +239,9 @@ void Model::load_main() {
         {"attention.indexer.candidate_top_k_blocks",2048}, {"attention.indexer.candidate_block_size",8},
         {"hyper_connection.count",4}, {"hyper_connection.sinkhorn_iterations",20},
         {"engram.compressed_vocab_size",99092}}) equal(f, p + key, expected);
+    if(!gsq_rco_1017_)equal(f,p+"embedding_length_out",20480);
+    else if(integer(f,p+"embedding_length")*integer(f,p+"hyper_connection.count")!=20480)
+        throw std::runtime_error("DeepSeek: unsupported mHC output width");
     equal(f, p + (ple_engram_ ? "ple.ngram_size" : "engram.ngram_size"), 4);
     equal(f, p + (ple_engram_ ? "ple.heads_per_ngram" : "engram.head_count"), 8);
     equal(f, p + (ple_engram_ ? "embedding_length_per_layer_input" : "engram.head_dim"), 256);
@@ -221,13 +251,13 @@ void Model::load_main() {
     std::vector<uint64_t> ratios;
     for (const auto& l : ownership_) ratios.push_back(l.compression);
     const auto actual_ratios = array(f, p + "attention.compress_ratios");
-    if (ple_engram_ && actual_ratios.size() == 43) ratios.insert(ratios.end(), 3, 0);
+    if ((ple_engram_ || gsq_rco_1017_) && actual_ratios.size() == 43) ratios.insert(ratios.end(), 3, 0);
     if (actual_ratios != ratios) throw std::runtime_error("DeepSeek: unsupported compression ratios");
     // The PLE converter's DeepSeek41 graph explicitly omits per-head Q norm
     // and implements single-pass mHC (llama.cpp PR30817, b72050d).
     const auto* qnorm = f.get(p + "attention.q_norm");
     const auto* single = f.get(p + "hyper_connection.single_pass");
-    if ((!ple_engram_ && (!qnorm || !single)) || (qnorm && qnorm->u) || (single && !single->u) ||
+    if ((!ple_engram_ && !gsq_rco_1017_ && (!qnorm || !single)) || (qnorm && qnorm->u) || (single && !single->u) ||
         !meta(f, p + "expert_weights_norm").u)
         throw std::runtime_error("DeepSeek: unsupported norm or mHC semantics");
     geometry_.norm_eps = number(f, p + "attention.layer_norm_rms_epsilon");
@@ -265,9 +295,9 @@ void Model::load_main() {
     }
     for (int32_t id : token_map_)
         if (id < 0 || id >= 99092) throw std::runtime_error("DeepSeek: Engram token map out of range");
-    const auto multipliers = array(f, p + (ple_engram_ ? "ple.layer_multipliers" : "engram.multipliers"));
-    const auto primes = array(f, p + (ple_engram_ ? "ple.head_vocab_sizes" : "engram.primes"));
-    const auto offsets = array(f, p + (ple_engram_ ? "ple.head_offsets" : "engram.offsets"));
+    const auto multipliers = engram_hash_values("multipliers");
+    const auto primes = engram_hash_values("primes");
+    const auto offsets = engram_hash_values("offsets");
     const auto rows = ple_engram_ ? std::vector<uint64_t>{384006168,384016682} : array(f, p + "engram.num_embeddings");
     if (multipliers.size() != 8 || primes.size() != 48 || offsets.size() != 48 || rows.size() != 2)
         throw std::runtime_error("DeepSeek: invalid Engram hash metadata lengths");
@@ -290,6 +320,22 @@ void Model::load_main() {
         throw std::runtime_error("DeepSeek: Engram padding token out of range");
 }
 
+std::vector<uint64_t> Model::engram_hash_values(const std::string& key) const {
+    if(key!="multipliers" && key!="primes" && key!="offsets")
+        throw std::invalid_argument("DeepSeek: invalid Engram hash key");
+    if(gsq_rco_1017_) {
+        const auto& v=tensor("engram_"+key+".weight");
+        if(v.info->type!=27 || v.bytes%8)throw std::runtime_error("DeepSeek: Engram I64 hash layout");
+        std::vector<uint64_t> values(v.bytes/8);
+        std::memcpy(values.data(),v.data,v.bytes);
+        for(auto value:values)if(value>INT64_MAX)throw std::runtime_error("DeepSeek: negative Engram hash value");
+        return values;
+    }
+    const std::string suffix=ple_engram_?(key=="multipliers"?"ple.layer_multipliers":key=="primes"?"ple.head_vocab_sizes":"ple.head_offsets"):"engram."+key;
+    return array(*main_,"deepseek41."+suffix);
+}
+uint64_t Model::engram_pad_token() const { return integer(*main_,"deepseek41.engram.pad_token_id"); }
+
 void Model::load_draft() {
     const auto& f = *draft_;
     if (meta(f, "general.architecture").s != "dflash")
@@ -306,11 +352,11 @@ void Model::load_draft() {
     if (draft_shared_embeddings_) {
         // The 1017 converter writes attention-input layer IDs directly and
         // omits the target's shared embedding/head. Both formats capture 37..39.
-        if (!main_ || !ple_engram_)
+        if (!main_ || (!ple_engram_ && !gsq_rco_1017_))
             throw std::runtime_error("DeepSeek: 1017 DSpark requires its PLE main model");
     } else {
         array_equal(f, p + "target_layers", {38,39,40});
-        if (main_ && ple_engram_)
+        if (main_ && (ple_engram_ || gsq_rco_1017_))
             throw std::runtime_error("DeepSeek: legacy DSpark does not match the PLE main model");
     }
     validate_file(f, draft_tensors_, true, false);
@@ -321,7 +367,7 @@ void Model::load_vision() {
     const auto& projector = meta(f, "clip.projector_type").s;
     if (meta(f, "general.architecture").s != "clip" || (projector != "deepseek4v" && projector != "deepseek41v"))
         throw std::runtime_error("DeepSeek: unsupported vision encoder");
-    if (main_ && (projector == "deepseek41v") != ple_engram_)
+    if (main_ && (projector == "deepseek41v") != (ple_engram_ || gsq_rco_1017_))
         throw std::runtime_error("DeepSeek: vision checkpoint does not match the main model");
     for (const auto& [key, expected] : std::vector<std::pair<std::string, uint64_t>>{
         {"block_count",32}, {"embedding_length",1024}, {"feed_forward_length",2816},
@@ -331,6 +377,11 @@ void Model::load_vision() {
 }
 std::string Model::checkpoint_identity() const {
     if (!main_ || !main_complete_) throw std::runtime_error("DeepSeek: complete main checkpoint required");
+    if(gsq_rco_1017_) {
+        std::string identity;
+        for(const auto* sha:gsq_rco_1017_sha256){if(!identity.empty())identity+=':';identity+=sha;}
+        return identity;
+    }
     if (!ple_engram_) return "11f46543370256ef616b6e458b6950e148625b5f8b7545173d124445d3393c53";
     std::string identity;
     for (const auto* sha : engram_type()==13 ? q2k_xl_sha256 : iq3xxs_sha256) {
@@ -379,13 +430,14 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
         if (!main_shards_.empty() &&
             views.size() + (main_complete_ ? 0 : 1) != integer(f, "split.tensors.count"))
             throw std::runtime_error("DeepSeek: incomplete split tensor directory");
+        if(external_engram_)collect(*external_engram_);
     }
     std::set<std::string> consumed;
     auto require = [&](const std::string& name, std::vector<uint64_t> shape, uint32_t type,
                        TensorRole role = TensorRole::dense) {
         auto it = views.find(name);
         if (it == views.end()) throw std::runtime_error("DeepSeek: missing tensor " + name);
-        const bool bf16_dense = !draft && !vision && ple_engram_ && type==8 && it->second.info->type==30 &&
+        const bool bf16_dense = !draft && !vision && (ple_engram_ || gsq_rco_1017_) && type==8 && it->second.info->type==30 &&
             (name.find("indexer.")!=std::string::npos || name.find("attn_compressor_")!=std::string::npos);
         const bool bf16_markov = draft && draft_shared_embeddings_ && type==8 && it->second.info->type==30 &&
             (name=="markov_w1.weight" || name=="markov_w2.weight");
@@ -396,7 +448,13 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
              suffix=="ffn_gate_shexp.weight" || suffix=="ffn_up_shexp.weight" || suffix=="ffn_down_shexp.weight")));
         const bool q5_engram=!draft && !vision && ple_engram_ && type==14 && it->second.info->type==13 &&
             name=="per_layer_token_embd.weight";
-        if (it->second.info->shape != shape || (it->second.info->type != type && !bf16_dense && !bf16_markov && !q6_dense && !q5_engram && !(draft&&type==8&&it->second.info->type==2)))
+        const bool q5_dense=gsq_rco_1017_ && !vision && type==8 && it->second.info->type==13 &&
+            (name=="output.weight" || name=="token_embd.weight" || (!draft &&
+             (suffix=="attn_output_a.weight" || suffix=="attn_output_b.weight" || suffix=="attn_q_b.weight" ||
+              suffix=="ffn_gate_shexp.weight" || suffix=="ffn_up_shexp.weight" || suffix=="ffn_down_shexp.weight" || suffix=="engram_wkv.weight")));
+        const bool bf16_gate=gsq_rco_1017_ && !draft && !vision && type==0 && it->second.info->type==30 &&
+            (suffix=="ffn_gate_inp.weight" || suffix=="engram_q.weight" || suffix=="engram_k.weight");
+        if (it->second.info->shape != shape || (it->second.info->type != type && !bf16_dense && !bf16_markov && !q6_dense && !q5_engram && !q5_dense && !bf16_gate && !(draft&&type==8&&it->second.info->type==2)))
             throw std::runtime_error("DeepSeek: tensor shape/type mismatch: " + name);
         it->second.role = role;
         consumed.insert(name);
@@ -427,28 +485,28 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
         const int layers = draft ? 3 : 40;
         const uint64_t experts = draft ? 128 : 384;
         for (int l = 0; l < layers; ++l) {
-            const uint32_t type = draft || ple_engram_ ? views.at(block(l,"ffn_gate_exps.weight")).info->type : l < 14 ? 11 : 10;
+            const uint32_t type = draft || ple_engram_ || gsq_rco_1017_ ? views.at(block(l,"ffn_gate_exps.weight")).info->type : l < 14 ? 11 : 10;
             if(draft&&type!=39&&type!=10&&type!=11&&type!=42)throw std::runtime_error("DeepSeek: unsupported draft expert type");
             if(!draft && type!=10 && type!=11 && type!=16 && type!=17 && type!=18 && type!=21 && type!=22)
                 throw std::runtime_error("DeepSeek: unsupported main Gate/Up type");
             for (const char* name : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
                 require(block(l, name), {5120,2304,experts}, type, TensorRole::routed_expert);
-            const uint32_t down_type = !draft && ple_engram_ ? views.at(block(l,"ffn_down_exps.weight")).info->type : type;
-            if(!draft && down_type!=10 && down_type!=11 && down_type!=16 && down_type!=18 && down_type!=21 && down_type!=39)
+            const uint32_t down_type = !draft && (ple_engram_ || gsq_rco_1017_) ? views.at(block(l,"ffn_down_exps.weight")).info->type : type;
+            if(!draft && down_type!=10 && down_type!=11 && down_type!=16 && down_type!=17 && down_type!=18 && down_type!=21 && down_type!=22 && down_type!=39)
                 throw std::runtime_error("DeepSeek: unsupported main Down type");
             require(block(l, "ffn_down_exps.weight"), {2304,5120,experts}, down_type, TensorRole::routed_expert);
             require(block(l, "attn_sinks.weight"), {64}, 0);
             require(block(l, "attn_kv_a_norm.weight"), {512}, 0);
             require(block(l, "attn_q_a_norm.weight"), {1280}, 0);
             require(block(l, "attn_kv.weight"), {5120,512}, 8);
-            require(block(l, "attn_output_a.weight"), {4096,8192}, 8);
+            require(block(l, "attn_output_a.weight"), !draft && gsq_rco_1017_ ? std::vector<uint64_t>{4096,1024,8} : std::vector<uint64_t>{4096,8192}, 8);
             require(block(l, "attn_output_b.weight"), {8192,5120}, 8);
             require(block(l, "attn_q_a.weight"), {5120,1280}, 8);
             require(block(l, "attn_q_b.weight"), {1280,32768}, 8);
             require(block(l, "attn_norm.weight"), {5120}, 0);
             require(block(l, "ffn_norm.weight"), {5120}, 0);
             require(block(l, "exp_probs_b.bias"), {experts}, 0);
-            if (!draft) require(block(l, "exp_probs_b_vl.bias"), {experts}, 0);
+            if (!draft && !gsq_rco_1017_) require(block(l, "exp_probs_b_vl.bias"), {experts}, 0);
             require(block(l, "ffn_gate_inp.weight"), {5120,experts}, 0);
             for (const char* name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
                 require(block(l, name), {5120,2304}, 8);
@@ -476,7 +534,7 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
                     require(block(l, "engram_gate.weight"), {5120,4}, 0);
                     require(block(l, "engram_kv.weight"), {6144,25600}, 14);
                 } else {
-                require(block(l, "engram_embd.weight"), {256,l == 1 ? 384006168u : 384016682u}, 8, TensorRole::engram);
+                require(block(l, "engram_embd.weight"), {256,l == 1 ? 384006168u : 384016682u}, gsq_rco_1017_?20:8, TensorRole::engram);
                 require(block(l, "engram_q.weight"), {5120,4}, 0);
                 require(block(l, "engram_k.weight"), {5120,4}, 0);
                 require(block(l, "engram_wkv.weight"), {6144,25600}, 8);
@@ -492,6 +550,11 @@ void Model::validate_file(const GgufFile& f, Views& views, bool draft, bool visi
                 else if (views.count("per_layer_token_embd.weight"))
                     throw std::runtime_error("DeepSeek: missing shard is not the Engram table");
             } else require("engram_token_map.weight", {129280}, 26, TensorRole::token_map);
+            if(gsq_rco_1017_) {
+                require("engram_primes.weight",{24,2},27,TensorRole::token_map);
+                require("engram_offsets.weight",{24,2},27,TensorRole::token_map);
+                require("engram_multipliers.weight",{4,2},27,TensorRole::token_map);
+            }
         }
         else {
             require("enc.output_norm.weight", {5120}, 0, TensorRole::draft_head);
@@ -542,6 +605,7 @@ void Model::write_inventory(std::ostream& out) const {
     bool first_file = true;
     std::vector<std::pair<const GgufFile*,const Views*>> files{{main_.get(),&tensors_}};
     for(const auto& shard:main_shards_)files.push_back({shard.get(),&tensors_});
+    files.push_back({external_engram_.get(),&tensors_});
     files.push_back({draft_.get(),&draft_tensors_});
     files.push_back({vision_.get(),&vision_tensors_});
     for (const auto& [f,collection] : files) {

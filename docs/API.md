@@ -40,7 +40,7 @@ Use `thinking.type=disabled` to disable thinking, or enable thinking with a budg
 
 ## Images
 
-Image input uses each endpoint's image-content format and requires the `mmproj` model path in the configuration.
+Image input uses each endpoint's image-content format and requires a UD model with the `mmproj` path and vision enabled in the configuration. GSQ-RCO currently supports text input only.
 
 ## Conversation prefixes
 

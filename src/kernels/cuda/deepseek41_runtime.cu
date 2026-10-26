@@ -12,6 +12,15 @@ __device__ float embedding_value(const void* weights, int type, int64_t offset) 
         return __half2float(*reinterpret_cast<const __half*>(block))*(int((block[2+offset%16]>>((offset%32)/16*4))&15)-8);}
     if(type==8){const auto* block=static_cast<const uint8_t*>(weights)+(offset/32)*34;
         return __half2float(*reinterpret_cast<const __half*>(block))*reinterpret_cast<const int8_t*>(block+2)[offset%32];}
+    if(type==13){
+        const auto* p=static_cast<const uint8_t*>(weights)+(offset/256)*176;const auto* scales=p+4;
+        const int group=(offset%256)/32,lane=offset%32;
+        const int scale=group<4?scales[group]&63:(scales[group+4]&15)|((scales[group-4]>>6)<<4);
+        const int minimum=group<4?scales[group+4]&63:(scales[group+4]>>4)|((scales[group]>>6)<<4);
+        const int code=((p[48+(group/2)*32+lane]>>((group&1)*4))&15)|(((p[16+lane]>>group)&1)<<4);
+        return (__half2float(*reinterpret_cast<const __half*>(p))*scale)*code-
+               __half2float(*reinterpret_cast<const __half*>(p+2))*minimum;
+    }
     return type == 0 ? static_cast<const float*>(weights)[offset] :
         __bfloat162float(static_cast<const __nv_bfloat16*>(weights)[offset]);
 }
@@ -139,7 +148,7 @@ int grid(int64_t n) { return static_cast<int>(std::min<int64_t>((n + 255) / 256,
 }
 cudaError_t init_residual_gpu(const void* w,int type,const int* ids,const float* pixels,const uint8_t* image,
                              float* h,float* pre,int tokens,cudaStream_t s) {
-    if ((type != 0 && type != 30 && type != 8 && type != 2) || tokens < 1) return cudaErrorInvalidValue;
+    if ((type != 0 && type != 30 && type != 8 && type != 2 && type != 13) || tokens < 1) return cudaErrorInvalidValue;
     init_kernel<<<grid(int64_t(tokens)*20480),256,0,s>>>(w,type,ids,pixels,image,h,pre,tokens); return cudaGetLastError();
 }
 cudaError_t draft_markov_row_gpu(const void* weights,int type,const int* previous,const int* inverse,

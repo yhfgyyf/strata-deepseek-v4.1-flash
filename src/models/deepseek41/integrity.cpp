@@ -1,10 +1,12 @@
 #include "strata/models/deepseek41/integrity.hpp"
 #include "strata/models/deepseek41/iq3xxs_digests.hpp"
 #include "strata/models/deepseek41/q2k_xl_digests.hpp"
+#include "strata/models/deepseek41/gsq_rco_1017_digests.hpp"
 #include "strata/artifact/gguf_split.hpp"
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
 #include <stdexcept>
 #include <sstream>
 #include <sys/stat.h>
@@ -50,6 +52,12 @@ void require_integrity(const std::string& proof, const std::string& kind, const 
     }
     if(kind=="main"){
         const auto shards=gguf_split_paths(path);
+        if(shards.size()==4) {
+            for(size_t i=0;i<shards.size();++i)
+                require_file(proof,"main."+std::to_string(i+1),shards[i],gsq_rco_1017_sha256[i]);
+            require_file(proof,"engram",(std::filesystem::path(path).parent_path()/gsq_rco_1017_engram_file).string(),gsq_rco_1017_sha256[4]);
+            return;
+        }
         if(shards.size()>1){
             if(shards.size()!=iq3xxs_sha256.size())throw std::invalid_argument("DeepSeek unapproved main shard count");
             // Both checkpoints have the same metadata-only first shard. Select a

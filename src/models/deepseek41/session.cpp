@@ -174,6 +174,7 @@ Session::Session(Runtime::Impl& runtime):impl_(std::make_unique<Impl>(runtime)){
 Session::~Session(){if(impl_){std::lock_guard<std::mutex> lock(impl_->runtime.execution_mutex);--impl_->runtime.active_sessions;impl_.reset();}}
 std::vector<float> Session::prefill(const std::vector<int>& ids,bool ced,const std::vector<ImageEmbedding>& images) {
     auto& s=*impl_;auto& r=s.runtime;
+    if(r.model.gsq_rco_1017()&&!images.empty())throw std::invalid_argument("DeepSeek: GSQ-RCO checkpoint lacks image routing biases");
     prefill::LedgerScope trace(r.options.trace,"ds41.prefill");
     if(ids.empty()||ids.size()>static_cast<size_t>(r.options.context)||s.transaction_active)throw std::invalid_argument("DeepSeek prompt/context/transaction");
     if(s.position!=s.original_prompt || s.tokens.size()>ids.size() || !std::equal(s.tokens.begin(),s.tokens.end(),ids.begin()))

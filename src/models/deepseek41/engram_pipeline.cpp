@@ -6,8 +6,8 @@ namespace strata::models::deepseek41 {
 namespace {std::atomic<bool> engram_short_enabled{true};}
 void engram_short_set_enabled(bool value){engram_short_enabled.store(value);}
 EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type)
-    : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==13?176:packed_type==14?210:272) {
-    if(packed_type!=8&&packed_type!=13&&packed_type!=14)throw std::invalid_argument("Engram pipeline type");
+    : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==20?144:packed_type==13?176:packed_type==14?210:272) {
+    if(packed_type!=8&&packed_type!=13&&packed_type!=14&&packed_type!=20)throw std::invalid_argument("Engram pipeline type");
     host_=std::make_unique<Pinned>(uint64_t(work.max_tokens)*24*row_bytes_,false,huge_pinned);
     if (!work.engram_input || !host_->pinned) throw std::runtime_error("Engram pipeline requires private BF16/pinned scratch");
     std::cerr<<"DeepSeek host_memory engram ";host_->info.write(std::cerr);std::cerr<<'\n';

@@ -473,7 +473,9 @@ int main(int argc,char** argv) {
         need(cublasCreate(&blas)==CUBLAS_STATUS_SUCCESS&&cublasSetStream(blas,stream.value)==CUBLAS_STATUS_SUCCESS&&
              cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH)==CUBLAS_STATUS_SUCCESS,"BLAS setup");
         struct Cleanup{cublasHandle_t handle;~Cleanup(){cublasDestroy(handle);}}cleanup{blas};
-        need(!d::expert_mixed_fast_enabled(),"candidate must not be default before timing acceptance");
+        // The cumulative runtime already adopted mixed kernels. This harness
+        // still invokes the independent expansion path explicitly as its control.
+        d::expert_mixed_fast_set_enabled(false);
         const std::string mode=argv[2];
         if(mode=="synthetic")synthetic(stream.value);
         else if(mode=="integration")integration(*d::Model::operator_weights_only(argv[1]),blas,stream.value);

@@ -148,13 +148,13 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     auto round=[&](float* x,uint64_t n){if(c.arithmetic==Arithmetic::production)gpu_check(round_bf16_gpu(x,n,stream));};
     auto matmul=[&](const Matrix& m,const float* x,float* out,int tokens,Workspace& work,int rows=0,int64_t ldx=0,
                    int64_t ldy=0,uint64_t offset=0,bool round_output=true){
-        if(c.batch_projection&&tokens==draft_tokens&&(m.type==0||m.type==2||m.type==8||m.type==14||m.type==30)){
-            const int n=rows?rows:m.rows,k=m.cols;const bool packed=m.type==2||m.type==8||m.type==14;
-            const int block=m.type==14?256:32;
+        if(c.batch_projection&&tokens==draft_tokens&&(m.type==0||m.type==2||m.type==8||m.type==13||m.type==14||m.type==30)){
+            const int n=rows?rows:m.rows,k=m.cols;const bool packed=m.type==2||m.type==8||m.type==13||m.type==14;
+            const int block=(m.type==13||m.type==14)?256:32;
             if(!ldx)ldx=k;if(!ldy)ldy=n;
             if(n<1||k<1||(packed&&(offset%block||k%block))||offset+uint64_t(n)*k>m.elements)
                 throw std::invalid_argument("DSpark draft matrix view");
-            const uint64_t bytes=packed?offset/block*(m.type==14?210:m.type==2?18:34):offset*(m.type==0?4:2);
+            const uint64_t bytes=packed?offset/block*(m.type==13?176:m.type==14?210:m.type==2?18:34):offset*(m.type==0?4:2);
             gpu_check((tokens==5?draft_projection5_gpu:draft_projection7_gpu)(static_cast<const uint8_t*>(m.data)+bytes,m.type,x,out,n,k,ldx,ldy,
                 m.packed_bf16&&c.arithmetic==Arithmetic::production,round_output&&c.arithmetic==Arithmetic::production,stream));
             if(c.stats)++c.stats->draft_batch_projection_calls;

@@ -217,6 +217,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 4;
         return true;
+    case 27:   // GSQ-RCO Engram hash parameters (I64)
+        elems = 1;
+        bytes = 8;
+        return true;
     case 39:   // MXFP4: one E8M0 scale and 16 packed E2M1 bytes
         elems = 32;
         bytes = 17;

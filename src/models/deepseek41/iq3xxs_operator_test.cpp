@@ -65,7 +65,7 @@ void samples(const d::Model& model,const char* arm,cudaStream_t stream){
     size_t tensors=0,cases=0,values=0;
     for(const auto& [name,v]:model.tensors()){
         const int type=v.info->type;
-        if(type==26)continue;
+        if(v.role==d::TensorRole::token_map)continue;
         const size_t cols=v.info->shape[0],rows=v.info->elements()/cols;
         for(size_t row:std::set<size_t>{0,rows/2,rows-1}){
             const auto* source=v.data+row*v.row_bytes;
@@ -101,7 +101,7 @@ struct Projection {
     Device<uint8_t> packed;
     Device<uint16_t> weights;
     Projection(const d::TensorView& v,cudaStream_t stream)
-        :view(v),rows(v.info->shape[1]),cols(v.info->shape[0]),type(v.info->type),
+        :view(v),rows(v.role==d::TensorRole::routed_expert?v.info->shape[1]:v.info->elements()/v.info->shape[0]),cols(v.info->shape[0]),type(v.info->type),
          packed(v.row_bytes*rows),weights(size_t(rows)*cols){
         // One expert (ID 0) for 3D tensors, the complete matrix for 2D tensors.
         packed.set(v.data,packed.size);
@@ -144,13 +144,14 @@ std::string suffix(const std::string& name){
 void projections(const d::Model& old,const d::Model& now,cublasHandle_t blas,cudaStream_t stream,bool timing){
     std::set<std::string> covered;int cases=0;
     for(const auto& [name,v]:now.tensors()){
-        if(v.info->shape.size()<2||v.role==d::TensorRole::engram)continue;
+        if(v.info->shape.size()<2||v.role==d::TensorRole::engram||v.role==d::TensorRole::token_map)continue;
         std::string old_name=name;
-        if(suffix(name)=="engram_gate.weight")continue; // Separate nonlinear gate test.
+        if(suffix(name)=="engram_gate.weight"||suffix(name)=="engram_q.weight"||suffix(name)=="engram_k.weight")continue; // Separate nonlinear gate test.
         if(!old.ple_engram()&&suffix(name)=="engram_kv.weight")old_name.replace(old_name.find("engram_kv"),9,"engram_wkv");
+        if(old.ple_engram()&&suffix(name)=="engram_wkv.weight")old_name.replace(old_name.find("engram_wkv"),10,"engram_kv");
         const auto& ov=old.tensor(old_name);
-        need(ov.info->shape==v.info->shape,"paired shape");
-        const int rows=v.info->shape[1],cols=v.info->shape[0];
+        need(ov.info->shape[0]==v.info->shape[0]&&ov.info->elements()==v.info->elements(),"paired flattened shape");
+        const int rows=v.role==d::TensorRole::routed_expert?v.info->shape[1]:v.info->elements()/v.info->shape[0],cols=v.info->shape[0];
         std::ostringstream key;key<<suffix(name)<<':'<<rows<<':'<<cols<<':'<<ov.info->type<<':'<<v.info->type;
         if(!covered.insert(key.str()).second)continue;
         Projection a(ov,stream),b(v,stream);
@@ -420,7 +421,7 @@ void boundaries(const d::Model& model,cudaStream_t stream){
     std::set<int> covered;
     for(const auto& [name,v]:model.tensors()){
         const int type=v.info->type;
-        if(type!=13&&type!=14&&type!=16&&type!=17&&type!=18&&type!=21&&type!=22&&type!=39)continue;
+        if(type!=13&&type!=14&&type!=16&&type!=17&&type!=18&&type!=20&&type!=21&&type!=22&&type!=39)continue;
         if(!covered.insert(type).second)continue;
         const size_t count=256,bytes=ggml_row_size(static_cast<ggml_type>(type),count);
         const size_t block=ggml_type_size(static_cast<ggml_type>(type));
@@ -517,11 +518,14 @@ void real_other_ops(const d::Model& old,const d::Model& now,cublasHandle_t blas,
     }
     for(int layer:{1,14}){
         const std::string base="blk."+std::to_string(layer)+".";
-        const auto& folded=now.tensor(base+"engram_gate.weight");
+        const auto& folded=now.tensor(base+(now.ple_engram()?"engram_gate.weight":"engram_q.weight"));
+        const auto& nk=now.tensor(base+(now.ple_engram()?"engram_gate.weight":"engram_k.weight"));
         const auto& q=old.tensor(base+(old.ple_engram()?"engram_gate.weight":"engram_q.weight"));const auto& k=old.tensor(base+(old.ple_engram()?"engram_gate.weight":"engram_k.weight"));
-        Device<float> qd(20480),kd(20480),fd(20480);
-        qd.set(reinterpret_cast<const float*>(q.data),20480);kd.set(reinterpret_cast<const float*>(k.data),20480);
-        fd.set(reinterpret_cast<const float*>(folded.data),20480);
+        Device<float> qd(20480),kd(20480),fd(20480),nkd(20480);
+        std::vector<float> qv(20480),kvv(20480),fv(20480),nkv(20480);
+        decode(q.info->type,q.data,qv.data(),20480);decode(k.info->type,k.data,kvv.data(),20480);
+        decode(folded.info->type,folded.data,fv.data(),20480);decode(nk.info->type,nk.data,nkv.data(),20480);
+        qd.set(qv.data(),20480);kd.set(kvv.data(),20480);fd.set(fv.data(),20480);nkd.set(nkv.data(),20480);
         for(int tokens:{1,2,5,8,9,128,512,8192}){
             std::vector<float> h(size_t(tokens)*20480),kv(size_t(tokens)*25600);std::vector<uint8_t> image(tokens);
             for(size_t i=0;i<h.size();++i)h[i]=bf(.2f*std::sin(float(i)*.017f));
@@ -533,12 +537,12 @@ void real_other_ops(const d::Model& old,const d::Model& now,cublasHandle_t blas,
                 // Include the same D2D reset in both arms so repeated in-place
                 // gate calls receive identical inputs instead of accumulating.
                 d::gpu_check(cudaMemcpyAsync(out.p,source.p,h.size()*4,cudaMemcpyDeviceToDevice,stream));
-                d::gpu_check(d::engram_gate_gpu(out.p,dkv.p,arm?fd.p:qd.p,arm||old.ple_engram()?nullptr:kd.p,mask.p,tokens,5120,stream));
+                d::gpu_check(d::engram_gate_gpu(out.p,dkv.p,arm?fd.p:qd.p,arm?(now.ple_engram()?nullptr:nkd.p):(old.ple_engram()?nullptr:kd.p),mask.p,tokens,5120,stream));
             };
             for(int arm=0;arm<2;++arm){
                 run(arm);d::gpu_check(cudaStreamSynchronize(stream));
-                const auto* qw=reinterpret_cast<const float*>(arm?folded.data:q.data);
-                const auto* kw=arm||old.ple_engram()?nullptr:reinterpret_cast<const float*>(k.data);
+                const auto* qw=arm?fv.data():qv.data();
+                const auto* kw=arm?(now.ple_engram()?nullptr:nkv.data()):(old.ple_engram()?nullptr:kvv.data());
                 std::vector<float> ref,actual;
                 for(int t:positions(tokens))for(int c=0;c<4;++c){
                     double hh=0,kk=0,dot=0;
@@ -573,7 +577,7 @@ int main(int argc,char** argv){
         std::cout<<std::setprecision(12);
         ggml_cpu_init();
         auto now=d::Model::operator_weights_only(argv[1]);d::Model old(argv[2]);
-        need(now->ple_engram(),"expected new PLE schema");
+        need(now->ple_engram()||now->gsq_rco_1017(),"expected PLE or GSQ-RCO1017 schema");
         for(int layer=0;layer<40;++layer){
             const auto first=now->expert(layer,0),last=now->expert(layer,383);
             need(last.gate-first.gate==383*first.projection_bytes,"Gate expert stride");
