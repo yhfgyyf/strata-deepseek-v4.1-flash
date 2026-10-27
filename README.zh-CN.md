@@ -7,8 +7,6 @@
   <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156" align="middle">
 </p>
 
-# strata-deepseek-v4.1-flash
-
 [English](README.md)
 
 本项目面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 等 harness 环境的实际使用，目标是在保证模型一定推理质量的前提下，尽可能提高推理速度。

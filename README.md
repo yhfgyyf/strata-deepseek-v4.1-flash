@@ -7,8 +7,6 @@
   <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156" align="middle">
 </p>
 
-# strata-deepseek-v4.1-flash
-
 [简体中文](README.zh-CN.md)
 
 The goal is practical use in agent harnesses such as [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): make inference as fast as possible while maintaining a useful level of model reasoning quality.
