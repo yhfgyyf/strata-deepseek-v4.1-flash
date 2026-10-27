@@ -6,9 +6,11 @@ Run from the repository root:
 ./start.sh
 ```
 
-The management page opens at `http://127.0.0.1:30010/` even before a model is installed. The page is in Chinese. Select the model, download source and storage directory. **按模型和目录填写路径** fills and saves the selected pack's paths; advanced fields also accept existing files. Inspect **查看准备计划**, then use **准备并启动** or **仅准备文件与引擎**. Once installed, **启动模型** starts the service without rebuilding or downloading. **打开聊天** opens the existing chat/monitor page after the service is ready.
+The management page opens at `http://127.0.0.1:30010/` even before a model is installed. The page is in English. Select the model, download source and storage directory. **Use model paths** fills and saves the selected pack's paths; advanced fields also accept existing files. Inspect **Review setup plan**, then use **Set up and start** or **Set up only**. Once installed, **Start model** starts the service without rebuilding or downloading. **Open chat** opens the existing chat/monitor page after the service is ready.
 
 The runtime target remains Linux x86-64, Python 3.10+, CMake 3.24+, a C++20 compiler, CUDA 13.2 and one RTX PRO 6000 Blackwell 96GB with the documented host-memory configuration. The manager checks prerequisites; it does not install system tools/drivers, change huge-page policy or stop competing workloads. Native startup still requires CPU 8, 40 registered expert blocks and 100% huge-page backing. This launcher does not change chunk size or model arithmetic.
+
+The chat page defaults to greedy decoding (temperature 0), matching this profile's DSpark adaptive verification. Nonzero temperatures are unsupported in this mode; if this browser has older saved sampling settings, set Temperature to 0 before chatting.
 
 ## Commands
 

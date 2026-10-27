@@ -1,12 +1,26 @@
+<p align="center">
+  <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156">
+</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/strata-lockup-dark.svg">
+    <img src="docs/assets/readme/strata-lockup-light.svg" alt="Strata" width="220">
+  </picture>
+</p>
+
 # strata-deepseek-v4.1-flash
 
 [English](README.md)
+
+本项目面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 等 harness 环境的实际使用，目标是在保证模型一定推理质量的前提下，尽可能提高推理速度。
 
 在家用电脑运行 DeepSeek-V4.1-Flash：**Intel Core i7-14700KF、单张 RTX PRO 6000 Blackwell 96GB、192GB DDR5-4800**。
 
 基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。适配模型共用一个启动脚本，直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
 
 支持 **1M 上下文容量（1,048,576 tokens）**、Unsloth 模型的**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。GSQ-RCO 当前支持文本输入。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。
+
+**推荐显卡：单张 RTX PRO 6000 Blackwell 96GB，或双张 RTX 5090。**
 
 ## 适配模型
 
@@ -60,7 +74,9 @@ GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和�
 
 已使用更广泛的代码、agent 和通用推理 prompt 采集专家路由统计，来源包括 DeepSWE、SWE-bench Pro 与 Verified、R2E-Gym、LongSWE、LiveCodeBench、BigCodeBench、ProgramBench、Terminal-Bench、BFCL 和 HLE，据此调整初始 profile 的专家排序与热度，并保留运行期间的在线自适应。
 
-当前运行时的专家内存使用 **block-pinned memory（分块锁页内存）＋大页存储**：40 段 CUDA 注册、100% 的 2 MiB 大页覆盖，测试链路为 PCIe 5.0 ×16。
+当前运行时的专家内存使用 **block-pinned memory（分块锁页内存）＋大页存储**：40 段 CUDA 注册、100% 的 2 MiB 大页覆盖。在 PCIe 5.0 ×16 上，独立 CPU→GPU（H2D）传输对照从单次注册／4 KiB 页的 **23.952 GB/s 提升到 45.104 GB/s（+88.31%）**，详见[性能记录](docs/PERFORMANCE_HISTORY.zh-CN.md)。
+
+**要达到上述传输速度，必须使用 PCIe 5.0 显卡，且 CPU／主板链路实际运行在 PCIe 5.0 ×16。** 如果 PCIe 4.0 或更低版本的链路已经饱和，分块锁页与大页带来的额外传输提升几乎为零。
 
 如果使用支持 **AVX-512、配备大容量内存和高内存带宽的服务器 CPU**，也可以尝试在 **decode 阶段由 CPU 执行 MoE 专家**，GPU 继续处理注意力等适合的工作。
 
@@ -74,7 +90,7 @@ cd strata-deepseek-v4.1-flash
 ./start.sh
 ```
 
-浏览器会打开 **http://127.0.0.1:30010** 管理页。选择模型和存放目录，点**按模型和目录填写路径**保存，再查看准备计划并点**准备并启动**。工具会创建独立 Python 环境、编译引擎、续传缺少的文件并校验 SHA256；也可以直接填写已有文件路径。页面提供启停、进度、日志和聊天入口。
+浏览器会打开 **http://127.0.0.1:30010** 管理页。选择模型和存放目录，点**Use model paths**保存，再查看准备计划并点**Set up and start**。工具会创建独立 Python 环境、编译引擎、续传缺少的文件并校验 SHA256；也可以直接填写已有文件路径。页面提供启停、进度、日志和聊天入口。
 
 终端或 AI 可使用非交互命令：
 

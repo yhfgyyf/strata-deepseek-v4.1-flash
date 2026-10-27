@@ -1,76 +1,76 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="strata-token" content="%%TOKEN%%">
-  <title>Strata · DeepSeek 管理</title>
+  <title>Strata · DeepSeek Manager</title>
   <link rel="stylesheet" href="/launcher.css">
   <script src="/launcher.js" defer></script>
 </head>
 <body>
-  <header><div class="mark">S</div><div><strong>Strata</strong><span>DeepSeek V4.1 Flash</span></div><span class="local">本机管理 · LOCAL</span></header>
+  <header><div class="mark">S</div><div><strong>Strata</strong><span>DeepSeek V4.1 Flash</span></div><span class="local">LOCAL MANAGER</span></header>
   <main>
     <section class="hero">
-      <div><p class="eyebrow">YOUR MODEL, YOUR MACHINE</p><h1>准备好，开始对话。</h1><p class="sub">选择模型，完成准备，然后打开聊天。模型文件和会话留在你的机器上。</p></div>
-      <div id="status" class="status" role="status"><i></i><span>连接管理服务…</span></div>
+      <div><p class="eyebrow">YOUR MODEL, YOUR MACHINE</p><h1>Ready when you are.</h1><p class="sub">Choose a model, finish setup, and start chatting. Your model and conversations stay on your machine.</p></div>
+      <div id="status" class="status" role="status"><i></i><span>Connecting…</span></div>
     </section>
     <div id="notice" class="notice" role="alert" hidden></div>
     <section class="card overview">
-      <div><span class="label">当前模型</span><strong id="current-model">—</strong></div>
-      <div><span class="label">服务地址</span><code id="endpoint">—</code></div>
-      <div class="actions"><button id="start" class="primary">启动模型</button><button id="stop" disabled>停止</button><a id="chat" class="button disabled" href="#" target="_blank" rel="noopener">打开聊天 ↗</a></div>
+      <div><span class="label">Current model</span><strong id="current-model">—</strong></div>
+      <div><span class="label">Service address</span><code id="endpoint">—</code></div>
+      <div class="actions"><button id="start" class="primary">Start model</button><button id="stop" disabled>Stop</button><a id="chat" class="button disabled" href="#" target="_blank" rel="noopener">Open chat ↗</a></div>
     </section>
     <div class="grid">
       <section class="card">
-        <div class="section-title"><span class="step">01</span><div><h2>模型与文件</h2><p>支持原始 GGUF，无需转换。</p></div></div>
+        <div class="section-title"><span class="step">01</span><div><h2>Model and files</h2><p>Use original GGUF files. No conversion needed.</p></div></div>
         <form id="config-form">
-          <label for="variant">模型版本</label>
+          <label for="variant">Model variant</label>
           <select id="variant" name="variant"><option>GSQ-RCO-IQ2_XS</option><option>UD-Q2_K_XL</option><option>UD-IQ3_XXS</option></select>
-          <div class="pair"><div><label for="source">下载来源</label><select id="source"><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option><option value="hf-mirror">HF Mirror</option></select></div><div><label for="data-dir">模型存放目录</label><input id="data-dir" autocomplete="off"></div></div>
-          <label class="check"><input id="no-proxy" type="checkbox">模型下载直连，不使用代理</label>
-          <p class="hint">首次准备需要数百 GB 空间。已存在的文件会校验，未完成的下载会继续；不会自动更换下载源。</p>
-          <button id="use-default-paths" type="button" class="small">按模型和目录填写路径</button>
-          <details id="paths"><summary>使用已有文件 / 高级配置</summary>
-            <label for="model">主模型第一分片</label><input id="model" data-config="model" autocomplete="off">
-            <label for="draft">DSpark 草稿模型</label><input id="draft" data-config="draft" autocomplete="off">
+          <div class="pair"><div><label for="source">Download source</label><select id="source"><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option><option value="hf-mirror">HF Mirror</option></select></div><div><label for="data-dir">Model directory</label><input id="data-dir" autocomplete="off"></div></div>
+          <label class="check"><input id="no-proxy" type="checkbox">Download models directly without a proxy</label>
+          <p class="hint">Initial setup needs hundreds of GB. Existing files are verified and partial downloads resume. The selected source is never changed automatically.</p>
+          <button id="use-default-paths" type="button" class="small">Use model paths</button>
+          <details id="paths"><summary>Existing files / advanced settings</summary>
+            <label for="model">Main model: first shard</label><input id="model" data-config="model" autocomplete="off">
+            <label for="draft">DSpark draft model</label><input id="draft" data-config="draft" autocomplete="off">
             <label for="tokenizer">Tokenizer</label><input id="tokenizer" data-config="tokenizer" autocomplete="off">
-            <label for="mmproj">mmproj（可留空）</label><input id="mmproj" data-config="mmproj" autocomplete="off">
-            <label class="check"><input id="vision" type="checkbox">启用图片输入（仅 UD 模型）</label>
-            <label for="engine">推理引擎</label><input id="engine" data-config="engine" autocomplete="off">
-            <div class="pair"><div><label for="port">API 端口</label><input id="port" type="number" min="1" max="65535"></div><div><label for="prefix-cache">前缀缓存 MiB</label><input id="prefix-cache" type="number" min="0" max="4096"></div></div>
-            <label for="host">API 监听地址</label><input id="host" autocomplete="off">
-            <label for="api-key">API 密钥 <span id="key-status"></span></label><input id="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥">
-            <label class="check"><input id="clear-key" type="checkbox">清除现有密钥</label>
-            <label for="hot-bytes">GPU 专家预算（bytes 或 auto）</label><input id="hot-bytes" autocomplete="off" placeholder="使用模型默认值">
-            <label for="profile">已有专家排名（可选）</label><input id="profile" data-config="profile" autocomplete="off">
-            <label for="heat">已有初始热度（与排名一起填写）</label><input id="heat" data-config="heat" autocomplete="off">
-            <label for="integrity">已有完整性证明（可选）</label><input id="integrity" data-config="integrity" autocomplete="off">
-            <label for="cuda">CUDA 编译器</label><input id="cuda" autocomplete="off">
-            <label for="build-dir">构建目录</label><input id="build-dir" autocomplete="off">
-            <label for="ggml-dir">已有固定版本 llama.cpp（可选）</label><input id="ggml-dir" autocomplete="off">
-            <label for="jobs">构建并行数</label><input id="jobs" type="number" min="1" max="16">
+            <label for="mmproj">mmproj (optional)</label><input id="mmproj" data-config="mmproj" autocomplete="off">
+            <label class="check"><input id="vision" type="checkbox">Enable image input (UD models only)</label>
+            <label for="engine">Inference engine</label><input id="engine" data-config="engine" autocomplete="off">
+            <div class="pair"><div><label for="port">API port</label><input id="port" type="number" min="1" max="65535"></div><div><label for="prefix-cache">Prefix cache (MiB)</label><input id="prefix-cache" type="number" min="0" max="4096"></div></div>
+            <label for="host">API bind address</label><input id="host" autocomplete="off">
+            <label for="api-key">API key <span id="key-status"></span></label><input id="api-key" type="password" autocomplete="new-password" placeholder="Leave blank to keep the existing key">
+            <label class="check"><input id="clear-key" type="checkbox">Clear the existing key</label>
+            <label for="hot-bytes">GPU expert budget (bytes or auto)</label><input id="hot-bytes" autocomplete="off" placeholder="Use the model default">
+            <label for="profile">Expert ranking (optional)</label><input id="profile" data-config="profile" autocomplete="off">
+            <label for="heat">Initial heat (requires a ranking)</label><input id="heat" data-config="heat" autocomplete="off">
+            <label for="integrity">Integrity proof (optional)</label><input id="integrity" data-config="integrity" autocomplete="off">
+            <label for="cuda">CUDA compiler</label><input id="cuda" autocomplete="off">
+            <label for="build-dir">Build directory</label><input id="build-dir" autocomplete="off">
+            <label for="ggml-dir">Pinned llama.cpp directory (optional)</label><input id="ggml-dir" autocomplete="off">
+            <label for="jobs">Build jobs</label><input id="jobs" type="number" min="1" max="16">
           </details>
-          <div class="form-footer"><span id="dirty">配置尚未保存</span><button id="save" type="submit">保存配置</button></div>
+          <div class="form-footer"><span id="dirty">Configuration not saved</span><button id="save" type="submit">Save configuration</button></div>
         </form>
       </section>
       <div class="right-column">
         <section class="card">
-          <div class="section-title"><span class="step">02</span><div><h2>准备与检查</h2><p>先查看计划，再安装依赖、构建和下载。</p></div></div>
-          <div class="actions wrap"><button id="plan">查看准备计划</button><button id="doctor">检查启动条件</button></div>
-          <div id="plan-view" class="plan"><p class="hint">保存配置后查看文件清单与所需空间。</p></div>
-          <div class="actions wrap"><button id="prepare-launch" class="primary">准备并启动</button><button id="prepare">仅准备文件与引擎</button></div>
-          <p class="hint">已准备完成时，直接使用上方“启动模型”。系统需具备 CUDA 13.2、CMake 3.24+ 和 C++ 编译器。</p>
+          <div class="section-title"><span class="step">02</span><div><h2>Setup and checks</h2><p>Review the plan before installing dependencies, building, and downloading.</p></div></div>
+          <div class="actions wrap"><button id="plan">Review setup plan</button><button id="doctor">Check requirements</button></div>
+          <div id="plan-view" class="plan"><p class="hint">Save the configuration to review files and required disk space.</p></div>
+          <div class="actions wrap"><button id="prepare-launch" class="primary">Set up and start</button><button id="prepare">Set up only</button></div>
+          <p class="hint">Already set up? Use Start model above. CUDA 13.2, CMake 3.24+, and a C++ compiler are required.</p>
         </section>
         <section class="card">
-          <div class="section-title"><span class="step">03</span><div><h2>进度与日志</h2><p id="progress-label">尚无运行任务</p></div></div>
+          <div class="section-title"><span class="step">03</span><div><h2>Progress and logs</h2><p id="progress-label">No setup job yet</p></div></div>
           <progress id="progress" max="100" value="0"></progress>
-          <div class="log-tabs"><button id="service-log" class="selected">服务日志</button><button id="install-log">准备日志</button><button id="cancel-prepare" disabled>取消准备</button><button id="refresh-log" class="refresh">刷新</button></div>
-          <pre id="logs" aria-live="off">日志会显示在这里。</pre>
+          <div class="log-tabs"><button id="service-log" class="selected">Service log</button><button id="install-log">Setup log</button><button id="cancel-prepare" disabled>Cancel setup</button><button id="refresh-log" class="refresh">Refresh</button></div>
+          <pre id="logs" aria-live="off">Logs will appear here.</pre>
         </section>
       </div>
     </div>
-    <footer>Linux x86-64 · RTX PRO 6000 Blackwell · 浏览器管理界面仅监听本机。关闭页面不会停止模型。</footer>
+    <footer>Linux x86-64 · RTX PRO 6000 Blackwell · The manager listens on localhost only. Closing this page does not stop the model.</footer>
   </main>
 </body>
 </html>

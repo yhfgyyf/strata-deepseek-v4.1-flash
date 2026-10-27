@@ -1,12 +1,26 @@
+<p align="center">
+  <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156">
+</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/strata-lockup-dark.svg">
+    <img src="docs/assets/readme/strata-lockup-light.svg" alt="Strata" width="220">
+  </picture>
+</p>
+
 # strata-deepseek-v4.1-flash
 
 [简体中文](README.zh-CN.md)
+
+The goal is practical use in agent harnesses such as [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): make inference as fast as possible while maintaining a useful level of model reasoning quality.
 
 DeepSeek-V4.1-Flash on a home PC: **Intel Core i7-14700KF, one RTX PRO 6000 Blackwell 96GB, and 192GB DDR5-4800**.
 
 Built on [Strata](https://github.com/Niko1221/Strata) and [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4), with a native DeepSeek runtime, SSD-backed Engram, GPU/RAM expert residency, and **DSpark speculative decoding**. The supported models use the same launch script and their original GGUF files: **no offline weight conversion, shard merging, or extra quantization is required**.
 
 The service supports **1M context capacity (1,048,576 tokens)**, **multimodal text + image input** with the Unsloth models, tool calls, OpenAI Chat Completions / Responses, and Anthropic Messages. GSQ-RCO currently supports text input. The starter uses one request slot, chunk 8192, and a default maximum output of 32768 tokens.
+
+**Recommended GPUs: one RTX PRO 6000 Blackwell 96GB, or two RTX 5090 cards.**
 
 ## Supported models
 
@@ -60,7 +74,9 @@ Rates are means ± sample standard deviations. Prefill uses native prompt time; 
 
 The calibrated startup profile was refined using expert-routing statistics from a broader mix of coding, agent and general-reasoning prompts: DeepSWE, SWE-bench Pro and Verified, R2E-Gym, LongSWE, LiveCodeBench, BigCodeBench, ProgramBench, Terminal-Bench, BFCL and HLE. These observations inform the initial expert ranking and heat, followed by online adaptive residency.
 
-The current runtime uses **block-pinned memory with huge pages** for expert RAM: 40 CUDA-registered blocks with 100% 2 MiB huge-page coverage on the tested PCIe 5.0 ×16 link.
+The current runtime uses **block-pinned memory with huge pages** for expert RAM: 40 CUDA-registered blocks with 100% 2 MiB huge-page coverage. On PCIe 5.0 ×16, the isolated CPU→GPU (H2D) transfer comparison improved from **23.952 to 45.104 GB/s (+88.31%)** versus a single registration with 4 KiB pages. See the [performance history](docs/PERFORMANCE_HISTORY.md).
+
+**Reaching this transfer rate requires a PCIe 5.0 GPU and a CPU/motherboard link operating at PCIe 5.0 ×16.** If a PCIe 4.0 or older link is already saturated, block pinning and huge pages provide little or no additional transfer throughput.
 
 On a server with **AVX-512, ample RAM and high memory bandwidth**, it is also worth testing **CPU execution of MoE experts during decode**, while keeping attention and other suitable work on the GPU.
 
@@ -74,7 +90,7 @@ cd strata-deepseek-v4.1-flash
 ./start.sh
 ```
 
-The local management page opens at **http://127.0.0.1:30010**. Choose a model and storage directory, click **按模型和目录填写路径** to save its paths, inspect the download plan, then select **准备并启动** (Prepare and start). It creates a private Python environment, builds the engine, resumes missing downloads and verifies SHA256. Existing files can be selected in the same page. Start/stop, progress, logs and the chat link remain available there.
+The local management page opens at **http://127.0.0.1:30010**. Choose a model and storage directory, click **Use model paths** to save its paths, inspect the download plan, then select **Set up and start**. It creates a private Python environment, builds the engine, resumes missing downloads and verifies SHA256. Existing files can be selected in the same page. Start/stop, progress, logs and the chat link remain available there.
 
 For a terminal or AI agent:
 
