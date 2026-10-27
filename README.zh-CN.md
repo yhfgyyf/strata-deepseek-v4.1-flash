@@ -15,7 +15,7 @@
 
 基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。适配模型共用一个启动脚本，直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
 
-支持 **1M 上下文容量（1,048,576 tokens）**、Unsloth 模型的**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。GSQ-RCO 当前支持文本输入。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。
+支持 **1M 上下文容量（1,048,576 tokens）**、Unsloth 模型的**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。GSQ-RCO 当前支持文本输入。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。长上下文场景可调整为 **chunk 32K（32768 tokens）**、**最大输出 128K（131072 tokens）**。
 
 **推荐显卡：单张 RTX PRO 6000 Blackwell 96GB，或双张 RTX 5090。**
 
