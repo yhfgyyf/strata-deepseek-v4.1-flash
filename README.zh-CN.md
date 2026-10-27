@@ -1,11 +1,10 @@
 <p align="center">
-  <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156">
-</p>
-<p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/strata-lockup-dark.svg">
-    <img src="docs/assets/readme/strata-lockup-light.svg" alt="Strata" width="220">
+    <img src="docs/assets/readme/strata-lockup-light.svg" alt="Strata" width="220" align="middle">
   </picture>
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/readme/whale-girl.png" alt="DeepSeek Whale-chan" width="156" align="middle">
 </p>
 
 # strata-deepseek-v4.1-flash
