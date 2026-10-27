@@ -75,6 +75,8 @@ The current runtime uses **block-pinned memory with huge pages** for expert RAM:
 
 **Reaching this transfer rate requires a PCIe 5.0 GPU and a CPU/motherboard link operating at PCIe 5.0 ×16.** If a PCIe 4.0 or older link is already saturated, block pinning and huge pages provide little or no additional transfer throughput.
 
+With this substantial increase in PCIe bandwidth, the project defaults to **GPU-only prefill and decode**, with no model-weight computation on the CPU. On the RTX PRO 6000 system described above, **GPU power draw is around 500 W** during inference.
+
 On a server with **AVX-512, ample RAM and high memory bandwidth**, it is also worth testing **CPU execution of MoE experts during decode**, while keeping attention and other suitable work on the GPU.
 
 ## Build and launch
