@@ -2,7 +2,7 @@
 
 [English](PERFORMANCE_HISTORY.md)
 
-这些 UD-Q2_K_XL 测量来自较早的运行时版本，保留原输入、容量和计时条件，不代表当前代码。最新 GSQ-RCO 测试数据见 [README](../README.zh-CN.md#吞吐)。
+这些 UD-Q2_K_XL 测量来自较早的运行时版本，保留原输入、容量和计时条件，不代表当前代码。最新 GSQ-RCO 测试数据见 [README](../README.md#吞吐)。
 
 原始记录: [32f09f0 / README.zh-CN.md](https://github.com/yhfgyyf/strata-deepseek-v4.1-flash/blob/32f09f09f368d063deff561f12ea3e009347446d/README.zh-CN.md).
 

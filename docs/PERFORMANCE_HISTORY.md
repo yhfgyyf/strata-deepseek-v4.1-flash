@@ -2,7 +2,7 @@
 
 [简体中文](PERFORMANCE_HISTORY.zh-CN.md)
 
-These UD-Q2_K_XL measurements used earlier runtime revisions and are retained with their original input, capacity and timing conditions. They do not describe the current code. See the [README](../README.md#throughput) for the current GSQ-RCO measurements.
+These UD-Q2_K_XL measurements used earlier runtime revisions and are retained with their original input, capacity and timing conditions. They do not describe the current code. See the [README](../README.en.md#throughput) for the current GSQ-RCO measurements.
 
 Archived source: [32f09f0 / README.md](https://github.com/yhfgyyf/strata-deepseek-v4.1-flash/blob/32f09f09f368d063deff561f12ea3e009347446d/README.md).
 
