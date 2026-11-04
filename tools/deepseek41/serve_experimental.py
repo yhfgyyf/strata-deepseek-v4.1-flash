@@ -10,7 +10,7 @@ import threading
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.deepseek41.startup_assets import GSQ_VARIANT, VARIANTS, prepare
+from tools.deepseek41.startup_assets import GSQ_VARIANT, GSQ_VARIANTS, GSQ_VISION_BIAS, VARIANTS, prepare, vision_enabled
 from tools.deepseek41.hash_proof import GSQ_ENGRAM_FILE
 
 
@@ -25,10 +25,8 @@ def load_config(path):
     variant = cfg.get("variant")
     if variant is not None and variant not in VARIANTS:
         raise ValueError("variant must be " + ", ".join(VARIANTS))
-    if variant == GSQ_VARIANT:
-        if cfg.get("vision") is True:
-            raise ValueError("GSQ-RCO is text-only; vision must be false")
-        cfg.setdefault("vision", False)
+    cfg.pop("_gsq_vision_bias", None)
+    cfg["vision"] = vision_enabled(cfg)
     # Explicit calibrated assets retain their existing behavior. The supplied
     # variant configs can instead prepare only small metadata beside the config.
     if variant:
@@ -36,6 +34,7 @@ def load_config(path):
         runtime = Path(cfg.get("runtime_dir", "runtime/" + path.stem)).expanduser()
         if not runtime.is_absolute():
             runtime = path.parent / runtime
+        cfg["runtime_dir"] = str(runtime)
         for name, filename in (("costs", "dspark-costs-rtxpro6000.txt"),
                                ("draft_input_vocab", "draft-input-vocab-114801.bin"),
                                ("draft_output_vocab", "draft-vocab-90000.bin")):
@@ -54,6 +53,11 @@ def load_config(path):
         raise ValueError("vision must be a boolean")
     if cfg.get("vision") and not cfg.get("mmproj"):
         raise ValueError("vision requires mmproj")
+    if variant in GSQ_VARIANTS and cfg["vision"]:
+        bias = (path.parent / Path(cfg["mmproj"]).expanduser()).with_name(GSQ_VISION_BIAS)
+        if not bias.is_file():
+            raise ValueError("GSQ image router bias is missing: " + str(bias))
+        cfg["_gsq_vision_bias"] = str(bias)
     if type(cfg.get("prefix_cache_mib", 0)) is not int or not 0 <= cfg.get("prefix_cache_mib", 0) <= 4096:
         raise ValueError("prefix_cache_mib must be an integer from 0 to 4096")
     for name in ("engine", "model", "draft", "tokenizer", "integrity", "profile", "heat",
@@ -77,8 +81,8 @@ def load_config(path):
     if not os.access(cfg["engine"], os.X_OK):
         raise ValueError("engine must be executable")
     if variant:
-        prefix = "DeepSeek-V4.1-Flash-1017-" + variant
-        shards = 4 if variant == GSQ_VARIANT else 7
+        prefix = "DeepSeek-V4.1-Flash-1017-" + (GSQ_VARIANT if variant in GSQ_VARIANTS else variant)
+        shards = 4 if variant in GSQ_VARIANTS else 7
         if Path(cfg["model"]).name != prefix + f"-00001-of-{shards:05d}.gguf":
             count = "four" if shards == 4 else "seven"
             raise ValueError("model must name the first of the " + count + " " + variant + " shards")
@@ -86,7 +90,7 @@ def load_config(path):
             peer = Path(cfg["model"]).with_name(prefix + f"-{i:05d}-of-{shards:05d}.gguf")
             if not peer.is_file():
                 raise ValueError("model shard is missing: " + str(peer))
-        if variant == GSQ_VARIANT and not Path(cfg["model"]).with_name(GSQ_ENGRAM_FILE).is_file():
+        if variant in GSQ_VARIANTS and not Path(cfg["model"]).with_name(GSQ_ENGRAM_FILE).is_file():
             raise ValueError("GSQ-RCO external Engram is missing: " + GSQ_ENGRAM_FILE)
     return cfg
 
@@ -101,17 +105,19 @@ def main():
     if args.check_config:
         print("Configuration paths are valid. Generated metadata and full hashes are checked at launch. No model or GPU was loaded.")
         return
-    prepare(cfg)
+    integrity = prepare(cfg)
     from serve.deepseek41_engine import DeepSeekEngine
     from serve.deepseek41_frontend import DeepSeekService
     from serve.deepseek41_tokenizer import DeepSeekTokenizer
     from serve.server import serve
 
     command = [cfg["engine"], cfg["model"], cfg["draft"], cfg.get("mmproj") or "-",
-               cfg["integrity"], cfg["profile"], cfg["heat"], cfg["costs"],
+               integrity, cfg["profile"], cfg["heat"], cfg["costs"],
                cfg["draft_input_vocab"], cfg["draft_output_vocab"]]
     if "hot_bytes" in cfg:
         command.append(str(cfg["hot_bytes"]))
+    if cfg.get("_gsq_vision_bias"):
+        command.append(cfg["_gsq_vision_bias"])
     if cfg.get("log"):
         Path(cfg["log"]).parent.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX", "0")
@@ -130,7 +136,7 @@ def main():
     try:
         tokenizer = DeepSeekTokenizer(cfg["tokenizer"])
         service = DeepSeekService(engine, tokenizer, cfg.get("alias", "deepseek-v4.1"),
-                                 vision=cfg.get("vision", bool(cfg.get("mmproj"))),
+                                 vision=cfg["vision"],
                                  sampling_defaults={"temperature": 0.0, "top_k": 1,
                                                     "top_p": 1.0, "seed": 1234})
         service.set_shared({"max_tokens": 32768})

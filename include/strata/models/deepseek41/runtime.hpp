@@ -31,6 +31,7 @@ struct RuntimeOptions {
     std::string profile, capture_directory, integrity_file;
     bool dspark = false, trace = false;
     std::string draft_sha256, vision_sha256, draft_vocab, draft_input_vocab;
+    std::string gsq_vision_bias; // Original 1017 image-router rows omitted from the four-shard release.
     bool dspark_prefix_commit = true, dense_q8_batch = true;
     bool target_verify_batch = true; // Exact multi-row projections and expert operations, 2..8 tokens.
     bool dspark_gpu_greedy = true, dspark_incremental_kv = true;

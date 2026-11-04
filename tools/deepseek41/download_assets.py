@@ -10,7 +10,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from tools.deepseek41.startup_assets import GSQ_VARIANT, TOKENIZER_SHA256, VARIANTS
+from tools.deepseek41.hash_proof import GSQ_ENGRAM_FILE
+from tools.deepseek41.startup_assets import (GSQ_UNCENSORED_VARIANT, GSQ_VARIANTS, GSQ_VISION_BIAS,
+                                            GSQ_VISION_BIAS_SHA256, TOKENIZER_SHA256, VARIANTS, vision_enabled)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCES = ("modelscope", "huggingface", "hf-mirror")
@@ -48,12 +50,17 @@ def catalog(variant, mmproj=True):
     if variant not in VARIANTS:
         raise ValueError("unsupported model variant")
     ud = read_json(ROOT / "data/models-1017.json")
-    main = read_json(ROOT / "data/models-gsq-rco-1017.json") if variant == GSQ_VARIANT else ud
+    gsq = read_json(ROOT / "data/models-gsq-rco-1017.json") if variant in GSQ_VARIANTS else None
+    main = (read_json(ROOT / "data/models-gsq-rco-uncensored-1017.json")
+            if variant == GSQ_UNCENSORED_VARIANT else gsq or ud)
     selected = []
     for entry in main["files"]:
-        if variant != GSQ_VARIANT and not entry["path"].startswith(variant + "/"):
+        if variant not in GSQ_VARIANTS and not entry["path"].startswith(variant + "/"):
             continue
         selected.append(dict(entry, repository=main["repository"], revision=main["huggingface_revision"], role="main"))
+    if variant == GSQ_UNCENSORED_VARIANT:
+        entry = next(x for x in gsq["files"] if x["path"] == GSQ_ENGRAM_FILE)
+        selected.append(dict(entry, repository=gsq["repository"], revision=gsq["huggingface_revision"], role="main"))
     for name, role in (("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf", "draft"), ("mmproj-BF16.gguf", "mmproj")):
         if role == "mmproj" and not mmproj:
             continue
@@ -76,13 +83,21 @@ def asset_url(asset, source):
 
 def assets_for_config(cfg):
     assets = catalog(cfg["variant"], bool(cfg.get("mmproj")))
+    if cfg["variant"] in GSQ_VARIANTS and vision_enabled(cfg):
+        assets.append(dict(path=GSQ_VISION_BIAS, bytes=61440, sha256=GSQ_VISION_BIAS_SHA256,
+                           repository="ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+                           revision="65d53bc8be65123e255ff02f3ded958b6dbf54fd", role="vision_bias"))
     first = next(x for x in assets if x["role"] == "main")
     if Path(cfg["model"]).name != Path(first["path"]).name:
         raise ValueError("model must name the first original shard for " + cfg["variant"])
     result = []
     for asset in assets:
-        destination = (Path(cfg["model"]).parent / Path(asset["path"]).name
-                       if asset["role"] == "main" else Path(cfg[asset["role"]]))
+        if asset["role"] == "main":
+            destination = Path(cfg["model"]).with_name(Path(asset["path"]).name)
+        elif asset["role"] == "vision_bias":
+            destination = Path(cfg["mmproj"]).with_name(GSQ_VISION_BIAS)
+        else:
+            destination = Path(cfg[asset["role"]])
         result.append(dict(asset, destination=str(destination)))
     return result
 

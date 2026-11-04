@@ -13,7 +13,8 @@
 
 namespace strata::models::deepseek41 {
 namespace {
-void require_file(const std::string& proof,const std::string& kind,const std::string& path,const std::string& expected) {
+void require_file(const std::string& proof,const std::string& kind,const std::string& path,const std::string& expected,
+                  const std::string& alternative = {}) {
     if (expected.empty() || path.empty() || proof.empty()) throw std::invalid_argument("DeepSeek full-hash proof is required");
     struct stat state{};
     if (stat(path.c_str(), &state) || !S_ISREG(state.st_mode)) throw std::runtime_error("DeepSeek weight file is not regular");
@@ -34,7 +35,7 @@ void require_file(const std::string& proof,const std::string& kind,const std::st
     bool found = false;
     while (input >> name >> hash >> identity[0] >> identity[1] >> identity[2] >> identity[3] >> identity[4]) {
         if (name != kind) continue;
-        if (found || hash != expected || identity != actual)
+        if (found || (hash != expected && hash != alternative) || identity != actual)
             throw std::runtime_error("DeepSeek " + kind + " full-hash proof is stale or does not match the approved weights");
         found = true;
     }
@@ -42,6 +43,10 @@ void require_file(const std::string& proof,const std::string& kind,const std::st
 }
 }
 void require_integrity(const std::string& proof, const std::string& kind, const std::string& path, const std::string& expected_override) {
+    if (kind == "vision_bias") {
+        require_file(proof, kind, path, gsq_vision_bias_sha256);
+        return;
+    }
     std::string expected = kind == "main" ? "11f46543370256ef616b6e458b6950e148625b5f8b7545173d124445d3393c53" :
         kind == "draft" ? "d5de12076cac2378cf8cdbf0853d8e0afb0a0cd06e6ef2829d0aceee69ff94a9" :
         kind == "vision" ? "bd8a7593fc3721fad8ef84689beeb65437cd7a75326f005d6f741521a872d09e" : "";
@@ -54,7 +59,8 @@ void require_integrity(const std::string& proof, const std::string& kind, const 
         const auto shards=gguf_split_paths(path);
         if(shards.size()==4) {
             for(size_t i=0;i<shards.size();++i)
-                require_file(proof,"main."+std::to_string(i+1),shards[i],gsq_rco_1017_sha256[i]);
+                require_file(proof,"main."+std::to_string(i+1),shards[i],gsq_rco_1017_sha256[i],
+                             i==3?gsq_rco_1017_uncensored_shard4_sha256:"");
             require_file(proof,"engram",(std::filesystem::path(path).parent_path()/gsq_rco_1017_engram_file).string(),gsq_rco_1017_sha256[4]);
             return;
         }

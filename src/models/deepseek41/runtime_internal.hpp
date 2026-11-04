@@ -335,6 +335,7 @@ struct Runtime::Impl {
     std::unique_ptr<Workspace> work;
     std::array<std::array<core::CapturedGraph,8>,40> shared_graphs;
     std::unique_ptr<WeightBank> vision_weights;
+    std::unique_ptr<core::DeviceArena> gsq_vision_bias;
     std::unique_ptr<VisionWork> vision_work;
     std::unique_ptr<DraftWeights> draft_weights;
     std::unique_ptr<DraftWork> draft_work;

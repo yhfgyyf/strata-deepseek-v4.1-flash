@@ -4,6 +4,7 @@
   "model": "/path/to/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf",
   "draft": "/path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
   "mmproj": "/path/to/mmproj-BF16.gguf",
+  "vision": true,
   "tokenizer": "/path/to/tokenizer.json",
   "runtime_dir": "../runtime/ud-iq3-xxs",
   "host": "127.0.0.1",

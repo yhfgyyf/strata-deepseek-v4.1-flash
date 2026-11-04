@@ -2,7 +2,7 @@
 
 `./start.sh` manages `config.local.json` by default. Select an existing file with `./start.sh gui --config FILE`; the same `--config FILE` works for `plan`, `install`, `start`, `status`, `stop`, `logs` and `doctor`. The management page can edit DeepSeek paths and settings while its service is stopped. It preserves unedited fields and creates a timestamped private backup before saving. The chat page's inherited generic `/config` editor is separate and is not used for DeepSeek configuration. See [management commands](LAUNCHER.md).
 
-[UD-Q2_K_XL](../examples/rtxpro6000.ud-q2-k-xl.json), [UD-IQ3_XXS](../examples/rtxpro6000.ud-iq3-xxs.json) and [GSQ-RCO-IQ2_XS](../examples/rtxpro6000.gsq-rco-iq2-xs.json) use `tools/deepseek41/serve_experimental.py --config FILE`. `rtxpro6000.experimental.json` is a compatibility copy of the Q2_K_XL example.
+[UD-Q2_K_XL](../examples/rtxpro6000.ud-q2-k-xl.json), [UD-IQ3_XXS](../examples/rtxpro6000.ud-iq3-xxs.json), [GSQ-RCO-IQ2_XS](../examples/rtxpro6000.gsq-rco-iq2-xs.json) and [GSQ-RCO-IQ2_XS-Uncensored](../examples/rtxpro6000.gsq-rco-iq2-xs-uncensored.json) use `tools/deepseek41/serve_experimental.py --config FILE`. `rtxpro6000.experimental.json` is a compatibility copy of the Q2_K_XL example.
 
 ## Fixed starter settings
 
@@ -12,7 +12,7 @@
 | Default maximum output | 32768; bounded by remaining context |
 | Prefill chunk | 8192, no automatic chunk selection |
 | Work / state / GPU headroom | 6720 / 1024 / 700 MiB |
-| GPU expert byte budget | UD-Q2_K_XL: 68664950784; UD-IQ3_XXS: 67636039680; GSQ-RCO-IQ2_XS: `auto` from available VRAM after runtime reservations |
+| GPU expert byte budget | UD-Q2_K_XL: 68664950784; UD-IQ3_XXS: 67636039680; both GSQ variants: `auto` from available VRAM after runtime reservations |
 | RAM expert budget / host headroom | 160 / 16 GiB |
 | Engram host cache / migration scratch | 8 GiB / 3072 MiB |
 | Host expert backing | 40 registered blocks, 100% 2 MiB page coverage before and after registration |
@@ -24,13 +24,13 @@
 | Residency | Format groups and online Maya accepted-row adaptation |
 | Request/control thread | CPU 8, pinned after runtime workers are created |
 | Text prefix cache | Example configs: 4 completed checkpoints, up to 1024 MiB |
-| Vision | Matching BF16 mmproj; optional for UD models. GSQ-RCO is text-only. |
+| Vision | Enabled in all four profiles. Four-shard GSQ models load their verified F32 image-router rows beside the BF16 mmproj. |
 
 ## JSON fields
 
-Required: `engine`, `variant`, `model` (first shard), `draft`, `tokenizer`. `variant` is `UD-IQ3_XXS`, `UD-Q2_K_XL` or `GSQ-RCO-IQ2_XS`. GSQ-RCO requires all four main shards and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` beside the first shard. The example paths must be edited before use.
+Required: `engine`, `variant`, `model` (first shard), `draft`, `tokenizer`. `variant` is `UD-IQ3_XXS`, `UD-Q2_K_XL`, `GSQ-RCO-IQ2_XS` or `GSQ-RCO-IQ2_XS-Uncensored`. GSQ-RCO requires all four main shards and `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` beside the first shard. The example paths must be edited before use.
 
-Optional `mmproj` enables images for the UD models. Boolean `vision: false` disables the image API while retaining the supplied mmproj allocation. GSQ-RCO defaults to `vision: false` and rejects `vision: true` because this checkpoint lacks the required vision-routing tensors. Its example retains mmproj to match the tested memory allocation; removing it changes the available expert budget.
+All four profiles set `vision: true` and supply the 1017 BF16 `mmproj`. Older GSQ configs that omit `vision` keep their text-only behavior. For UD, omitting `vision` enables images when `mmproj` is set. An explicit `vision: false` disables image input for any variant. The two UD models read their image-router rows from the main shards. The two GSQ models read the publisher’s 61,440-byte `exp_probs_b_vl.f32` beside the configured mmproj. Startup verifies its SHA256 and writes a separate proof in `runtime_dir`. With image input disabled, keeping `mmproj` still reserves the projector memory.
 
 Optional `runtime_dir` contains auto-generated `integrity.txt`, `starter.strp` and `starter-heat.txt`. The default is `runtime/<config-stem>` beside the JSON. Bundled `costs`, `draft_input_vocab` and `draft_output_vocab` are used unless explicit paths are supplied.
 

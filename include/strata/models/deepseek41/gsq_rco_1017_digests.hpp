@@ -10,5 +10,10 @@ inline constexpr std::array<const char*,5> gsq_rco_1017_sha256{
     "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf",
     "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"
 };
+// AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF, IQ2_XS.
+// Revision b8bca19979431f96126ceac8cbe0ee7160a28f8a changes only shard four.
+inline constexpr const char* gsq_rco_1017_uncensored_shard4_sha256=
+    "18305a5afbf8087e1f88a9f2978cc74650357f482629d346349ed374cb7c8451";
 inline constexpr const char* gsq_rco_1017_engram_file="DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf";
+inline constexpr const char* gsq_vision_bias_sha256="710b11267b4db392d1fdb558f36ba8e0e91a91f4e8180c953c912e18eacf843d";
 }

@@ -14,10 +14,10 @@ namespace strata::models::deepseek41 { int serve(Runtime&, const RuntimeOptions&
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "Usage: strata-deepseek41-experimental MODEL DRAFT VISION_OR_DASH PROOF PROFILE HEAT COSTS INPUT_VOCAB OUTPUT_VOCAB [HOT_BYTES|auto]\n";
+            std::cout << "Usage: strata-deepseek41-experimental MODEL DRAFT VISION_OR_DASH PROOF PROFILE HEAT COSTS INPUT_VOCAB OUTPUT_VOCAB [HOT_BYTES|auto [GSQ_VISION_BIAS]]\n";
             return 0;
         }
-        if (argc != 10 && argc != 11) throw std::invalid_argument("expected nine asset paths and optional hot bytes; use --help");
+        if (argc < 10 || argc > 12) throw std::invalid_argument("invalid experimental server arguments; use --help");
         const std::string model = argv[1];
         const auto shards = strata::gguf_split_paths(model).size();
         const bool iq = shards == 7 || shards == 4;
@@ -31,7 +31,8 @@ int main(int argc, char** argv) {
         o.draft_vocab = argv[9];
         o.dspark = true; o.context = 1048576; o.chunk = 8192; o.slots = 1;
         o.hot_front = iq ? 64ull << 30 : 72596914176ull; o.hot_back = 0; o.hot_auto = false;
-        if (argc == 11) {
+        if (argc == 12) o.gsq_vision_bias = argv[11];
+        if (argc >= 11) {
             const std::string value = argv[10];
             if (value == "auto") {
                 o.hot_auto = true;
@@ -97,7 +98,9 @@ int main(int argc, char** argv) {
         runtime->write_ledger(std::cerr); std::cerr << '\n';
         size_t free = 0, total = 0; d::gpu_check(cudaMemGetInfo(&free, &total));
         if (free < (700ull << 20)) throw std::runtime_error("GPU free-memory guard");
-        std::cerr << "Experimental service: context=1048576 chunk=8192 work_mib=6720 vision=F32 block_pinned=40 huge_min_percent="
+        std::cerr << "Experimental service: context=1048576 chunk=8192 work_mib=6720 vision=" << (vision.empty() ? "off" : "F32")
+                  << " vision_router=" << (!vision.empty() && shards != 4 ? "backbone" : Access::rt(*runtime).gsq_vision_bias ? "external_f32" : "off")
+                  << " block_pinned=40 huge_min_percent="
                   << huge_minimum << " draft=5 adaptive=1 shared_pair=1 main_fusion=2 scores_fast=1 dq_fast=1 mixed_fast=" << iq
                   << " iq_short_batch=" << iq << " hot_bytes=" << o.hot_front << " hot_auto=" << o.hot_auto << " free=" << free << '\n';
         std::cerr << "C37 serve: request_cpu=8 shared_early_submit=" << o.shared_early_submit

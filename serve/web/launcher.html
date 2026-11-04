@@ -26,7 +26,7 @@
         <div class="section-title"><span class="step">01</span><div><h2>Model and files</h2><p>Use original GGUF files. No conversion needed.</p></div></div>
         <form id="config-form">
           <label for="variant">Model variant</label>
-          <select id="variant" name="variant"><option>GSQ-RCO-IQ2_XS</option><option>UD-Q2_K_XL</option><option>UD-IQ3_XXS</option></select>
+          <select id="variant" name="variant"><option>GSQ-RCO-IQ2_XS</option><option>GSQ-RCO-IQ2_XS-Uncensored</option><option>UD-Q2_K_XL</option><option>UD-IQ3_XXS</option></select>
           <div class="pair"><div><label for="source">Download source</label><select id="source"><option value="modelscope">ModelScope</option><option value="huggingface">Hugging Face</option><option value="hf-mirror">HF Mirror</option></select></div><div><label for="data-dir">Model directory</label><input id="data-dir" autocomplete="off"></div></div>
           <label class="check"><input id="no-proxy" type="checkbox">Download models directly without a proxy</label>
           <p class="hint">Initial setup needs hundreds of GB. Existing files are verified and partial downloads resume. The selected source is never changed automatically.</p>
@@ -36,7 +36,7 @@
             <label for="draft">DSpark draft model</label><input id="draft" data-config="draft" autocomplete="off">
             <label for="tokenizer">Tokenizer</label><input id="tokenizer" data-config="tokenizer" autocomplete="off">
             <label for="mmproj">mmproj (optional)</label><input id="mmproj" data-config="mmproj" autocomplete="off">
-            <label class="check"><input id="vision" type="checkbox">Enable image input (UD models only)</label>
+            <label class="check"><input id="vision" type="checkbox">Enable image input</label>
             <label for="engine">Inference engine</label><input id="engine" data-config="engine" autocomplete="off">
             <div class="pair"><div><label for="port">API port</label><input id="port" type="number" min="1" max="65535"></div><div><label for="prefix-cache">Prefix cache (MiB)</label><input id="prefix-cache" type="number" min="0" max="4096"></div></div>
             <label for="host">API bind address</label><input id="host" autocomplete="off">

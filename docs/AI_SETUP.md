@@ -1,6 +1,6 @@
 # Set up this DeepSeek repository with an AI agent
 
-This guide applies to **strata-deepseek-v4.1-flash**, its fixed Linux/CUDA/RTX PRO 6000 profile and the three model variants listed in the README. Use this repository's `./start.sh`; upstream Strata's `strata launch`, desktop installers and model identifiers are different products/workflows.
+This guide applies to **strata-deepseek-v4.1-flash**, its fixed Linux/CUDA/RTX PRO 6000 profile and the four model variants listed in [LAUNCHER.md](LAUNCHER.md). Use this repository's `./start.sh`; upstream Strata's `strata launch`, desktop installers and model identifiers are different products/workflows.
 
 ## Inspect before acquiring files
 
@@ -14,7 +14,7 @@ Read the user's selected model, destination, download source and proxy constrain
 
 `configure` writes a private config with a backup; `plan` does not write, download, hash or load a GPU. Use `--config FILE` on **every** command when the default is not intended. Inspect file destinations, missing bytes, disk margins, selected source, build/engine and URL. Existing matching sizes are not integrity verification.
 
-Use `UD-Q2_K_XL` or `UD-IQ3_XXS` only when that is the chosen pack. `configure --set /private/fields.json` accepts existing asset paths and other supported fields. `--reset-paths` deliberately resets paths to the selected model/data directory; do not use it on a calibrated config merely to change one setting. Keep API keys out of shell arguments and answers.
+Use `GSQ-RCO-IQ2_XS-Uncensored`, `UD-Q2_K_XL` or `UD-IQ3_XXS` only when that is the chosen pack. The Uncensored pack has the same shard names as the original GSQ pack but its own fourth-shard digest; keep its directory separate. It reuses the original external Engram, DSpark and mmproj. All four default profiles enable image input. The launcher installs the verified `exp_probs_b_vl.f32` beside the configured mmproj for both four-shard GSQ profiles. For new Uncensored downloads, explicitly select `--source huggingface` or `--source hf-mirror`; ModelScope availability has not been verified. `configure --set /private/fields.json` accepts existing asset paths and other supported fields. `--reset-paths` deliberately resets paths to the selected model/data directory; do not use it on a calibrated config merely to change one setting. Keep API keys out of shell arguments and answers.
 
 ## Prepare and start
 

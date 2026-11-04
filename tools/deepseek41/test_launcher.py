@@ -124,11 +124,23 @@ class Downloads(unittest.TestCase):
     def test_all_sources_use_same_expected_hashes(self):
         for variant in launcher.VARIANTS:
             assets = downloads.catalog(variant)
-            self.assertEqual(len(assets), 8 if variant == launcher.GSQ_VARIANT else 10)
+            self.assertEqual(len(assets), 8 if variant in launcher.GSQ_VARIANTS else 10)
             for source in downloads.SOURCES:
                 urls = [downloads.asset_url(a, source) for a in assets]
                 self.assertTrue(all(u.startswith("https://") for u in urls))
                 self.assertTrue(all("/resolve/" in u for u in urls))
+
+    def test_uncensored_catalog_uses_atomic_main_and_original_shared_assets(self):
+        original = downloads.catalog("GSQ-RCO-IQ2_XS")
+        assets = downloads.catalog("GSQ-RCO-IQ2_XS-Uncensored")
+        self.assertEqual(len(assets), 8)
+        self.assertEqual([a["path"] for a in assets], [a["path"] for a in original])
+        self.assertEqual([a["sha256"] for a in assets[:3]], [a["sha256"] for a in original[:3]])
+        self.assertNotEqual(assets[3]["sha256"], original[3]["sha256"])
+        self.assertEqual(assets[4:], original[4:])
+        for asset in assets[:4]:
+            self.assertEqual(asset["repository"], "AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF")
+            self.assertEqual(asset["revision"], "b8bca19979431f96126ceac8cbe0ee7160a28f8a")
 
 
 class ManagerFixture(unittest.TestCase):
@@ -147,11 +159,30 @@ class ManagerFixture(unittest.TestCase):
 
 
 class Configuration(ManagerFixture):
+    def test_image_switch_round_trips_legacy_and_explicit_settings(self):
+        for variant in launcher.VARIANTS:
+            cfg = launcher.default_config(variant, self.manager.setup())
+            self.assertTrue(cfg.pop("vision"))
+            for stored in (None, False, True):
+                with self.subTest(variant=variant, stored=stored):
+                    if stored is not None:
+                        cfg["vision"] = stored
+                    downloads.private_json(self.manager.config, cfg)
+                    shown = self.manager.public_config()["values"]["vision"]
+                    self.assertEqual(shown, variant not in launcher.GSQ_VARIANTS if stored is None else stored)
+                    self.manager.save_config({"vision": shown})
+                    self.assertIs(self.manager.config_value()["vision"], shown)
+                    has_bias = any(a["path"] == "exp_probs_b_vl.f32" for a in self.manager.plan()["assets"])
+                    self.assertEqual(has_bias, variant in launcher.GSQ_VARIANTS and shown)
+
     def test_plan_is_read_only_and_accounts_for_all_files(self):
         plan = self.manager.plan()
         self.assertFalse(self.manager.config.exists())
         self.assertFalse(self.manager.state_dir.exists())
-        self.assertEqual(len(plan["assets"]), 8)
+        self.assertEqual(len(plan["assets"]), 9)
+        self.assertTrue(self.manager.config_value()["vision"])
+        bias = next(a for a in plan["assets"] if a["path"] == "exp_probs_b_vl.f32")
+        self.assertEqual(bias["bytes"], 61440)
         self.assertEqual(plan["download_bytes"], sum(a["bytes"] for a in plan["assets"]))
         self.assertTrue(any("Engram" in a["path"] for a in plan["assets"]))
 
@@ -170,7 +201,7 @@ class Configuration(ManagerFixture):
     def test_invalid_config_does_not_replace_previous_file(self):
         self.manager.save_config()
         before = self.manager.config.read_bytes()
-        for change in (dict(port=True), dict(vision=True), dict(hot_bytes=0), dict(prefix_cache_mib=-1),
+        for change in (dict(port=True), dict(vision=True, mmproj=""), dict(hot_bytes=0), dict(prefix_cache_mib=-1),
                        dict(profile="one-without-heat"), dict(command="not an allowed field")):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.manager.save_config(change)
@@ -209,6 +240,21 @@ class Configuration(ManagerFixture):
         plan = self.manager.plan()
         self.assertEqual(len(plan["assets"]), 10)
         self.assertIn("UD-IQ3_XXS-00001-of-00007", plan["assets"][0]["destination"])
+
+    def test_uncensored_model_paths_do_not_collide_with_original_gsq(self):
+        original = self.manager.config_value()
+        self.manager.save_config(dict(variant="GSQ-RCO-IQ2_XS-Uncensored"), reset_paths=True)
+        cfg = self.manager.config_value()
+        self.assertNotEqual(Path(cfg["model"]).parent, Path(original["model"]).parent)
+        self.assertEqual(Path(cfg["model"]).name, Path(original["model"]).name)
+        self.assertNotEqual(cfg["runtime_dir"], original["runtime_dir"])
+        self.assertNotEqual(cfg["alias"], original["alias"])
+        for field in ("draft", "mmproj", "tokenizer"):
+            self.assertEqual(cfg[field], original[field])
+        self.assertEqual(len(self.manager.plan()["assets"]), 9)
+        self.assertIn(cfg["variant"], self.manager.public_config()["variants"])
+        self.manager.save_config(dict(vision=False))
+        self.assertFalse(any(a["path"] == "exp_probs_b_vl.f32" for a in self.manager.plan()["assets"]))
 
     def test_identity_mismatch_never_signals_an_unrelated_process(self):
         self.manager.save_config()
@@ -382,7 +428,7 @@ class Web(ManagerFixture):
         state=self.request("/api/state")
         self.assertTrue(state["config"]["has_api_key"])
         self.assertNotIn("must-stay-private",json.dumps(state))
-        self.assertEqual(len(self.request("/api/plan")["assets"]),8)
+        self.assertEqual(len(self.request("/api/plan")["assets"]),9)
 
     def test_foreign_origin_host_and_missing_token_rejected(self):
         for headers in ({"Origin":"https://foreign.example"},{"Host":"foreign.example"},{"X-Strata-Token":""}):

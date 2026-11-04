@@ -5,6 +5,7 @@
 #include "strata/models/deepseek41/integrity.hpp"
 #include "strata/models/deepseek41/prefill_chunk.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -149,6 +150,19 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     }
     weights=std::make_unique<WeightBank>(model,o.arithmetic,stream.value,false,false,o.dense_q8);
     if(model.has_vision())vision_weights=std::make_unique<WeightBank>(model,Arithmetic::f32,stream.value,false,true);
+    if (!o.gsq_vision_bias.empty()) {
+        if (!model.gsq_rco_1017() || !model.has_vision())
+            throw std::invalid_argument("DeepSeek external vision router requires GSQ-RCO and mmproj");
+        require_integrity(o.integrity_file, "vision_bias", o.gsq_vision_bias);
+        std::array<float, 40 * 384> rows;
+        std::ifstream input(o.gsq_vision_bias, std::ios::binary);
+        if (!input.read(reinterpret_cast<char*>(rows.data()), sizeof(rows)) || input.peek() != EOF ||
+            !std::all_of(rows.begin(), rows.end(), [](float value) { return std::isfinite(value); }))
+            throw std::runtime_error("DeepSeek invalid 40 x 384 F32 image router bias");
+        require_integrity(o.integrity_file, "vision_bias", o.gsq_vision_bias);
+        gsq_vision_bias = std::make_unique<core::DeviceArena>(sizeof(rows));
+        gpu_check(cudaMemcpy(gsq_vision_bias->alloc(sizeof(rows)), rows.data(), sizeof(rows), cudaMemcpyHostToDevice));
+    }
     if(o.dspark){
         draft_weights=std::make_unique<DraftWeights>(model,o.arithmetic,stream.value,o.draft_vocab,o.draft_input_vocab);
         if(draft_weights->bytes()>(11ull<<30))throw std::runtime_error("DSpark weights exceed the 11 GiB draft region");

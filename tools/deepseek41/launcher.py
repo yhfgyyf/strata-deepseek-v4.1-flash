@@ -25,7 +25,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.deepseek41.download_assets import (SOURCES, assets_for_config, download_file, private_json, read_json)
-from tools.deepseek41.startup_assets import GSQ_VARIANT, VARIANTS
+from tools.deepseek41.startup_assets import GSQ_VARIANT, GSQ_UNCENSORED_VARIANT, GSQ_VARIANTS, VARIANTS, vision_enabled
 
 ENTRY = ROOT / "tools/deepseek41/serve_experimental.py"
 PATH_KEYS = ("engine", "model", "draft", "mmproj", "tokenizer", "runtime_dir", "profile", "heat", "integrity",
@@ -127,7 +127,8 @@ def health(cfg):
 
 
 def default_config(variant, setup):
-    example = {GSQ_VARIANT: "gsq-rco-iq2-xs", "UD-Q2_K_XL": "ud-q2-k-xl", "UD-IQ3_XXS": "ud-iq3-xxs"}[variant]
+    example = {GSQ_VARIANT: "gsq-rco-iq2-xs", GSQ_UNCENSORED_VARIANT: "gsq-rco-iq2-xs-uncensored",
+               "UD-Q2_K_XL": "ud-q2-k-xl", "UD-IQ3_XXS": "ud-iq3-xxs"}[variant]
     cfg = read_json(ROOT / ("examples/rtxpro6000." + example + ".json"))
     data = Path(setup["data_dir"]).expanduser().absolute()
     cfg.update(engine=str(Path(setup["build_dir"]).expanduser().absolute() / "strata-deepseek41-experimental"),
@@ -140,7 +141,7 @@ def default_config(variant, setup):
 
 def validate_config(cfg):
     if not isinstance(cfg, dict) or cfg.get("variant") not in VARIANTS:
-        raise ValueError("choose GSQ-RCO-IQ2_XS, UD-Q2_K_XL or UD-IQ3_XXS")
+        raise ValueError("choose " + ", ".join(VARIANTS))
     for key in ("engine", "model", "draft", "tokenizer"):
         if not isinstance(cfg.get(key), str) or not cfg[key].strip():
             raise ValueError(key + " must be a file path")
@@ -163,8 +164,8 @@ def validate_config(cfg):
         raise ValueError("a non-loopback API requires api_key")
     if "vision" in cfg and type(cfg["vision"]) is not bool:
         raise ValueError("vision must be a boolean")
-    if cfg.get("vision") and (cfg["variant"] == GSQ_VARIANT or not cfg.get("mmproj")):
-        raise ValueError("vision requires a UD model and mmproj")
+    if cfg.get("vision") and not cfg.get("mmproj"):
+        raise ValueError("vision requires mmproj")
     cache = cfg.get("prefix_cache_mib", 0)
     if type(cache) is not int or not 0 <= cache <= 4096:
         raise ValueError("prefix_cache_mib must be an integer in 0..4096")
@@ -205,9 +206,10 @@ class Manager:
 
     def public_config(self):
         cfg = self.config_value()
+        cfg["vision"] = vision_enabled(cfg)
         has_key = bool(cfg.pop("api_key", ""))
         return dict(path=str(self.config), exists=self.config.is_file(), values=cfg, has_api_key=has_key,
-                    setup=self.setup(), variants=[GSQ_VARIANT, "UD-Q2_K_XL", "UD-IQ3_XXS"])
+                    setup=self.setup(), variants=[*GSQ_VARIANTS, "UD-Q2_K_XL", "UD-IQ3_XXS"])
 
     def job(self):
         job = read_json(self.state_dir / "job.json", {})

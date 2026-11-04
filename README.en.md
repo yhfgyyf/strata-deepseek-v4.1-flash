@@ -15,7 +15,7 @@ DeepSeek-V4.1-Flash on a home PC: **Intel Core i7-14700KF, one RTX PRO 6000 Blac
 
 Built on [Strata](https://github.com/Niko1221/Strata) and [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4), with a native DeepSeek runtime, SSD-backed Engram, GPU/RAM expert residency, and **DSpark speculative decoding**. The supported models use the same launch script and their original GGUF files: **no offline weight conversion, shard merging, or extra quantization is required**.
 
-The service supports **1M context capacity (1,048,576 tokens)**, **multimodal text + image input** with the Unsloth models, tool calls, OpenAI Chat Completions / Responses, and Anthropic Messages. GSQ-RCO currently supports text input. The starter uses one request slot, chunk 8192, and a default maximum output of 32768 tokens. For long contexts, the setup can be adjusted to **chunk 32K (32768 tokens)** and **a maximum output of 128K (131072 tokens)**.
+The service supports **1M context capacity (1,048,576 tokens)**, **multimodal text + image input**, tool calls, OpenAI Chat Completions / Responses, and Anthropic Messages. The starter uses one request slot, chunk 8192, and a default maximum output of 32768 tokens. For long contexts, the setup can be adjusted to **chunk 32K (32768 tokens)** and **a maximum output of 128K (131072 tokens)**.
 
 **Recommended GPUs: one RTX PRO 6000 Blackwell 96GB, or two RTX 5090 cards.**
 
@@ -26,12 +26,14 @@ The service supports **1M context capacity (1,048,576 tokens)**, **multimodal te
 | Main model | Hugging Face | ModelScope | Launch configuration |
 |---|---|---|---|
 | **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS + IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | [GSQ-RCO-IQ2_XS + IQ4_NL Engram](https://www.modelscope.cn/models/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
+| **GSQ-RCO-IQ2_XS-Uncensored** | [AtomicChat IQ2_XS](https://huggingface.co/AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF/tree/b8bca19979431f96126ceac8cbe0ee7160a28f8a) | — | [rtxpro6000.gsq-rco-iq2-xs-uncensored.json](examples/rtxpro6000.gsq-rco-iq2-xs-uncensored.json) |
 | **UD-IQ3_XXS** | [UD-IQ3_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [Model files — select UD-IQ3_XXS](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-iq3-xxs.json](examples/rtxpro6000.ud-iq3-xxs.json) |
 | **UD-Q2_K_XL** | [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [Model files — select UD-Q2_K_XL](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-q2-k-xl.json](examples/rtxpro6000.ud-q2-k-xl.json) |
 
 | Model | Total weights (GB) | Main model excluding Engram (GB) | Engram (GB) |
 |---|---:|---:|---:|
 | **GSQ-RCO-IQ2_XS** | **265.821** | 155.226 | 110.595 |
+| **GSQ-RCO-IQ2_XS-Uncensored** | **265.821** | 155.226 | 110.595 |
 | **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
 | **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
 
@@ -99,6 +101,8 @@ For a terminal or AI agent:
 ./start.sh launch --yes --json
 # Later: ./start.sh start | status | stop | logs
 ```
+
+For Uncensored, run `./start.sh configure --config config.uncensored.json --model GSQ-RCO-IQ2_XS-Uncensored --data-dir /path/to/models --source huggingface` and pass `--config config.uncensored.json` to subsequent commands.
 
 Downloads default to ModelScope; `--source huggingface` and `--source hf-mirror` are explicit alternatives with the same required hashes. The manager stays on localhost, preserves interrupted downloads and controls only its own service. The API and existing web chat use port **30011** by default. The original `serve_experimental.py --config FILE` entry remains supported.
 

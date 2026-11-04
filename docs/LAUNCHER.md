@@ -25,10 +25,21 @@ All commands accept `--config FILE` (default `config.local.json`) and `--json`. 
 ./start.sh stop --json
 ```
 
+Supported model selections are `GSQ-RCO-IQ2_XS`, `GSQ-RCO-IQ2_XS-Uncensored`, `UD-Q2_K_XL` and `UD-IQ3_XXS`. The Uncensored option uses AtomicChat's pinned IQ2_XS shards, the original GSQ Engram, and the original 1017 DSpark/mmproj. Both GSQ variants use the publisher’s 60 KiB `exp_probs_b_vl.f32` next to the configured mmproj for image routing. The two UD variants read these rows from their main shards. The Uncensored shard filenames match the original GSQ pack, so the default model/runtime directories and API alias are separate. Full verification selects the appropriate fourth-shard digest.
+
+To prepare a separate Uncensored configuration:
+
+```bash
+./start.sh configure --config config.uncensored.json --model GSQ-RCO-IQ2_XS-Uncensored --data-dir /path/to/models --source huggingface
+./start.sh plan --config config.uncensored.json --json
+```
+
+For this new pack, select `huggingface` or `hf-mirror` explicitly; ModelScope availability has not been verified. Existing asset paths can be supplied with `configure --set` below. To switch models on the same GPU/port, stop the currently managed config, then start the selected config. Keep using that same config path for status, logs and stop.
+
 | Command | Behavior |
 |---|---|
 | `gui` | Open the local management page. `--port 30010 --no-browser` supports a headless host. |
-| `configure` | Save paths/settings with a private timestamped backup. `--model UD-Q2_K_XL` / `UD-IQ3_XXS` selects the other packs. `--reset-paths` replaces existing asset paths using the selected model and data directory. |
+| `configure` | Save paths/settings with a private timestamped backup. `--model` selects one of the four packs above. `--reset-paths` replaces existing asset paths using the selected model and data directory. |
 | `plan` | Read-only file/disk/download plan; no hashing, writes, installation or GPU loading. |
 | `install --yes` | Create `.venv`, install the existing pinned Python requirements, build the three native entries, resume/verify assets and check config. Leaves the model stopped. |
 | `launch --yes` | Install, then start and wait for readiness. |

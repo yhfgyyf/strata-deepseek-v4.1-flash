@@ -16,7 +16,7 @@ function fill(config) {
   const c=config.values,s=config.setup;
   for(const el of document.querySelectorAll("[data-config]")) el.value=c[el.dataset.config]||"";
   $("variant").value=c.variant; $("source").value=s.source; $("data-dir").value=s.data_dir;
-  $("no-proxy").checked=s.no_proxy; $("vision").checked=!!c.vision; $("vision").disabled=c.variant.startsWith("GSQ");
+  $("no-proxy").checked=s.no_proxy; $("vision").checked=c.vision;
   $("port").value=c.port||30011; $("host").value=c.host||"127.0.0.1";
   $("prefix-cache").value=c.prefix_cache_mib??0; $("hot-bytes").value=c.hot_bytes??"";
   $("cuda").value=s.cuda; $("build-dir").value=s.build_dir; $("ggml-dir").value=s.ggml_dir; $("jobs").value=s.jobs;
@@ -42,7 +42,6 @@ function updateControls() {
   $("cancel-prepare").disabled=busy||!preparing||active;
   $("chat").href=s.ready?s.url:"#";
   for(const el of document.querySelectorAll("#config-form input,#config-form select")) el.disabled=active||preparing;
-  $("vision").disabled ||= $("variant").value.startsWith("GSQ");
 }
 async function refresh() {
   const previousState=current?.service.state;
@@ -64,7 +63,7 @@ async function refresh() {
 async function logs() { const value=await api("logs?kind="+logKind); const el=$("logs"),bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20; el.textContent=value.text||"No logs yet.";if(bottom)el.scrollTop=el.scrollHeight; }
 async function action(fn) { if(busy)return;busy=true;updateControls();try{await fn();await refresh();await logs();}catch(e){notice(e.message);}finally{busy=false;updateControls();} }
 $("config-form").addEventListener("input",edit);
-$("variant").addEventListener("change",()=>{ if($("variant").value.startsWith("GSQ"))$("vision").checked=false; updateControls();notice("Model changed. Select Use model paths, or enter the existing files for this model."); });
+$("variant").addEventListener("change",()=>{ updateControls();notice("Model changed. Select Use model paths, or enter the existing files for this model."); });
 $("config-form").addEventListener("submit",e=>{e.preventDefault();action(async()=>{const v=await api("config",payload());const state=await api("state");fill(state.config);notice("Configuration saved."+(v.backup?" A backup of the previous version was saved.":""),true);});});
 $("use-default-paths").addEventListener("click",()=>action(async()=>{const v=payload();v.reset_paths=true;for(const key of ["model","draft","tokenizer","mmproj","engine","profile","heat","integrity"])delete v.set[key];await api("config",v);const state=await api("state");fill(state.config);notice("Default paths saved for the selected model and directory.",true);}));
 $("plan").addEventListener("click",()=>action(async()=>{if(dirty)throw new Error("Save the configuration before reviewing the setup plan.");const p=await api("plan");const box=$("plan-view");box.replaceChildren();const title=document.createElement("strong");title.textContent=`To download: ${(p.download_bytes/2**30).toFixed(2)} GiB · ${p.assets.length} files`;box.append(title);const list=document.createElement("ul");for(const a of p.assets){const li=document.createElement("li");li.textContent=`${a.exists?(a.size_matches?"Needs verification":"Size mismatch; original file preserved"):a.partial_bytes?"Resume":"Download"} · ${a.path} · ${(a.bytes/2**30).toFixed(2)} GiB`;if(a.exists&&!a.size_matches)li.className="bad";list.append(li);}for(const d of p.disks){const li=document.createElement("li");li.textContent=`${d.path}: ${(d.free_bytes/2**30).toFixed(1)} GiB free${d.enough?"":"; insufficient space"}`;if(!d.enough)li.className="bad";list.append(li);}box.append(list);}));

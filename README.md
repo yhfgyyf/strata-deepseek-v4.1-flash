@@ -15,7 +15,7 @@
 
 基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。适配模型共用一个启动脚本，直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
 
-支持 **1M 上下文容量（1,048,576 tokens）**、Unsloth 模型的**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。GSQ-RCO 当前支持文本输入。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。长上下文场景可调整为 **chunk 32K（32768 tokens）**、**最大输出 128K（131072 tokens）**。
+支持 **1M 上下文容量（1,048,576 tokens）**、**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。长上下文场景可调整为 **chunk 32K（32768 tokens）**、**最大输出 128K（131072 tokens）**。
 
 **推荐显卡：单张 RTX PRO 6000 Blackwell 96GB，或双张 RTX 5090。**
 
@@ -26,12 +26,14 @@
 | 主模型 | Hugging Face | ModelScope（魔搭） | 启动配置 |
 |---|---|---|---|
 | **GSQ-RCO-IQ2_XS** | [GSQ-RCO-IQ2_XS＋IQ4_NL Engram](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/tree/cb02422c900df489cea5833e8a92171224059b3c) | [GSQ-RCO-IQ2_XS＋IQ4_NL Engram](https://www.modelscope.cn/models/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) | [rtxpro6000.gsq-rco-iq2-xs.json](examples/rtxpro6000.gsq-rco-iq2-xs.json) |
+| **GSQ-RCO-IQ2_XS-Uncensored** | [AtomicChat IQ2_XS](https://huggingface.co/AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF/tree/b8bca19979431f96126ceac8cbe0ee7160a28f8a) | — | [rtxpro6000.gsq-rco-iq2-xs-uncensored.json](examples/rtxpro6000.gsq-rco-iq2-xs-uncensored.json) |
 | **UD-IQ3_XXS** | [UD-IQ3_XXS 目录](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [文件列表，选择 UD-IQ3_XXS](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-iq3-xxs.json](examples/rtxpro6000.ud-iq3-xxs.json) |
 | **UD-Q2_K_XL** | [UD-Q2_K_XL 目录](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [文件列表，选择 UD-Q2_K_XL](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files) | [rtxpro6000.ud-q2-k-xl.json](examples/rtxpro6000.ud-q2-k-xl.json) |
 
 | 模型 | 总权重（GB） | 主模型，不含 Engram（GB） | Engram（GB） |
 |---|---:|---:|---:|
 | **GSQ-RCO-IQ2_XS** | **265.821** | 155.226 | 110.595 |
+| **GSQ-RCO-IQ2_XS-Uncensored** | **265.821** | 155.226 | 110.595 |
 | **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
 | **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
 
@@ -99,6 +101,8 @@ cd strata-deepseek-v4.1-flash
 ./start.sh launch --yes --json
 # 后续：./start.sh start | status | stop | logs
 ```
+
+Uncensored 使用独立配置。运行 `./start.sh configure --config config.uncensored.json --model GSQ-RCO-IQ2_XS-Uncensored --data-dir /path/to/models --source huggingface`，后续命令均带 `--config config.uncensored.json`。
 
 默认从 ModelScope 下载；可明确指定 `--source huggingface` 或 `--source hf-mirror`，都必须通过同一组摘要校验。管理页仅监听本机，下载中断保留断点，启停仅针对本工具创建的服务。API 与原有 Web 聊天默认使用 **30011** 端口。原 `serve_experimental.py --config FILE` 入口继续可用。
 
