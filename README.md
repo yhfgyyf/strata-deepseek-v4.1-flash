@@ -19,6 +19,8 @@
 
 **推荐显卡：单张 RTX PRO 6000 Blackwell 96GB，或双张 RTX 5090。**
 
+同一代码树保留 **RTX PRO 6000 的 C37 累计基线＋GSQ 适配**，并包含 **双 L20 48GB 的 CED/PP mask479 基线**。双 L20 使用 SM89、P2P、文本模式及每卡 40 段普通页锁页内存；独立入口、六分片 GSQ PLE 配置和构建命令见[双 L20 启动说明](docs/INSTALL.md#dual-l20-mask479)。下方 PRO 6000 吞吐表仍对应原测试条件。
+
 ## 适配模型
 
 **GSQ-RCO-IQ2_XS** 来自 **ISTA-DASLab / DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF**，搭配独立的 IQ4_NL Engram 文件。UD 两种版本来自 **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**。

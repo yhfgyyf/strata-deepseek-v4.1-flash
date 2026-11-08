@@ -20,6 +20,20 @@ __global__ void convert_slots(const int64_t* swa, const int64_t* global, int* ou
 namespace strata::models::deepseek41 {
 static cudaError_t cake_attention(const PackedAttention& params, int* scratch, size_t bytes,
                                       cudaStream_t stream, bool draft) {
+    int device=0,major=0;
+    auto status=cudaGetDevice(&device);if(status!=cudaSuccess)return status;
+    status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);if(status!=cudaSuccess)return status;
+    // CAKE's UE8M0/FP4 conversions and cluster fences require the SM120 build.
+    // Preserve packed-cache semantics on Ada through the existing BF16 MMA path.
+    if(major<12) {
+        int minor=0;
+        if(major==8) {
+            status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);
+            if(status!=cudaSuccess)return status;
+        }
+        return major==8&&minor==9?packed_attention_ada_gpu(params,scratch,bytes,stream):
+                                 packed_attention_gpu(params,stream);
+    }
     const auto* p=&params;
     if(!p||!scratch||p->tokens<1||p->heads!=64||
        (draft?((p->tokens!=5&&p->tokens!=7)||p->swa_topk<1||p->swa_topk>135||p->global_topk):p->swa_topk!=128)||

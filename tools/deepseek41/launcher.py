@@ -30,7 +30,8 @@ from tools.deepseek41.startup_assets import GSQ_VARIANT, GSQ_UNCENSORED_VARIANT,
 ENTRY = ROOT / "tools/deepseek41/serve_experimental.py"
 PATH_KEYS = ("engine", "model", "draft", "mmproj", "tokenizer", "runtime_dir", "profile", "heat", "integrity",
              "costs", "draft_input_vocab", "draft_output_vocab", "log")
-EDIT_KEYS = set(PATH_KEYS) | {"variant", "host", "port", "alias", "api_key", "vision", "hot_bytes", "prefix_cache_mib"}
+EDIT_KEYS = set(PATH_KEYS) | {"variant", "host", "port", "alias", "api_key", "vision", "hot_bytes", "prefix_cache_mib",
+                              "pipeline_peer", "huge_pinned_memory", "decode_cpu_misses", "pipeline_contiguous"}
 SETUP_DEFAULTS = dict(source="modelscope", data_dir=str(ROOT / "models"), build_dir=str(ROOT / "build"),
                       cuda="/usr/local/cuda-13.2/bin/nvcc", ggml_dir="", jobs=2, no_proxy=False)
 
@@ -164,6 +165,19 @@ def validate_config(cfg):
         raise ValueError("a non-loopback API requires api_key")
     if "vision" in cfg and type(cfg["vision"]) is not bool:
         raise ValueError("vision must be a boolean")
+    peer = cfg.get("pipeline_peer", -1)
+    if type(peer) is not int or peer < -1 or peer == 0:
+        raise ValueError("pipeline_peer must be -1 or a positive CUDA device index")
+    if type(cfg.get("huge_pinned_memory", True)) is not bool:
+        raise ValueError("huge_pinned_memory must be a boolean")
+    if type(cfg.get("decode_cpu_misses", False)) is not bool:
+        raise ValueError("decode_cpu_misses must be a boolean")
+    if type(cfg.get("pipeline_contiguous", False)) is not bool:
+        raise ValueError("pipeline_contiguous must be a boolean")
+    if cfg.get("pipeline_contiguous", False) and peer < 0:
+        raise ValueError("pipeline_contiguous requires pipeline_peer")
+    if peer >= 0 and vision_enabled(cfg):
+        raise ValueError("the CED pipeline supports text input only")
     if cfg.get("vision") and not cfg.get("mmproj"):
         raise ValueError("vision requires mmproj")
     cache = cfg.get("prefix_cache_mib", 0)
@@ -318,7 +332,10 @@ class Manager:
                     download_bytes=sum(x["download_bytes"] for x in assets), disks=list(groups.values()),
                     build=str(expected_engine) == cfg["engine"] or not Path(cfg["engine"]).is_file(),
                     engine=cfg["engine"], url=endpoint(cfg),
-                    profile="Linux x86-64 / CUDA 13.2 / RTX PRO 6000 96GB; 8192 chunk, 40 blocks, 100% huge pages",
+                    profile="Linux x86-64 / CUDA 13.2 / " +
+                            ("dual L20 48GB; 8192 chunk, 40 blocks per device" if cfg.get("pipeline_peer", -1) >= 0 else
+                             "RTX PRO 6000 96GB; 8192 chunk, 40 blocks") +
+                            (", 100% huge pages" if cfg.get("huge_pinned_memory", True) else ", ordinary pinned pages"),
                     note="Existing sizes are not SHA256 proof. Install verifies all assets; start verifies native-loader metadata.")
 
     def doctor(self, stage="run"):
@@ -341,22 +358,34 @@ class Manager:
                     supported = bool(version and tuple(map(int, version.groups())) >= (3, 24))
                 check(name, supported, (out or error)[:500])
         else:
+            cfg = self.config_value(resolve=True)
             code, out, error = run_output([str(self.python), "-c", "import numpy,jinja2,regex,PIL,requests,psutil"])
             check("runtime dependencies", code == 0, "ready" if code == 0 else (error or out)[-600:])
             code, out, error = run_output(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free,utilization.gpu,compute_cap",
                                            "--format=csv,noheader,nounits"])
             devices = list(csv.reader(out.splitlines())) if code == 0 else []
             visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            selected = [r for r in devices if len(r) == 7 and (visible is None and r[0].strip() == "0"
-                        or visible is not None and visible in (r[0].strip(), r[1].strip()))]
-            check("GPU selection", len(selected) == 1, out or error or "no GPU")
-            if len(selected) == 1:
-                gpu = [v.strip() for v in selected[0]]
-                check("GPU profile", "RTX PRO 6000" in gpu[2] and gpu[6] == "12.0" and float(gpu[3]) >= 90000, gpu[2])
-                check("GPU available", float(gpu[4]) >= 90000 and float(gpu[5]) <= 10,
-                      f"{gpu[4]} MiB free, {gpu[5]}% busy")
+            peer = cfg.get("pipeline_peer", -1)
+            if peer >= 0:
+                rows = [[v.strip() for v in r] for r in devices if len(r) == 7]
+                if visible is not None:
+                    rows = [next((r for r in rows if token.strip() in r[:2]), None) for token in visible.split(",")]
+                selected = [rows[i] for i in (0, peer)] if peer < len(rows) else []
+                valid = len(selected) == 2 and all(selected) and selected[0][1] != selected[1][1]
+            else:
+                selected = [r for r in devices if len(r) == 7 and (visible is None and r[0].strip() == "0"
+                            or visible is not None and visible in (r[0].strip(), r[1].strip()))]
+                valid = len(selected) == 1
+            check("GPU selection", valid, out or error or "no GPU")
+            if valid:
+                for row in selected:
+                    gpu = [v.strip() for v in row]
+                    model, capability, minimum = ("L20", "8.9", 45000) if peer >= 0 else ("RTX PRO 6000", "12.0", 90000)
+                    check("GPU profile " + gpu[0], model in gpu[2] and gpu[6] == capability and float(gpu[3]) >= minimum, gpu[2])
+                    check("GPU available " + gpu[0], float(gpu[4]) >= minimum and float(gpu[5]) <= 10,
+                          f"{gpu[4]} MiB free, {gpu[5]}% busy")
                 code, processes, error = run_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"])
-                check("no competing GPU workload", code == 0 and gpu[1] not in processes, processes or error or "none")
+                check("no competing GPU workload", code == 0 and not any(r[1].strip() in processes for r in selected), processes or error or "none")
             try:
                 mem = {line.split(":")[0]: int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()}
                 check("available RAM", mem["MemAvailable"] >= 160 * 1024 * 1024,
@@ -365,14 +394,15 @@ class Manager:
                 check("CPU 8", 8 in cpus, "CPU 8 must be in the process affinity set")
             except (OSError, KeyError, AttributeError, ValueError) as error:
                 check("host resources", False, str(error))
-            cfg = self.config_value(resolve=True)
             try:
                 from tools.deepseek41.serve_experimental import load_config
                 load_config(self.config)
                 check("config paths", True, str(self.config))
             except (OSError, ValueError) as error:
                 check("config paths", False, str(error))
-            check("huge-page policy", True, "Native startup enforces 40 registered blocks and 100% coverage; no system settings changed")
+            check("huge-page policy", True, "Native startup enforces 40 registered blocks per device; " +
+                  ("100% huge-page coverage" if cfg.get("huge_pinned_memory", True) else "ordinary pinned pages explicitly selected") +
+                  "; no system settings changed")
         return dict(ok=all(x["ok"] for x in checks), stage=stage, checks=checks)
 
     def install(self, yes=False, wait_lock=False):
@@ -410,7 +440,7 @@ class Manager:
                 command([str(self.python), "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")], "dependencies")
                 if plan["build"]:
                     args = ["cmake", "-S", str(ROOT), "-B", settings["build_dir"], "-DCMAKE_BUILD_TYPE=Release",
-                            "-DSTRATA_ENABLE_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=120",
+                            "-DSTRATA_ENABLE_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=" + ("89" if cfg.get("pipeline_peer", -1) >= 0 else "120"),
                             "-DCMAKE_CUDA_COMPILER=" + settings["cuda"], "-DSTRATA_BUILD_TESTS=OFF",
                             "-DSTRATA_BUILD_DEEPSEEK41_TESTS=ON"]
                     if settings["ggml_dir"]:

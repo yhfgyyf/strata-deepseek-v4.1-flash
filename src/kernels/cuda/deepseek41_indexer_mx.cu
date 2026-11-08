@@ -149,6 +149,22 @@ cudaError_t index_scores_mxfp4_gpu(const float* q,const float* w,const uint8_t* 
  if(!q||!w||!packed||!scores||!scratch||tokens<1||tokens>65535||rows<1||start<0||
     (ratio!=1&&ratio!=2)||width!=(blocks?16384:rows)||scratch_bytes<size_t(tokens)*2304)
   return cudaErrorInvalidValue;
+ int device=0,major=0;
+ auto device_status=cudaGetDevice(&device);if(device_status!=cudaSuccess)return device_status;
+ device_status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);if(device_status!=cudaSuccess)return device_status;
+ if(major<12){
+  int minor=0;
+  if(major==8){
+   device_status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);
+   if(device_status!=cudaSuccess)return device_status;
+  }
+  const auto result=major==8&&minor==9?
+      index_scores_bf16_gpu(q,w,packed,mask,blocks,scores,tokens,rows,width,start,ratio,stream):
+      blocks?compact_index_scores_gpu(q,w,nullptr,packed,blocks,scores,tokens,rows,start,ratio,stream):
+      index_scores_gpu(q,w,nullptr,packed,mask,scores,tokens,rows,start,ratio,stream);
+  if(result==cudaSuccess&&score_audit)score_audit(q,w,packed,mask,blocks,scores,tokens,rows,width,start,ratio,stream);
+  return result;
+ }
  auto* payload=scratch;
  auto* scales=reinterpret_cast<uint32_t*>(scratch+size_t(tokens)*2048);
  auto* unsafe=scratch+size_t(tokens)*2176;

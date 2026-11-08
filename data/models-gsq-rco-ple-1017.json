@@ -1,0 +1,36 @@
+{
+  "repository": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+  "huggingface_revision": "65d53bc8be65123e255ff02f3ded958b6dbf54fd",
+  "files": [
+    {
+      "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf",
+      "bytes": 5780704,
+      "sha256": "0182a2a1f42d319a0dbc6e34aa82a063880c069fe3aafbbea86018f386e64e5f"
+    },
+    {
+      "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00006.gguf",
+      "bytes": 39581533600,
+      "sha256": "5c88039fa640460a9fc3465a6dfcd162a4083dd738d55e5b52e025be14555a08"
+    },
+    {
+      "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00006.gguf",
+      "bytes": 39417972640,
+      "sha256": "0fddebfd05f0a36cfd107ba5dfd2547e64df61adbab39560a5a5f5521ca099a5"
+    },
+    {
+      "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00006.gguf",
+      "bytes": 39079187648,
+      "sha256": "c577a43c6e6e615838a1655a0b162541edeac6f36542f08c4a9593a70dcaf500"
+    },
+    {
+      "path": "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00005-of-00006.gguf",
+      "bytes": 37141423776,
+      "sha256": "851d8605bf504962054d17ea8a0d9e2e0a228d085d396bd865a4de9f16d90fbd"
+    },
+    {
+      "path": "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+      "bytes": 110595290816,
+      "sha256": "3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3"
+    }
+  ]
+}

@@ -71,6 +71,7 @@ cudaError_t route_parallel_gpu(const float* logits, const float* bias, const flo
                               int* ids,float* weights,int experts,int top_k,int tokens,float scale,cudaStream_t stream);
 // Change only while the runtime is drained; exact HC vector candidate.
 void hc_project_vector_set_enabled(bool enabled);
+void hc_project_reuse_set_enabled(bool enabled);
 cudaError_t hc_project_gpu(const float* residual, const float* fn, float* mixes, int hidden, int tokens,
                            float eps, cudaStream_t stream);
 cudaError_t hc_split_gpu(const float* mixes, const float* scale, const float* base, float* pre,

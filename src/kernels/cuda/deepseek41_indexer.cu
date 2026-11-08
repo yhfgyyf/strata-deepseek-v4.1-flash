@@ -2,6 +2,8 @@
 #include "strata/models/deepseek41/indexer.hpp"
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <climits>
+#include <cuda_bf16.h>
+#include <mma.h>
 
 namespace strata::models::deepseek41 {
 namespace {
@@ -176,3 +178,129 @@ cudaError_t compact_index_topk_gpu(const IndexSortBuffers& b,const int32_t* bloc
     return cudaGetLastError();
 }
 } // namespace strata::models::deepseek41
+
+// SM89 BF16 Tensor Core scorer, with exact scalar fallback for unsafe inputs.
+namespace strata::models::deepseek41 {
+namespace {
+__device__ __forceinline__ float ada_fp4(uint8_t c) {
+    const unsigned m=c&7;
+    const unsigned bits=m==0?0:m==1?0x3f000000u:((m/2+126)<<23)|((m&1)<<22);
+    return __uint_as_float(bits|((c&8u)<<28));
+}
+__global__ void scores_bf16(const float* q,const float* weights,const uint8_t* packed,
+                           const uint8_t* candidates,const int32_t* blocks,float* scores,
+                           int rows,int width,int64_t start,int ratio) {
+    constexpr int tile=64,stride=136;
+    const int tid=threadIdx.x,warp=tid/32,lane=tid%32,token=blockIdx.y,first=blockIdx.x*tile;
+    const int64_t visible=(start+token+1)/ratio;
+    __shared__ __align__(32) __nv_bfloat16 matrices[(32+tile)*stride];
+    auto* queries=matrices;
+    auto* keys=matrices+32*stride;
+    auto* dots=reinterpret_cast<float*>(matrices);
+    __shared__ int key_ids[tile];
+    if(tid<tile){
+        const int c=first+tid;
+        const int key=c<width?(blocks?blocks[int64_t(token)*2048+c/8]*8+c%8:c):-1;
+        key_ids[tid]=key>=0&&key<rows&&key<visible&&(!candidates||candidates[int64_t(token)*rows+key])?key:-1;
+    }
+    if(!__syncthreads_or(tid<tile&&key_ids[tid]>=0)){
+        if(tid<tile&&first+tid<width)scores[int64_t(token)*width+first+tid]=-INFINITY;
+        return;
+    }
+    bool unsafe=false;
+    for(int i=tid*4;i<32*128;i+=128*4){
+        const float4 values=*reinterpret_cast<const float4*>(q+int64_t(token)*4096+i);
+        const uint32_t bits[4]={__float_as_uint(values.x),__float_as_uint(values.y),
+                               __float_as_uint(values.z),__float_as_uint(values.w)};
+#pragma unroll
+        for(int z=0;z<4;++z){
+            const unsigned magnitude=bits[z]&0x7fffffffU;
+            unsafe|=(bits[z]&0xffffU)!=0 || (magnitude!=0 &&
+                (magnitude<0x24800000U || magnitude>0x5a800000U));
+        }
+        auto* target=reinterpret_cast<uint64_t*>(queries+(i/128)*stride+i%128);
+        *target=uint64_t(bits[0]>>16)|(uint64_t(bits[1]>>16)<<16)|
+                (uint64_t(bits[2]>>16)<<32)|(uint64_t(bits[3]>>16)<<48);
+    }
+    for(int r=warp;r<tile;r+=4){
+        const int key=key_ids[r],dim=lane*4;
+        uint64_t result=0;
+        if(key>=0){
+            const auto* p=packed+int64_t(key)*68;
+            const unsigned exponent=p[64+dim/32];
+            unsafe|=exponent<73||exponent>181;
+            const unsigned codes=*reinterpret_cast<const uint16_t*>(p+dim/2);
+#pragma unroll
+            for(int z=0;z<4;++z){
+                const unsigned code=(codes>>(4*z))&15,m=code&7;
+                unsigned bits=((m/2+126)<<7)|((m&1)<<6);
+                bits=m==1?0x3f00U:bits;
+                bits=m==0?0U:unsigned(int(bits)+(int(exponent)-127)*128);
+                result|=uint64_t((bits|((code&8)<<12))&0xffffU)<<(z*16);
+            }
+        }
+        *reinterpret_cast<uint64_t*>(keys+r*stride+dim)=result;
+    }
+    if(__syncthreads_or(unsafe)){
+        // Same dimension/shuffle tree and eight head groups as the scalar baseline.
+        for(int r=warp;r<tile;r+=4){
+            const int key=key_ids[r];
+            if(key<0){if(!lane&&first+r<width)scores[int64_t(token)*width+first+r]=-INFINITY;continue;}
+            const auto* p=packed+int64_t(key)*68;float kv[4];
+#pragma unroll
+            for(int z=0;z<4;++z){const int d=lane+32*z;kv[z]=ada_fp4((p[d/2]>>(d%2*4))&15)*__uint_as_float(uint32_t(p[64+z])<<23);}
+            float sums[8]={};
+            for(int h=0;h<32;++h){
+                float dot=0;
+#pragma unroll
+                for(int z=0;z<4;++z)dot+=q[(int64_t(token)*32+h)*128+lane+32*z]*kv[z];
+                for(int delta=16;delta;delta>>=1)dot+=__shfl_down_sync(0xffffffff,dot,delta);
+                if(!lane)sums[h%8]+=fmaxf(dot,0.f)*weights[token*32+h]*(1.f/64.f);
+            }
+            if(!lane){float sum=0;for(int w=0;w<8;++w)sum+=sums[w];scores[int64_t(token)*width+first+r]=sum;}
+        }
+        return;
+    }
+    namespace wmma=nvcuda::wmma;
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc[2];
+    wmma::fill_fragment(acc[0],0.f);wmma::fill_fragment(acc[1],0.f);
+#pragma unroll
+    for(int k=0;k<128;k+=16){
+        wmma::fragment<wmma::matrix_a,16,16,16,__nv_bfloat16,wmma::row_major> a;
+        wmma::load_matrix_sync(a,keys+warp*16*stride+k,stride);
+#pragma unroll
+        for(int h=0;h<2;++h){
+            wmma::fragment<wmma::matrix_b,16,16,16,__nv_bfloat16,wmma::col_major> b;
+            wmma::load_matrix_sync(b,queries+h*16*stride+k,stride);
+            wmma::mma_sync(acc[h],a,b,acc[h]);
+        }
+    }
+    __syncthreads(); // Query storage becomes the FP32 score tile only after every warp has read it.
+    wmma::store_matrix_sync(dots+warp*16,acc[0],64,wmma::mem_col_major);
+    wmma::store_matrix_sync(dots+warp*16+16*64,acc[1],64,wmma::mem_col_major);
+    __syncthreads();
+    if(tid<tile&&first+tid<width){
+        float total=0;
+#pragma unroll
+        for(int w=0;w<8;++w){
+            float sum=0;
+#pragma unroll
+            for(int h=w;h<32;h+=8)sum+=fmaxf(dots[h*64+tid],0.f)*weights[token*32+h]*(1.f/64.f);
+            total+=sum;
+        }
+        scores[int64_t(token)*width+first+tid]=key_ids[tid]>=0?total:-INFINITY;
+    }
+}
+}
+cudaError_t index_scores_bf16_gpu(const float* q,const float* w,const uint8_t* packed,
+    const uint8_t* mask,const int32_t* blocks,float* scores,int tokens,int rows,int width,
+    int64_t start,int ratio,cudaStream_t stream){
+    if(!q||!w||!packed||!scores||tokens<1||tokens>65535||rows<1||start<0||
+       (ratio!=1&&ratio!=2)||width!=(blocks?16384:rows))return cudaErrorInvalidValue;
+    if((reinterpret_cast<uintptr_t>(q)&15)||(reinterpret_cast<uintptr_t>(packed)&1))
+        return blocks?compact_index_scores_gpu(q,w,nullptr,packed,blocks,scores,tokens,rows,start,ratio,stream):
+                      index_scores_gpu(q,w,nullptr,packed,mask,scores,tokens,rows,start,ratio,stream);
+    scores_bf16<<<dim3((uint64_t(width)+63)/64,tokens),128,0,stream>>>(q,w,packed,mask,blocks,scores,rows,width,start,ratio);
+    return cudaGetLastError();
+}
+}

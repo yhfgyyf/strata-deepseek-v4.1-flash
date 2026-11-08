@@ -10,6 +10,16 @@ inline constexpr std::array<const char*,5> gsq_rco_1017_sha256{
     "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf",
     "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"
 };
+// Publisher's PLE-compatible six-shard layout, verified from ModelScope 2026-11-05.
+// The last shard is the renamed/linked IQ4_NL Engram table, with its own header.
+inline constexpr std::array<const char*,6> gsq_rco_1017_ple_sha256{
+    "0182a2a1f42d319a0dbc6e34aa82a063880c069fe3aafbbea86018f386e64e5f",
+    "5c88039fa640460a9fc3465a6dfcd162a4083dd738d55e5b52e025be14555a08",
+    "0fddebfd05f0a36cfd107ba5dfd2547e64df61adbab39560a5a5f5521ca099a5",
+    "c577a43c6e6e615838a1655a0b162541edeac6f36542f08c4a9593a70dcaf500",
+    "851d8605bf504962054d17ea8a0d9e2e0a228d085d396bd865a4de9f16d90fbd",
+    "3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3"
+};
 // AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF, IQ2_XS.
 // Revision b8bca19979431f96126ceac8cbe0ee7160a28f8a changes only shard four.
 inline constexpr const char* gsq_rco_1017_uncensored_shard4_sha256=

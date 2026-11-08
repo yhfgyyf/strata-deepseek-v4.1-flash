@@ -32,6 +32,10 @@ cudaError_t pack_global_gpu(const uint16_t* kv, const int64_t* slots, int tokens
 cudaError_t pack_index_gpu(const float* keys, uint8_t* packed, int rows, cudaStream_t stream);
 cudaError_t fake_quant_index_gpu(float* queries, int rows, cudaStream_t stream);
 cudaError_t packed_attention_gpu(const PackedAttention& params, cudaStream_t stream);
+// SM89: scratch must be disjoint from all inputs/outputs. Large prefill reuses
+// it for BF16 cache rows; unsupported layouts/capacities keep packed attention.
+cudaError_t packed_attention_ada_gpu(const PackedAttention& params, void* scratch,
+                                     size_t scratch_bytes, cudaStream_t stream);
 // SM120 main-model path: reuses dead Q-low-rank scratch, original partial/LSE arena.
 cudaError_t packed_attention_cake_gpu(const PackedAttention& params, int32_t* scratch,
                                       size_t scratch_bytes, cudaStream_t stream);

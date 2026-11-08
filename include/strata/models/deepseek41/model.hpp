@@ -107,7 +107,7 @@ private:
     std::array<LayerOwnership, 40> ownership_ = layer_ownership();
     std::unique_ptr<GgufFile> main_, draft_, vision_, external_engram_;
     std::vector<std::unique_ptr<GgufFile>> main_shards_;
-    bool main_complete_ = true, ple_engram_ = false, gsq_rco_1017_ = false, draft_shared_embeddings_ = false;
+    bool main_complete_ = true, ple_engram_ = false, gsq_rco_1017_ = false, gsq_ple_ = false, draft_shared_embeddings_ = false;
     Views tensors_, draft_tensors_, vision_tensors_;
     std::vector<int32_t> token_map_;
 };

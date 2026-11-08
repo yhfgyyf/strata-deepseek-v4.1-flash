@@ -45,6 +45,14 @@ GSQ_RCO_SHA256 = [
     "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a",
 ]
 GSQ_ENGRAM_FILE = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+GSQ_PLE_SHA256 = [
+    "0182a2a1f42d319a0dbc6e34aa82a063880c069fe3aafbbea86018f386e64e5f",
+    "5c88039fa640460a9fc3465a6dfcd162a4083dd738d55e5b52e025be14555a08",
+    "0fddebfd05f0a36cfd107ba5dfd2547e64df61adbab39560a5a5f5521ca099a5",
+    "c577a43c6e6e615838a1655a0b162541edeac6f36542f08c4a9593a70dcaf500",
+    "851d8605bf504962054d17ea8a0d9e2e0a228d085d396bd865a4de9f16d90fbd",
+    "3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3",
+]
 # AtomicChat IQ2_XS at b8bca19979431f96126ceac8cbe0ee7160a28f8a.
 GSQ_UNCENSORED_SHARD4_SHA256 = "18305a5afbf8087e1f88a9f2978cc74650357f482629d346349ed374cb7c8451"
 
@@ -62,6 +70,11 @@ def approved_files(paths, main_q2_k_xl=False, sidecars_1017=False, main_gsq_rco=
             continue
         match = re.fullmatch(r"(.*)-(\d{5})-of-(\d{5})\.gguf", path.name)
         if kind == "main" and main_gsq_rco:
+            if match and int(match[3]) == 6 and 1 <= int(match[2]) <= 6 and not main_gsq_rco_uncensored:
+                result.extend(
+                    ("main." + str(i), path.with_name(f"{match[1]}-{i:05d}-of-00006.gguf"), digest)
+                    for i, digest in enumerate(GSQ_PLE_SHA256, 1))
+                continue
             if not match or int(match[3]) != 4 or not 1 <= int(match[2]) <= 4:
                 raise ValueError("GSQ-RCO requires four main shards and external Engram")
             digests = list(GSQ_RCO_SHA256)

@@ -1,7 +1,8 @@
 # Working on strata-deepseek-v4.1-flash
 
 This project runs DeepSeek V4.1 Flash on Linux x86-64,
-CUDA 13.2 and one RTX PRO 6000 Blackwell (SM120).
+CUDA 13.2 and one RTX PRO 6000 Blackwell (SM120), or the explicit
+dual-L20 (SM89) text-only profile in docs/INSTALL.md.
 
 - Read the relevant source and documentation before editing. Preserve local model files and configuration.
 - Keep the fixed prefill chunk at 8192 unless the user asks to change it.

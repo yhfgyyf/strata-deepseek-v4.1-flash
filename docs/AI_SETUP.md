@@ -2,6 +2,8 @@
 
 This guide applies to **strata-deepseek-v4.1-flash**, its fixed Linux/CUDA/RTX PRO 6000 profile and the four model variants listed in [LAUNCHER.md](LAUNCHER.md). Use this repository's `./start.sh`; upstream Strata's `strata launch`, desktop installers and model identifiers are different products/workflows.
 
+For the explicit dual-L20 text profile, follow [its manual build and mask479 entry](INSTALL.md#dual-l20-mask479). Preserve the single-card examples when configuring L20.
+
 ## Inspect before acquiring files
 
 Read the user's selected model, destination, download source and proxy constraints. Reuse existing files when requested. Check OS/architecture, free disk, CPU 8, available RAM/VRAM and competing GPU workloads. Do not install drivers, alter huge-page settings, stop existing services or substitute a different model as a hidden preparation step.

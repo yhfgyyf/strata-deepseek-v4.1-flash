@@ -111,6 +111,32 @@ int main() {
         std::ofstream(gsq_shards.back(),std::ios::app)<<"changed";gsq_refuses();
         gsq_proof(uncensored);
         std::filesystem::remove(engram);gsq_refuses();
+        const auto ple_first=(root/"gsq-00001-of-00006.gguf").string();
+        const auto ple_shards=strata::gguf_split_paths(ple_first,false);
+        for(const auto& path:ple_shards)std::ofstream(path)<<"fixture";
+        auto ple_proof=[&](int count,bool wrong=false){
+            std::ofstream out(proof);out<<"STRATA_DSV41_SHA256_V1\n";
+            for(int i=0;i<count;++i){
+                struct stat q{};if(stat(ple_shards[i].c_str(),&q))throw std::runtime_error("PLE fixture stat");
+#ifdef __APPLE__
+                const auto mt=uint64_t(q.st_mtimespec.tv_sec)*1000000000+q.st_mtimespec.tv_nsec;
+                const auto ct=uint64_t(q.st_ctimespec.tv_sec)*1000000000+q.st_ctimespec.tv_nsec;
+#else
+                const auto mt=uint64_t(q.st_mtim.tv_sec)*1000000000+q.st_mtim.tv_nsec;
+                const auto ct=uint64_t(q.st_ctim.tv_sec)*1000000000+q.st_ctim.tv_nsec;
+#endif
+                out<<"main."<<i+1<<' '<<(wrong&&i==3?uncensored:strata::models::deepseek41::gsq_rco_1017_ple_sha256[i])<<' '
+                    <<q.st_dev<<' '<<q.st_ino<<' '<<q.st_size<<' '<<mt<<' '<<ct<<'\n';
+            }
+        };
+        auto ple_refuses=[&]{
+            try{require_integrity(proof.string(),"main",ple_first);}
+            catch(const std::exception&){return;}
+            throw std::runtime_error("invalid six-shard proof accepted");
+        };
+        ple_proof(6);require_integrity(proof.string(),"main",ple_first);
+        ple_proof(5);ple_refuses();ple_proof(6,true);ple_refuses();
+        ple_proof(6);std::ofstream(ple_shards.back(),std::ios::app)<<"changed";ple_refuses();
         std::cout<<"DeepSeek proof identity and refusal passed\n";return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

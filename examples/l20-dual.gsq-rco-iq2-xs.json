@@ -1,0 +1,18 @@
+{
+  "engine": "../build-l20/strata-deepseek41-l20-mask479",
+  "variant": "GSQ-RCO-IQ2_XS",
+  "model": "/path/to/GSQ-RCO-PLE/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf",
+  "draft": "/path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf",
+  "tokenizer": "/path/to/tokenizer.json",
+  "vision": false,
+  "pipeline_peer": 1,
+  "huge_pinned_memory": false,
+  "runtime_dir": "../runtime/l20-mask479",
+  "host": "127.0.0.1",
+  "port": 10002,
+  "prefix_cache_mib": 1024,
+  "alias": "deepseek-v4.1-flash-1017-gsq-rco",
+  "log": "../runtime/l20-mask479/engine.log",
+  "decode_cpu_misses": false,
+  "pipeline_contiguous": false
+}

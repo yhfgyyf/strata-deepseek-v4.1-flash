@@ -1,4 +1,4 @@
-"""Serve the fixed RTX PRO 6000 experimental profile from local asset paths."""
+"""Serve the RTX PRO 6000 or dual-L20 experimental profile from local assets."""
 import argparse
 import json
 import os
@@ -10,7 +10,7 @@ import threading
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.deepseek41.startup_assets import GSQ_VARIANT, GSQ_VARIANTS, GSQ_VISION_BIAS, VARIANTS, prepare, vision_enabled
+from tools.deepseek41.startup_assets import GSQ_VARIANT, GSQ_VARIANTS, GSQ_VISION_BIAS, VARIANTS, prepare, vision_enabled, gsq_ple_model
 from tools.deepseek41.hash_proof import GSQ_ENGRAM_FILE
 
 
@@ -26,7 +26,20 @@ def load_config(path):
     if variant is not None and variant not in VARIANTS:
         raise ValueError("variant must be " + ", ".join(VARIANTS))
     cfg.pop("_gsq_vision_bias", None)
+    peer = cfg.get("pipeline_peer", -1)
+    if type(peer) is not int or peer < -1 or peer == 0:
+        raise ValueError("pipeline_peer must be -1 or a positive CUDA device index")
+    if type(cfg.get("huge_pinned_memory", True)) is not bool:
+        raise ValueError("huge_pinned_memory must be a boolean")
+    if type(cfg.get("decode_cpu_misses", False)) is not bool:
+        raise ValueError("decode_cpu_misses must be a boolean")
+    if type(cfg.get("pipeline_contiguous", False)) is not bool:
+        raise ValueError("pipeline_contiguous must be a boolean")
+    if cfg.get("pipeline_contiguous", False) and peer < 0:
+        raise ValueError("pipeline_contiguous requires pipeline_peer")
     cfg["vision"] = vision_enabled(cfg)
+    if peer >= 0 and cfg["vision"]:
+        raise ValueError("the CED pipeline supports text input only")
     # Explicit calibrated assets retain their existing behavior. The supplied
     # variant configs can instead prepare only small metadata beside the config.
     if variant:
@@ -53,7 +66,7 @@ def load_config(path):
         raise ValueError("vision must be a boolean")
     if cfg.get("vision") and not cfg.get("mmproj"):
         raise ValueError("vision requires mmproj")
-    if variant in GSQ_VARIANTS and cfg["vision"]:
+    if variant in GSQ_VARIANTS and cfg["vision"] and not gsq_ple_model(cfg):
         bias = (path.parent / Path(cfg["mmproj"]).expanduser()).with_name(GSQ_VISION_BIAS)
         if not bias.is_file():
             raise ValueError("GSQ image router bias is missing: " + str(bias))
@@ -82,15 +95,15 @@ def load_config(path):
         raise ValueError("engine must be executable")
     if variant:
         prefix = "DeepSeek-V4.1-Flash-1017-" + (GSQ_VARIANT if variant in GSQ_VARIANTS else variant)
-        shards = 4 if variant in GSQ_VARIANTS else 7
+        shards = 6 if gsq_ple_model(cfg) else 4 if variant in GSQ_VARIANTS else 7
         if Path(cfg["model"]).name != prefix + f"-00001-of-{shards:05d}.gguf":
-            count = "four" if shards == 4 else "seven"
+            count = "six" if shards == 6 else "four" if shards == 4 else "seven"
             raise ValueError("model must name the first of the " + count + " " + variant + " shards")
         for i in range(1, shards + 1):
             peer = Path(cfg["model"]).with_name(prefix + f"-{i:05d}-of-{shards:05d}.gguf")
             if not peer.is_file():
                 raise ValueError("model shard is missing: " + str(peer))
-        if variant in GSQ_VARIANTS and not Path(cfg["model"]).with_name(GSQ_ENGRAM_FILE).is_file():
+        if variant in GSQ_VARIANTS and shards == 4 and not Path(cfg["model"]).with_name(GSQ_ENGRAM_FILE).is_file():
             raise ValueError("GSQ-RCO external Engram is missing: " + GSQ_ENGRAM_FILE)
     return cfg
 
@@ -127,6 +140,10 @@ def main():
     os.environ["STRATA_DS41_BLOCK_SEGMENTS"] = "40"
     os.environ["STRATA_DS41_BLOCK_HUGE_MIN_PERCENT"] = "100"
     os.environ["STRATA_DS41_DECODE_SEGMENTS"] = "2"
+    os.environ["STRATA_DS41_PIPELINE_PEER"] = str(cfg.get("pipeline_peer", -1))
+    os.environ["STRATA_DS41_NO_HUGE"] = "0" if cfg.get("huge_pinned_memory", True) else "1"
+    os.environ["STRATA_DS41_DECODE_CPU_MISSES"] = "1" if cfg.get("decode_cpu_misses", False) else "0"
+    os.environ["STRATA_DS41_PIPELINE_CONTIGUOUS"] = "1" if cfg.get("pipeline_contiguous", False) else "0"
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

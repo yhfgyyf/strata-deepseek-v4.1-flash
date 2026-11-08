@@ -11,6 +11,9 @@ void index_score_set_audit(IndexScoreAudit audit);
 cudaError_t index_scores_mxfp4_gpu(const float* q,const float* weights,const uint8_t* packed,const uint8_t* mask,
  const int32_t* blocks,float* scores,uint8_t* scratch,size_t scratch_bytes,int tokens,int rows,int width,
  int64_t start,int ratio,cudaStream_t stream);
+// SM89: no additional scratch; unaligned or numerically unsafe inputs keep scalar semantics.
+cudaError_t index_scores_bf16_gpu(const float* q,const float* weights,const uint8_t* packed,const uint8_t* mask,
+ const int32_t* blocks,float* scores,int tokens,int rows,int width,int64_t start,int ratio,cudaStream_t stream);
 struct IndexSortBuffers {
     float* sorted_scores = nullptr;
     int *input_ids = nullptr, *sorted_ids = nullptr;

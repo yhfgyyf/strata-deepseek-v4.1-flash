@@ -52,9 +52,11 @@ struct RuntimeOptions {
     bool engram_pipeline = false, expert_bf16 = false, expert_direct_gemv = false;
     bool expert_pipeline = false, adaptive_layer_progress = false;
     double pcie_frac = 0;
+    bool decode_cpu_misses = false; // Decode cold experts use CPU; prefill keeps the GPU issuer.
     bool compact_logits = false;
     bool compact_workspace = false; // Main-model phase scratch reuse; DSpark reserves its wider FC input.
     bool dense_q8 = false, dense_q8_1 = false; // Packed attention/shared weights; optional short Q8_1 inputs.
+    bool moe_input_reuse = false, shared_q8_reuse = false, sm89_grouped_moe = false;
     bool shared_q8_pair = false; // Shared Gate/Up reuse one Q8_1 input and an exact paired projection.
     bool shared_early_submit = true, route_compact_handoff = true; // Independently confirmed short all-GPU dispatch.
     int expert_gu_mode = 0; // 0: separate BF16 GEMVs; 1: fused BF16; 2: fused integer Q8_1.
@@ -64,6 +66,14 @@ struct RuntimeOptions {
     bool decode_raw_cache = false;
     bool pinned_experts = false, prefill_expert_lookahead = false;
     bool huge_pinned_memory = true;
+    int pipeline_peer = -1; // Optional second CUDA device; CED stages 0:10,10:20,20:32,32:40 by default.
+    bool pipeline_contiguous = false; // Explicit alternative: layers 0:20 on rank 0, 20:40 on rank 1.
+    bool pipeline_overlap = true;
+    int pipeline_rank = -1; // Internal: -1 single device, 0/1 stage ownership.
+    bool owns_layer(int layer) const {
+        return pipeline_rank < 0 || pipeline_rank == (pipeline_contiguous ? int(layer >= 20) :
+            ((layer < 10 || (layer >= 20 && layer < 32)) ? 0 : 1));
+    }
     std::vector<std::string> capture_stages; // Empty preserves the complete diagnostic capture.
 };
 struct ImageEmbedding {
@@ -74,6 +84,7 @@ struct ImageEmbedding {
 };
 struct ExecutionStats {
     uint64_t expert_gpu = 0, expert_cpu = 0, h2d_expert_bytes = 0;
+    uint64_t cpu_input_d2h_bytes = 0, cpu_output_h2d_bytes = 0;
     uint64_t encoder_token_layers = 0, decoder_token_layers = 0, kv_only_tokens = 0;
     uint64_t replay_tokens = 0, decoded_tokens = 0;
     double prefill_ms = 0, decode_ms = 0, engram_wait_ms = 0;
@@ -94,6 +105,7 @@ struct ExecutionStats {
     uint64_t direct_expert_bytes=0,prefetch_expert_bytes=0,prefetch_unused_bytes=0,prefetch_pruned_bytes=0;
     std::array<double,2> engram_layer_wait_ms{};
     uint64_t shared_graph_captures=0,shared_graph_launches=0;
+    uint64_t peer_copy_bytes=0,pipeline_encoder_chunks=0;
 };
 struct Distribution {
     std::vector<int32_t> ids;

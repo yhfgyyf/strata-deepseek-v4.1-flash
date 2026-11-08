@@ -270,6 +270,13 @@ void routed(int type,int tokens,cublasHandle_t blas){
 }
 int main(){
     try{
+        for(bool contiguous:{false,true})for(int rank:{-1,0,1}){
+            d::RuntimeOptions options;options.pipeline_rank=rank;options.pipeline_contiguous=contiguous;
+            for(int layer=0;layer<40;++layer){
+                const int owner=contiguous?int(layer>=20):((layer<10||(layer>=20&&layer<32))?0:1);
+                if(options.owns_layer(layer)!=(rank<0||rank==owner))throw std::runtime_error("pipeline layer ownership");
+            }
+        }
         cublasHandle_t blas=nullptr;if(cublasCreate(&blas)!=CUBLAS_STATUS_SUCCESS||cublasSetMathMode(blas,CUBLAS_PEDANTIC_MATH)!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("test BLAS");
         struct Cleanup{cublasHandle_t h;~Cleanup(){cublasDestroy(h);}} cleanup{blas};
         helpers();strided(blas);strided_round();workspace_attention_bounds();compact_workspace_budget();workspace_auto_budget();markov_bf16_rows();

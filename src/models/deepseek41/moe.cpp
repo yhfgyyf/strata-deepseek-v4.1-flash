@@ -33,7 +33,7 @@ bool Runtime::Impl::short_gpu_moe(int tokens,int phase) const {
         (options.experts==ExpertMode::gpu||(options.experts==ExpertMode::hybrid&&options.pcie_frac==1));
 }
 bool Runtime::Impl::compact_routes(int tokens,int phase) const {
-    return options.route_compact_handoff&&short_gpu_moe(tokens,phase)&&options.decode_graph&&
+    return options.route_compact_handoff&&!options.decode_cpu_misses&&short_gpu_moe(tokens,phase)&&options.decode_graph&&
         (decode_segment_mask&2)&&((1u<<tokens)&0x1b4u)&&route_group_enabled.load();
 }
 void Runtime::Impl::route(int layer,int tokens,Workspace& w,int phase) {
@@ -60,6 +60,7 @@ void Runtime::Impl::route(int layer,int tokens,Workspace& w,int phase) {
 void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,int phase,std::vector<int>* deferred_routes,bool routes_ready) {
     prefill::LedgerScope moe_trace(options.trace,"ds41.moe");
     const bool prefill=phase!=2;
+    const bool cpu_misses=options.decode_cpu_misses&&!prefill;
     const bool mixed_fast=options.arithmetic==Arithmetic::production&&expert_mixed_fast_enabled();
     if(decode_raw_cache && !prefill && tokens>8)decode_raw_cache->clear(upload.value);
     const auto& f=experts->format(layer);
@@ -85,7 +86,11 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
             gpu_check(round_bf16_strided_gpu(w.shared_up,tokens,2304,2304,stream.value));
         }else{
             matmul(gate,w.x,w.shared_gate,tokens,w);
-            matmul(up,w.x,w.shared_up,tokens,w);
+            const bool reuse=options.shared_q8_reuse&&options.arithmetic==Arithmetic::production&&
+                tokens>=1&&tokens<=8&&options.dense_q8_1&&(tokens==1||options.dense_q8_batch)&&
+                gate.packed_bf16&&up.packed_bf16&&gate.type==13&&up.type==13&&
+                gate.rows==2304&&up.rows==2304&&gate.cols==5120&&up.cols==5120;
+            matmul(up,w.x,w.shared_up,tokens,w,0,0,0,0,true,reuse);
         }
         gpu_check((options.arithmetic==Arithmetic::production?swiglu_bf16_gpu:swiglu_gpu)(w.shared_gate,w.shared_up,nullptr,w.shared_act,2304,tokens,10.f,stream.value));
         matmul(tensor(layer,"ffn_down_shexp"),w.shared_act,w.shared_out,tokens,w);
@@ -113,8 +118,12 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     } shared_failure{stream.value};
     if(!routes_ready)route(layer,tokens,w,phase);
     const bool cpu_path=options.arithmetic==Arithmetic::production &&
-        (options.experts==ExpertMode::cpu || (options.experts==ExpertMode::hybrid && !prefill && tokens<=kernels::cpu::MAXT));
-    if(cpu_path && options.pcie_frac<1)gpu_check(cudaMemcpyAsync(w.host_x,w.x,int64_t(tokens)*5120*4,cudaMemcpyDeviceToHost,stream.value));
+        (options.experts==ExpertMode::cpu || (options.experts==ExpertMode::hybrid && !prefill && (cpu_misses||tokens<=kernels::cpu::MAXT)));
+    if(cpu_path && (cpu_misses||options.pcie_frac<1)){
+        const uint64_t bytes=int64_t(tokens)*5120*4;
+        gpu_check(cudaMemcpyAsync(w.host_x,w.x,bytes,cudaMemcpyDeviceToHost,stream.value));
+        stats.cpu_input_d2h_bytes+=bytes;
+    }
     if(early_shared){
         gpu_check(cudaEventRecord(route_ready.value,stream.value));
         shared_failure.active=true;
@@ -176,7 +185,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     }
     std::vector<const Group*> cold,cpu;
     std::vector<std::pair<const Group*,const uint8_t*>> resident;
-    const bool cache_active=decode_raw_cache && phase==2 && tokens<=8;
+    const bool cache_active=decode_raw_cache && phase==2 && tokens<=8 && !cpu_misses;
     for(const auto& g:groups)if(!g.rows.empty()) {
         if(options.experts==ExpertMode::cpu)cpu.push_back(&g);
         else if(const auto* blob=experts->gpu(layer,g.expert,stream.value,stats,phase))resident.push_back({&g,blob});
@@ -186,7 +195,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         }else if(cpu_path)cpu.push_back(&g);
         else cold.push_back(&g);
     }
-    if(cpu_path && options.pcie_frac>0) {
+    if(cpu_path && !cpu_misses && options.pcie_frac>0) {
         const size_t take=cpu.size()*static_cast<unsigned>(std::lround(options.pcie_frac*256))/256;
         for(size_t i=0;i<take;++i)stats.demand_expert_tokens+=cpu[i]->rows.size();
         stats.demand_expert_bytes+=take*f.bytes;stats.cold_expert_groups+=take;stats.demand_expert_groups+=take;
@@ -230,7 +239,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     // the original per-expert workspace; no residency or arena allocation changes.
     constexpr uint64_t expert_elements=5120ull*2304;
     // Only the measured full prefill chunk uses this path; smaller batches regress.
-    const bool bounded=mixed_fast && options.expert_bf16 && options.expert_pipeline && tokens==8192 &&
+    const bool bounded=(bounded_moe_supported||(bounded_moe_sm89&&options.sm89_grouped_moe)) && mixed_fast && options.expert_bf16 && options.expert_pipeline && tokens==8192 &&
         // These two pairs fail the whole-layer accuracy gate; keep567.
         !(f.gu_type==17 && f.d_type==39) && !(f.gu_type==11 && f.d_type==11) &&
         (expert_mixed_type(f.gu_type)||f.gu_type==11) && (expert_mixed_type(f.d_type)||f.d_type==11) &&
@@ -262,11 +271,22 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         const int* slots=single?nullptr:w.group_slots+g.offset;
         float* output=single?w.parts+int64_t(g.slots[0])*5120:w.parts;
         int projection_index=0;
+        auto reused_gu=[&](const uint16_t* weights,float* output,int index){
+            if(!options.moe_input_reuse||nt<=8||index>1||options.arithmetic!=Arithmetic::production)return false;
+            if(index==0)gpu_check(float_to_bf16_gpu(input,w.bf_input,int64_t(nt)*5120,stream.value));
+            const float alpha=1,beta=0;
+            const auto status=cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,2304,nt,5120,&alpha,
+                weights,CUDA_R_16BF,5120,w.bf_input,CUDA_R_16BF,5120,&beta,output,CUDA_R_32F,2304,
+                CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            if(status!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("DeepSeek reused GU multiplication status="+std::to_string(status));
+            round(output,int64_t(nt)*2304);return true;
+        };
         auto projection=[&](const uint8_t* packed,int rows,int cols,uint16_t* bf,const float* input,float* output){
             const int index=projection_index++;
             const int type=index==2?f.d_type:f.gu_type;
             const bool packed_supported=type==10||type==11||type==39;
             if(prepared) {
+                if(reused_gu((*prepared)[index],output,index))return;
                 Matrix matrix{(*prepared)[index],30,rows,cols,uint64_t(rows)*cols};
                 matmul(matrix,input,output,nt,w);return;
             }
@@ -292,6 +312,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
             }else {
                 gpu_check(dequant_gpu(packed,type,w.dequant,matrix.elements,stream.value));matrix.data=w.dequant;
             }
+            if(matrix.type==30&&reused_gu(static_cast<const uint16_t*>(matrix.data),output,index))return;
             matmul(matrix,input,output,nt,w);
         };
         if(mixed_fast && options.expert_direct_gemv && !prepared &&
@@ -537,8 +558,10 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
             item.job.ff_weights=item.weights.data();stats.expert_cpu+=item.job.nt;jobs.push_back(std::move(item));
         }
         if(!jobs.empty())drain();
-        for(const Group* group:cpu)for(int slot:group->slots)
+        for(const Group* group:cpu)for(int slot:group->slots){
             gpu_check(cudaMemcpyAsync(w.parts+int64_t(slot)*5120,w.host_parts+int64_t(slot)*5120,5120*4,cudaMemcpyHostToDevice,stream.value));
+            stats.cpu_output_h2d_bytes+=5120*4;
+        }
     }
     gpu_check(combine_experts_gpu(w.parts,w.route_ids,w.shared_out,w.branch,tokens,6,stream.value));round(w.branch,int64_t(tokens)*5120);
 }

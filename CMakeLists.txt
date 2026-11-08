@@ -1326,7 +1326,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_deepseek41_kernels PRIVATE third_party/ggml)
     add_library(strata_deepseek41_runtime STATIC src/models/deepseek41/runtime.cpp src/models/deepseek41/weights.cpp
       src/models/deepseek41/layer.cpp src/models/deepseek41/moe.cpp src/models/deepseek41/session.cpp src/models/deepseek41/vision.cpp
-      src/models/deepseek41/draft.cpp)
+      src/models/deepseek41/draft.cpp src/models/deepseek41/pipeline.cpp)
     target_sources(strata_deepseek41_runtime PRIVATE src/models/deepseek41/engram_pipeline.cpp src/models/deepseek41/expert_pipeline.cpp)
     target_include_directories(strata_deepseek41_runtime PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_sources(strata_deepseek41_runtime PRIVATE src/models/deepseek41/ipc.cpp src/models/deepseek41/phase_cache.cpp
@@ -1341,6 +1341,9 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(deepseek41_quantized_ops_test src/models/deepseek41/quantized_ops_test.cpp)
     target_include_directories(deepseek41_quantized_ops_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(deepseek41_quantized_ops_test PRIVATE strata_deepseek41_runtime ggml-base)
+    add_executable(deepseek41_ple_weights_test src/models/deepseek41/ple_weights_test.cpp)
+    target_include_directories(deepseek41_ple_weights_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(deepseek41_ple_weights_test PRIVATE strata_deepseek41_runtime ggml-base)
     add_executable(deepseek41_prefill_quant_test src/models/deepseek41/prefill_quant_test.cpp)
     target_include_directories(deepseek41_prefill_quant_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(deepseek41_prefill_quant_test PRIVATE strata_deepseek41_runtime strata_mmq ggml-base)
@@ -1353,6 +1356,11 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata-deepseek41-experimental PRIVATE
       ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} src/models/deepseek41)
     target_link_libraries(strata-deepseek41-experimental PRIVATE strata_deepseek41_runtime)
+
+    add_executable(strata-deepseek41-l20-mask479 tools/deepseek41/l20_mask479_server.cpp)
+    target_include_directories(strata-deepseek41-l20-mask479 PRIVATE
+      ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} src/models/deepseek41)
+    target_link_libraries(strata-deepseek41-l20-mask479 PRIVATE strata_deepseek41_runtime)
 
     add_executable(strata-deepseek41-vision src/models/deepseek41/vision_main.cpp)
     target_link_libraries(strata-deepseek41-vision PRIVATE strata_deepseek41_runtime)

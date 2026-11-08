@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
         if (argc < 10 || argc > 12) throw std::invalid_argument("invalid experimental server arguments; use --help");
         const std::string model = argv[1];
         const auto shards = strata::gguf_split_paths(model).size();
-        const bool iq = shards == 7 || shards == 4;
+        const bool iq = shards == 7 || shards == 4 || shards == 6;
         const std::string vision = std::string(argv[3]) == "-" ? "" : argv[3];
         d::RuntimeOptions o;
         o.integrity_file = argv[4];
@@ -55,11 +55,37 @@ int main(int argc, char** argv) {
         }
         o.engram_pipeline = true; o.expert_bf16 = true; o.expert_direct_gemv = true;
         o.expert_pipeline = true; o.adaptive_layer_progress = true; o.pcie_frac = 1;
+        if(const char* cpu=std::getenv("STRATA_DS41_DECODE_CPU_MISSES")){
+            if(std::string(cpu)!="0"&&std::string(cpu)!="1")throw std::invalid_argument("CPU decode miss selection");
+            o.decode_cpu_misses=std::string(cpu)=="1";
+        }
         o.compact_logits = true; o.compact_workspace = true; o.dense_q8 = true; o.dense_q8_1 = true;
         o.expert_gu_mode = 2; o.decode_graph = true; o.decode_raw_cache = true;
         o.pinned_experts = true; o.prefill_expert_lookahead = true; o.huge_pinned_memory = true;
+        if(const char* peer=std::getenv("STRATA_DS41_PIPELINE_PEER")){
+            const std::string value=peer;size_t used=0;o.pipeline_peer=std::stoi(value,&used);
+            if(used!=value.size()||o.pipeline_peer< -1)throw std::invalid_argument("pipeline peer device");
+        }
+        if(const char* split=std::getenv("STRATA_DS41_PIPELINE_CONTIGUOUS")){
+            if(std::string(split)!="0"&&std::string(split)!="1")throw std::invalid_argument("pipeline contiguous selection");
+            o.pipeline_contiguous=std::string(split)=="1";
+        }
+        if(const char* ordinary=std::getenv("STRATA_DS41_NO_HUGE")){
+            if(std::string(ordinary)!="0"&&std::string(ordinary)!="1")throw std::invalid_argument("ordinary page selection");
+            o.huge_pinned_memory=std::string(ordinary)!="1";
+        }
+        if(const char* serial=std::getenv("STRATA_DS41_PIPELINE_SERIAL")){
+            if(std::string(serial)!="0"&&std::string(serial)!="1")throw std::invalid_argument("pipeline serial control");
+            o.pipeline_overlap=std::string(serial)!="1";
+        }
         o.engram_continuous = true; o.parallel_router = true; o.engram_aio = true; o.trace = false;
         o.dspark_prefix_commit = true; o.dense_q8_batch = true; o.dspark_gpu_greedy = true;
+        auto reuse_flag=[](const char* name){const char* v=std::getenv(name);if(!v)return false;
+            if(std::string(v)!="0"&&std::string(v)!="1")throw std::invalid_argument(name);return v[0]=='1';};
+        o.moe_input_reuse=reuse_flag("STRATA_DS41_MOE_INPUT_REUSE");
+        o.shared_q8_reuse=reuse_flag("STRATA_DS41_SHARED_Q8_REUSE");
+        o.sm89_grouped_moe=reuse_flag("STRATA_DS41_SM89_GROUPED_MOE");
+        strata::models::deepseek41::hc_project_reuse_set_enabled(reuse_flag("STRATA_DS41_HC_PROJECT_REUSE"));
         o.dspark_incremental_kv = true; o.dspark_draft_tokens = 5; o.shared_q8_pair = true;
         o.dspark_adaptive_verification = true; o.dspark_fused_moe = true;
         o.dspark_batch_projection = true; o.target_verify_batch = true;
@@ -83,18 +109,20 @@ int main(int argc, char** argv) {
             throw std::runtime_error("pin request/control thread CPU8");
         using Access = d::PrefetchBlockBenchmark;
         o.hot_front = Access::rt(*runtime).options.hot_front;
-        const auto& host = Access::rt(*runtime).experts->host_memory_info();
-        host.write(std::cerr); std::cerr << '\n';
-        const unsigned huge_minimum = d::block_huge_min_percent();
-        if ((std::string(host.mode) != "registered_2m_blocks" &&
-             std::string(host.mode) != "registered_blocks_mixed_pages") || host.registration_count != 40 ||
-            host.required_huge_percent != huge_minimum || !host.logical ||
-            !d::host_huge_sufficient(host.huge_before, host.mapped, huge_minimum) ||
-            !d::host_huge_sufficient(host.huge_after, host.mapped, huge_minimum) ||
-            Access::rt(*runtime).experts->hot_pairs().empty() || Access::rt(*runtime).experts->gpu_bytes() > o.hot_front)
-            throw std::runtime_error("block-pinned memory/coverage/residency gate");
-        Access::startup_heat(Access::cache(*runtime), argv[6], false);
-        Access::aligned(Access::cache(*runtime), false);
+        const unsigned huge_minimum = o.huge_pinned_memory?d::block_huge_min_percent():0;
+        auto& primary=Access::rt(*runtime);
+        for(auto* device:{&primary,primary.peer.get()})if(device){
+            d::DeviceScope selected(device->device);const auto& host=device->experts->host_memory_info();
+            host.write(std::cerr);std::cerr<<'\n';
+            const bool pages=o.huge_pinned_memory?
+                ((std::string(host.mode)=="registered_2m_blocks"||std::string(host.mode)=="registered_blocks_mixed_pages")&&
+                 d::host_huge_sufficient(host.huge_before,host.mapped,huge_minimum)&&d::host_huge_sufficient(host.huge_after,host.mapped,huge_minimum)):
+                (std::string(host.mode)=="registered_ordinary_blocks"&&host.huge_before==0&&host.huge_after==0);
+            if(!pages||host.registration_count!=40||host.required_huge_percent!=huge_minimum||!host.logical||
+               device->experts->hot_pairs().empty()||device->experts->gpu_bytes()>device->options.hot_front)
+                throw std::runtime_error("block-pinned memory/coverage/residency gate");
+            Access::startup_heat(Access::cache(*device),argv[6],false);Access::aligned(Access::cache(*device),false);
+        }
         runtime->write_ledger(std::cerr); std::cerr << '\n';
         size_t free = 0, total = 0; d::gpu_check(cudaMemGetInfo(&free, &total));
         if (free < (700ull << 20)) throw std::runtime_error("GPU free-memory guard");

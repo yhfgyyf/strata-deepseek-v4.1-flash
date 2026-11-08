@@ -64,20 +64,29 @@ __global__ void float_attention_kernel(const float* q, const float* swa, const f
     out[(int64_t(token) * heads + head) * 512 + lane + 256] = denominator > 0 ? odd * alpha / denominator : 0.f;
 }
 }
-cudaError_t packed_attention_gpu(const PackedAttention& p, cudaStream_t stream) {
+namespace {
+bool attention_valid(const PackedAttention& p, bool expanded) {
     if (!p.q || !p.sinks || !p.output || !p.lse || p.tokens < 1 || p.heads != 64 ||
         p.swa_topk < 0 || p.global_topk < 0 || p.splits < 1 || p.splits > native::kV41MaxSplits ||
         p.q_head_stride != 512 || p.q_token_stride < p.heads * p.q_head_stride ||
-        !layout_valid(p.swa,528) || p.swa.page_size != 32 || (p.swa_topk && !p.swa_slots) ||
-        (p.global_topk && (!layout_valid(p.global,288) || !p.global_slots ||
+        !layout_valid(p.swa,expanded?1024:528) || p.swa.page_size != 32 || (p.swa_topk && !p.swa_slots) ||
+        (p.global_topk && (!layout_valid(p.global,expanded?1024:288) || !p.global_slots ||
                           (p.global.page_size != 64 && p.global.page_size != 128))) ||
-        (p.splits > 1 && !p.partial)) return cudaErrorInvalidValue;
-    native::V41EpilogueParams epilogue{};
+        (p.splits > 1 && !p.partial)) return false;
     if (p.grouped_output) {
         if (!p.positions || !p.cos_sin || p.cos_positions < 1 || p.total_tokens < p.tokens ||
             p.token_offset < 0 || p.token_offset > p.total_tokens - p.tokens ||
             p.grouped_output == p.q || p.grouped_output == p.output || p.grouped_output == p.partial)
-            return cudaErrorInvalidValue;
+            return false;
+    }
+    return true;
+}
+}
+template <bool ExpandedCache = false, bool FastMath = false>
+static cudaError_t packed_attention_impl(const PackedAttention& p, cudaStream_t stream) {
+    if (!attention_valid(p,ExpandedCache)) return cudaErrorInvalidValue;
+    native::V41EpilogueParams epilogue{};
+    if (p.grouped_output) {
         epilogue = {p.positions,p.cos_sin,reinterpret_cast<native::bf16*>(p.grouped_output),64,
                     p.cos_positions,p.total_tokens,p.token_offset,8};
     }
@@ -90,9 +99,56 @@ cudaError_t packed_attention_gpu(const PackedAttention& p, cudaStream_t stream) 
         p.swa.bytes,p.global.bytes,p.swa.page_stride,p.swa.row_stride,p.global.page_stride,p.global.row_stride,
         p.swa.page_size,p.global.page_size,p.swa_topk,p.global_topk,p.tokens,p.heads,p.splits,
         0.04419417382415922f,p.global_topk > 0,false,epilogue};
-    return native::launch_deepseek_v41_attention<int64_t,int64_t>(params,
+    return native::launch_deepseek_v41_attention<int64_t,int64_t,ExpandedCache,FastMath>(params,
         reinterpret_cast<native::bf16*>(p.output),token_stride,512,stream);
 }
+cudaError_t packed_attention_gpu(const PackedAttention& p, cudaStream_t stream) {
+    return packed_attention_impl(p,stream);
+}
+
+namespace {
+template<bool Global>
+__global__ void expand_attention_cache(CacheLayout cache, uint16_t* output, int64_t rows) {
+    const int64_t row=blockIdx.x;
+    if(row>=rows)return;
+    const int dim=threadIdx.x*2;
+    const auto* src=cache.data+row*cache.row_stride;
+    float a,b;
+    if constexpr(Global) {
+        const float scale=native::decode_fp8_e4m3(src[256+dim/16]);
+        const uint8_t code=src[dim/2];
+        a=native::decode_e2m1(code&15)*scale;
+        b=native::decode_e2m1(code>>4)*scale;
+    } else {
+        const float scale=__uint_as_float(uint32_t(src[512+dim/32])<<23);
+        a=native::decode_fp8_e4m3(src[dim])*scale;
+        b=native::decode_fp8_e4m3(src[dim+1])*scale;
+    }
+    *reinterpret_cast<__nv_bfloat162*>(output+row*512+dim)=__floats2bfloat162_rn(a,b);
+}
+}
+
+cudaError_t packed_attention_ada_gpu(const PackedAttention& p, void* scratch, size_t bytes, cudaStream_t stream) {
+    if (!attention_valid(p,false)) return cudaErrorInvalidValue;
+    if (p.tokens<=32) return packed_attention_impl<false,true>(p,stream);
+    const bool supported=p.splits==1&&p.swa_topk==128&&
+        p.swa.page_stride==p.swa.row_stride*p.swa.page_size&&
+        (!p.global_topk||p.global.page_stride==p.global.row_stride*p.global.page_size);
+    if(!supported||!scratch||reinterpret_cast<uintptr_t>(scratch)%16)return packed_attention_gpu(p,stream);
+    const int64_t sw_rows=(p.swa.bytes-528)/p.swa.row_stride+1;
+    const int64_t g_rows=p.global_topk?(p.global.bytes-288)/p.global.row_stride+1:0;
+    if(sw_rows>0x7fffffffLL||g_rows>0x7fffffffLL||uint64_t(sw_rows+g_rows)>bytes/1024)
+        return packed_attention_gpu(p,stream);
+    auto* output=static_cast<uint16_t*>(scratch);
+    expand_attention_cache<false><<<sw_rows,256,0,stream>>>(p.swa,output,sw_rows);
+    if(g_rows)expand_attention_cache<true><<<g_rows,256,0,stream>>>(p.global,output+sw_rows*512,g_rows);
+    auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+    auto expanded=p;
+    expanded.swa={reinterpret_cast<uint8_t*>(output),sw_rows*1024,int64_t(p.swa.page_size)*1024,1024,p.swa.page_size};
+    if(g_rows)expanded.global={reinterpret_cast<uint8_t*>(output+sw_rows*512),g_rows*1024,int64_t(p.global.page_size)*1024,1024,p.global.page_size};
+    return packed_attention_impl<true,true>(expanded,stream);
+}
+
 cudaError_t float_attention_gpu(const float* q,const float* swa,const float* global,
                                const int64_t* sw_slots,const int64_t* global_slots,const float* sinks,float* out,
                                int tokens,int heads,int sw_topk,int global_topk,int64_t sw_rows,int64_t global_rows,cudaStream_t stream) {

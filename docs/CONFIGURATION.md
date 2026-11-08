@@ -43,3 +43,9 @@ To reuse calibrated startup assets, provide both `profile` and `heat`. An explic
 The launcher sets `STRATA_DS41_BLOCK_SEGMENTS=40`, `STRATA_DS41_BLOCK_HUGE_MIN_PERCENT=100` and `STRATA_DS41_DECODE_SEGMENTS=2`, and defaults `CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX=0`, matching the adopted profile. It does not change system configuration. `--check-config` only checks paths and executable permissions; startup checks generated metadata and full model identity.
 
 It also defaults `STRATA_DS41_ADAPTIVE_POLICY=maya`, `OMP_NUM_THREADS=6` and `OPENBLAS_NUM_THREADS=1`. Set the policy to `legacy` to select the earlier residency policy. The experimental starter requires CPU 8 to be available in the process CPU set.
+
+## Explicit dual-L20 profile
+
+The [L20 example](../examples/l20-dual.gsq-rco-iq2-xs.json) uses the separate [mask479 entry](INSTALL.md#dual-l20-mask479), port10002 and `vision: false`. `pipeline_peer: 1` selects the second visible CUDA device; omitting it or setting `-1` retains the single-device path. `pipeline_contiguous: false` retains the CED stage ownership 0:10 / 10:20 / 20:32 / 32:40. `decode_cpu_misses: false` keeps cold experts on GPU. `huge_pinned_memory: false` explicitly selects ordinary-page block-pinned memory with 40 registrations per bank; the PRO 6000 default remains `true` with 100% huge-page coverage. These fields do not change drivers, system page settings or another service.
+
+Use the L20 script and binary together. Merely selecting two GPUs with the original experimental binary does not activate the complete mask479 dispatch set. The six-shard model path selects its pinned PLE identity; the existing four-shard GSQ and Uncensored identities remain distinct.

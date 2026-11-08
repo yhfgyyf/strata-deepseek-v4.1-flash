@@ -42,12 +42,24 @@ bool vocab_weight(const std::string& name) {
 }
 }
 WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t stream,bool draft,bool vision,bool dense_q8,
-                       const std::vector<int32_t>* draft_vocab,const std::vector<int32_t>* draft_input_vocab) {
+                       const std::vector<int32_t>* draft_vocab,const std::vector<int32_t>* draft_input_vocab,const RuntimeOptions* placement) {
     if(draft_vocab&&(!draft||vision||draft_vocab->empty()))throw std::invalid_argument("draft vocabulary weight bank");
     uint64_t bytes = 0;
     for (const auto& [name,v] : model.tensors(draft,vision)) {
         const auto& t = *v.info;
         if (!include_weight(v.role)) continue;
+        if(placement && placement->pipeline_rank>=0 && !draft && !vision){
+            if(name.rfind("blk.",0)==0){
+                const int layer=std::stoi(name.substr(4));
+                // Both ranks need Engram projection descriptors. Rank 1 prepares
+                // layer20's KV-only path locally at the end of each encoder chunk.
+                const bool projection=name.find(".engram_kv.")!=std::string::npos || name.find(".engram_wkv.")!=std::string::npos;
+                const bool kv_only=placement->pipeline_rank==1 && layer==20 &&
+                    (name.find(".attn_compressor_")!=std::string::npos || name.find(".indexer.")!=std::string::npos || name.find(".attn_norm.")!=std::string::npos);
+                if(!placement->owns_layer(layer) && !projection && !kv_only)continue;
+            }else if(placement->pipeline_rank==0 && (name=="output.weight" || name=="output_norm.weight"))continue;
+            else if(placement->pipeline_rank==1 && name=="token_embd.weight")continue;
+        }
         Matrix m; m.type = storage_type(v,t.name,arithmetic,model,draft,dense_q8); m.cols = t.shape[0]; m.elements = 1;
         m.packed_bf16=(dense_q8&&(m.type==8||m.type==13||m.type==14)&&packed_projection(t.name))||(draft&&(m.type==2||m.type==8)&&!vocab_weight(t.name));
         for (auto dim : t.shape) m.elements *= dim;
@@ -60,8 +72,9 @@ WeightBank::WeightBank(const Model& model,Arithmetic arithmetic,cudaStream_t str
         }
         bytes += aligned(m.type==2?m.elements/32*18:m.type==8?m.elements/32*34:m.type==13?m.elements/256*176:m.type==14?m.elements/256*210:m.elements*(m.type==0?4:2));matrices_.emplace(t.name,m);
     }
-    arena_ = std::make_unique<core::DeviceArena>(bytes);
-    core::DeviceArena temporary(128ull << 20);
+    const int device=current_device();
+    arena_ = std::make_unique<core::DeviceArena>(bytes,device);
+    core::DeviceArena temporary(128ull << 20,device);
     auto* packed = allocate<uint8_t>(temporary,32ull << 20);
     auto* decoded = allocate<float>(temporary,16ull << 20);
     int last_layer = -1;
@@ -170,18 +183,21 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         if (!options.profile.empty()) {
             std::vector<std::pair<int32_t,int32_t>> ranked; int64_t profile_slots = 0;
             if (!core::read_expert_profile(options.profile,40,384,ranked,profile_slots,error)) throw std::runtime_error(error);
+            ranked.erase(std::remove_if(ranked.begin(),ranked.end(),[&](const auto& key){return !options.owns_layer(key.first);}),ranked.end());
             if (options.hot_front > UINT64_MAX - options.hot_back) throw std::overflow_error("DeepSeek expert budget overflow");
             hot_ = allocate_ranked_hot_experts(sizes,ranked,options.hot_front+options.hot_back).experts;
             if (hot_.empty()) throw std::invalid_argument("DeepSeek first ranked expert does not fit GPU capacity");
         } else {
             const auto quotas = allocate_hot_experts(sizes,options.hot_front,options.hot_back);
             for (int e = 0; e < 384; ++e) for (int l = 0; l < 40; ++l)
-                if (e < quotas.count[l]) hot_.emplace_back(l,e);
+                if (options.owns_layer(l) && e < quotas.count[l]) hot_.emplace_back(l,e);
         }
         std::vector<uint64_t> layer_sizes(sizes.begin(),sizes.end());
-        if (!core::detail::make_cache_complement_plan(40,384,layer_sizes,hot_,{},offsets_,ram_bytes_,error)) throw std::runtime_error(error);
+        std::vector<ExpertKey> remote;
+        for(int l=0;l<40;++l)if(!options.owns_layer(l))for(int e=0;e<384;++e)remote.emplace_back(l,e);
+        if (!core::detail::make_cache_complement_plan(40,384,layer_sizes,hot_,remote,offsets_,ram_bytes_,error)) throw std::runtime_error(error);
         std::vector<uint64_t> host_segments;
-        if(options.pinned_experts && options.huge_pinned_memory && ram_bytes_){
+        if(options.pinned_experts && ram_bytes_){
             std::size_t segments=0;
             if(const char* value=std::getenv("STRATA_DS41_BLOCK_SEGMENTS")){
                 if(std::string(value)!="40")throw std::invalid_argument("DeepSeek explicit host segment count must be 40");
@@ -205,6 +221,8 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         std::vector<int64_t> slot_sizes;
         for (const auto& [l,e] : core) { (void)e; slot_sizes.push_back(sizes[l]); }
         if (!slot_sizes.empty() && !cache_.open_sized(slot_sizes,40,384,error)) throw std::runtime_error(error);
+        // Complete the default-stream clear before nonblocking expert uploads.
+        if (!slot_sizes.empty()) gpu_check(cudaStreamSynchronize(nullptr));
         core::detail::HostMemory memory;
         if (!core::detail::host_available_memory(memory)) throw std::runtime_error("DeepSeek host memory unavailable");
         const uint64_t total_ram=ram_bytes_+backup_bytes();
@@ -232,6 +250,7 @@ GgufExperts::GgufExperts(const Model& model,const RuntimeOptions& options,cudaSt
         hot_slot[l*384+e] = slot;
     }
     if (options.arithmetic != Arithmetic::f32) for (int l = 0; l < 40; ++l) {
+        if(!options.owns_layer(l))continue;
         for (int e = 0; e < 384; ++e) {
             const int slot = hot_slot[l*384+e];
             if (slot >= 0) {

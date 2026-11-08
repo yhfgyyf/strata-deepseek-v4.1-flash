@@ -58,10 +58,11 @@ struct Session::Impl::Snapshot {
     size_t token_count=0;
     std::vector<float> last_logits;
     std::vector<double> routing_heat;
+    std::vector<double> peer_routing_heat;
 };
 Session::Impl::Impl(Runtime::Impl& r) : runtime(r),work(*r.work),capture(r.options.capture_directory) {
     capture.stages=r.options.capture_stages;
-    state=std::make_unique<core::DeviceArena>(r.options.state/r.options.slots);
+    state=std::make_unique<core::DeviceArena>(r.options.state/r.options.slots,r.device);
     const bool f32=r.options.arithmetic==Arithmetic::f32;
     partial_owner.fill(-1);int owner=0;
     for(int layer=0;layer<40;++layer) {
@@ -79,12 +80,14 @@ Session::Impl::Impl(Runtime::Impl& r) : runtime(r),work(*r.work),capture(r.optio
     draft_hidden=allocate<float>(*state,128*15360);snapshot_hidden=allocate<float>(*state,128*15360);
     snapshot_local=allocate<uint8_t>(*state,40*128*(f32?512*4:528));snapshot_partial=allocate<float>(*state,4*2*512);
     verified_partial=allocate<float>(*state,4*8*2*512);
-    if(r.options.dspark)draft_kv=std::make_unique<DraftKvCache>(*state,f32);
+    if(r.options.dspark && r.options.pipeline_rank!=0)draft_kv=std::make_unique<DraftKvCache>(*state,f32);
     gpu_check(cudaMemsetAsync(state->base(),0,state->used(),r.stream.value));
     gpu_check(cudaStreamSynchronize(r.stream.value));
     std::cerr<<"DeepSeek slot state used="<<state->used()<<" reserved="<<state->capacity()<<'\n';
+    if(r.peer){DeviceScope selected(r.peer->device);peer=std::make_unique<Impl>(*r.peer);}
 }
 Session::Impl::~Impl(){
+    peer.reset();cudaSetDevice(runtime.device);
     if(engram_ticket)engram_ticket->cancel();
     if(engram_lookahead)engram_lookahead->cancel();
     if(engram_pipeline)engram_pipeline->stop();
@@ -106,6 +109,7 @@ void Session::Impl::prefetch_engram(const std::vector<int>& prompt,int64_t start
 }
 void Session::Impl::reset_local(int first,int64_t at) {
     for(int l=first;l<40;++l){local[l].position=at;local[l].count=0;}
+    if(peer)peer->reset_local(first,at);
 }
 void Session::Impl::image_mask(int count,int64_t start) {
     std::vector<uint8_t> mask(count);
@@ -135,10 +139,7 @@ void Session::Impl::init(const std::vector<int>& ids,int64_t start) {
         history=query.after;engram_ticket=runtime.engram->submit(std::move(query),generation,runtime.options.engram_pipeline);
     }
     ++batch_epoch;index_epoch=0;candidate_epoch=0;index_source=-1;
-    if(runtime.options.engram_pipeline) {
-        if(!engram_pipeline)engram_pipeline=std::make_unique<EngramPipeline>(work,runtime.options.arithmetic,runtime.options.trace,runtime.options.huge_pinned_memory,runtime.model.engram_type());
-        engram_pipeline->start(engram_ticket,batch_epoch,ids.size(),runtime.tensor(1,"engram_wkv"),runtime.tensor(14,"engram_wkv"));
-    }
+    start_engram(ids.size());
     gpu_check(cudaMemcpyAsync(work.ids,ids.data(),ids.size()*sizeof(int),cudaMemcpyHostToDevice,runtime.stream.value));
     gpu_check(cudaMemcpyAsync(work.image,mask.data(),mask.size(),cudaMemcpyHostToDevice,runtime.stream.value));
     if(!values.empty())gpu_check(cudaMemcpyAsync(work.image_values,values.data(),values.size()*4,cudaMemcpyHostToDevice,runtime.stream.value));
@@ -146,6 +147,16 @@ void Session::Impl::init(const std::vector<int>& ids,int64_t start) {
     gpu_check(init_residual_gpu(embedding.data,embedding.type,work.ids,work.image_values,work.image,work.h,work.pre,ids.size(),runtime.stream.value));runtime.round(work.h,ids.size()*20480);
     dump("hc_init",work.h,{static_cast<int64_t>(ids.size()),4,5120});
     dump("hc_pre_init",work.pre,{static_cast<int64_t>(ids.size()),4});
+}
+void Session::Impl::start_engram(int count) {
+    if(!runtime.options.engram_pipeline)return;
+    const int mask=(runtime.options.owns_layer(1)?1:0)|(runtime.options.owns_layer(14)?2:0);
+    if(!mask)return;
+    if(!engram_pipeline){
+        engram_pipeline=std::make_unique<EngramPipeline>(work,runtime.options.arithmetic,runtime.options.trace,
+            runtime.options.huge_pinned_memory,runtime.model.engram_type(),mask);
+    }
+    engram_pipeline->start(engram_ticket,batch_epoch,count,runtime.tensor(1,"engram_wkv"),runtime.tensor(14,"engram_wkv"));
 }
 void Session::Impl::save_boundary(int count,int64_t start) {
     const auto stream=runtime.stream.value;
@@ -174,6 +185,7 @@ Session::Session(Runtime::Impl& runtime):impl_(std::make_unique<Impl>(runtime)){
 Session::~Session(){if(impl_){std::lock_guard<std::mutex> lock(impl_->runtime.execution_mutex);--impl_->runtime.active_sessions;impl_.reset();}}
 std::vector<float> Session::prefill(const std::vector<int>& ids,bool ced,const std::vector<ImageEmbedding>& images) {
     auto& s=*impl_;auto& r=s.runtime;
+    DeviceScope selected(r.device);
     if(r.model.gsq_rco_1017()&&!r.gsq_vision_bias&&!images.empty())throw std::invalid_argument("DeepSeek: GSQ-RCO image routing biases were not loaded");
     prefill::LedgerScope trace(r.options.trace,"ds41.prefill");
     if(ids.empty()||ids.size()>static_cast<size_t>(r.options.context)||s.transaction_active)throw std::invalid_argument("DeepSeek prompt/context/transaction");
@@ -195,6 +207,7 @@ std::vector<float> Session::prefill(const std::vector<int>& ids,bool ced,const s
     }
     const int tail_begin=ced?replay_start(ids.size(),images):0;
     s.ced=ced;s.images=images;s.original_prompt=ids.size();s.capture.tokens(ids);
+    if(s.peer && ced)return s.pipeline_prefill(ids,tail_begin);
     const auto before=std::chrono::steady_clock::now();
     std::vector<float> result;
     // Include the first read in request timing and start before phase preparation.
@@ -233,6 +246,7 @@ std::vector<float> Session::prefill(const std::vector<int>& ids,bool ced,const s
         }
     }else s.decoder_position=s.position;
     if(!result.empty())s.last_logits.assign(result.end()-129280,result.end());
+    s.sync_peer_metadata();
     if(s.last_logits.empty()||s.encoder_position!=s.original_prompt||s.decoder_position!=s.original_prompt||s.history.position!=s.position)
         throw std::runtime_error("DeepSeek incomplete prefill state");
     s.counters.prefill_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
@@ -259,6 +273,7 @@ std::vector<float> Session::resume_history(const std::vector<int>& ids,int64_t o
 }
 std::vector<float> Session::forward(const std::vector<int>& ids) {
     auto& s=*impl_;auto& r=s.runtime;
+    DeviceScope selected(r.device);
     prefill::LedgerScope trace(r.options.trace,"ds41.decode_or_verify");
     if(ids.empty()||ids.size()>static_cast<size_t>(std::max(8,r.options.chunk))||s.position+ids.size()>static_cast<size_t>(r.options.context)||
         s.position<s.original_prompt||s.encoder_position!=s.position||s.decoder_position!=s.position)
@@ -271,17 +286,28 @@ std::vector<float> Session::forward(const std::vector<int>& ids) {
     // erase rejected rows or count a six-row verification as six windows.
     r.experts->observe_decode_window(ids.size());
     if(!s.transaction_active)r.experts->adjust_decode(ids.size(),r.stream.value,s.counters);
+    if(s.peer){
+        auto& p=*s.peer;DeviceScope selected_peer(p.runtime.device);
+        p.runtime.experts->observe_decode_window(ids.size());
+        if(!s.transaction_active)p.runtime.experts->adjust_decode(ids.size(),p.runtime.stream.value,p.counters);
+    }
+    s.sync_peer_metadata();
     s.counters.decode_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();return result;
 }
 int64_t Session::position()const{return impl_->position;}
 int64_t Session::original_prompt_length()const{return impl_->original_prompt;}
-ExecutionStats Session::stats()const{return impl_->counters;}
-void Session::cancel(){impl_->cancelled.store(true);}
+ExecutionStats Session::stats()const{
+    auto result=impl_->counters;if(impl_->peer)add_execution_stats(result,impl_->peer->counters);return result;
+}
+void Session::Impl::clear_transaction(){transaction.reset();transaction_active=false;transaction_routes_deferred=false;}
+void Session::cancel(){impl_->cancelled.store(true);if(impl_->peer)impl_->peer->cancelled.store(true);}
 void Session::begin_transaction() {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    DeviceScope selected(r.device);
     if(s.transaction_active)throw std::runtime_error("DeepSeek nested transaction");
     auto snap=std::make_unique<Impl::Snapshot>();snap->position=s.position;snap->encoder=s.encoder_position;snap->decoder=s.decoder_position;
     snap->routing_heat=r.experts->heat_snapshot();
+    if(s.peer)snap->peer_routing_heat=s.peer->runtime.experts->heat_snapshot();
     snap->history=s.history;snap->token_count=s.tokens.size();snap->last_logits=s.last_logits;
     snap->draft_position=s.draft_capture_position;
     gpu_check(cudaMemcpyAsync(s.snapshot_hidden,s.draft_hidden,128*15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
@@ -299,6 +325,11 @@ void Session::begin_transaction() {
     copies.flush();gpu_check(cudaStreamSynchronize(r.stream.value));s.transaction=std::move(snap);s.transaction_active=true;
     s.transaction_routes_deferred=r.options.dspark_prefix_commit;
     for(auto& routes:s.transaction_routes)routes.clear();
+    if(s.peer){
+        s.peer->transaction=std::make_unique<Impl::Snapshot>(*s.transaction);
+        s.peer->transaction_active=true;s.peer->transaction_routes_deferred=s.transaction_routes_deferred;
+        for(auto& routes:s.peer->transaction_routes)routes.clear();
+    }
 }
 void Session::Impl::capture_partial(int layer,int count,int64_t start) {
     if(!transaction_active||!transaction_routes_deferred)return;
@@ -316,10 +347,14 @@ void Session::Impl::commit_routes(int keep) {
     for(int layer=0;layer<40;++layer){
         if(transaction_routes[layer].size()<static_cast<size_t>(keep*6))throw std::logic_error("DeepSeek transaction route count");
     }
-    for(int layer=0;layer<40;++layer)runtime.experts->observe_routes(layer,transaction_routes[layer].data(),keep,2);
+    for(int layer=0;layer<40;++layer){
+        auto& r=peer&&!runtime.options.owns_layer(layer)?peer->runtime:runtime;
+        r.experts->observe_routes(layer,transaction_routes[layer].data(),keep,2);
+    }
 }
 void Session::commit_verified_prefix(int keep,const std::vector<float>& verified_logits) {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    DeviceScope selected(r.device);
     if(!s.transaction_active||!s.transaction_routes_deferred)throw std::runtime_error("DeepSeek prefix commit requires a recorded transaction");
     const auto& snap=*s.transaction;const int64_t total=s.position-snap.position,end=snap.position+keep;
     if(keep<1||keep>total||total>8||verified_logits.size()!=static_cast<size_t>(total*129280)||
@@ -361,10 +396,13 @@ void Session::commit_verified_prefix(int keep,const std::vector<float>& verified
     copies.flush();gpu_check(cudaStreamSynchronize(r.stream.value));s.commit_routes(keep);
     // Physical forward/H2D counters include rejected verification work.
     r.experts->adjust_decode(keep,r.stream.value,s.counters);
+    if(s.peer){DeviceScope selected_peer(s.peer->runtime.device);s.peer->runtime.experts->adjust_decode(keep,s.peer->runtime.stream.value,s.peer->counters);}
     s.transaction.reset();s.transaction_active=false;s.transaction_routes_deferred=false;
+    s.restore_peer();
 }
 void Session::rollback_transaction() {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    DeviceScope selected(r.device);
     if(!s.transaction_active)throw std::runtime_error("DeepSeek no transaction");
     const auto& snap=*s.transaction;
     StateCopies copies(state_copy_enabled.load(),r.stream.value);
@@ -381,21 +419,27 @@ void Session::rollback_transaction() {
     s.position=snap.position;s.encoder_position=snap.encoder;s.decoder_position=snap.decoder;s.history=snap.history;s.tokens.resize(snap.token_count);s.last_logits=snap.last_logits;
     if(s.draft_kv&&s.draft_kv->position>snap.position)s.draft_kv->position=-1;
     r.experts->restore_heat(snap.routing_heat);
+    if(s.peer)s.peer->runtime.experts->restore_heat(snap.peer_routing_heat);
     s.draft_capture_position=snap.draft_position;
     copies.flush();
     gpu_check(cudaMemcpyAsync(s.draft_hidden,s.snapshot_hidden,128*15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
     ++s.generation;s.index_epoch=s.candidate_epoch=0;s.index_source=-1;if(s.engram_ticket)s.engram_ticket->cancel();
     gpu_check(cudaStreamSynchronize(r.stream.value));s.transaction.reset();s.transaction_active=false;s.transaction_routes_deferred=false;
+    s.restore_peer();
 }
 void Session::commit_transaction(){
     auto& s=*impl_;std::lock_guard<std::mutex> lock(s.runtime.execution_mutex);
+    DeviceScope selected(s.runtime.device);
     if(!s.transaction_active)throw std::runtime_error("DeepSeek no transaction");
     const int count=s.position-s.transaction->position;s.commit_routes(count);
     s.runtime.experts->adjust_decode(count,s.runtime.stream.value,s.counters);
+    if(s.peer){DeviceScope selected_peer(s.peer->runtime.device);s.peer->runtime.experts->adjust_decode(count,s.peer->runtime.stream.value,s.peer->counters);}
     s.transaction.reset();s.transaction_active=false;s.transaction_routes_deferred=false;
+    if(s.peer){s.peer->transaction.reset();s.peer->transaction_active=false;s.peer->transaction_routes_deferred=false;}
 }
 void Session::save_prefix(const std::string& path)const {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    DeviceScope selected(r.device);
     if(s.transaction_active||s.position!=s.original_prompt||s.tokens.size()!=static_cast<size_t>(s.position)||s.last_logits.size()!=129280)
         throw std::runtime_error("DeepSeek prefix requires a completed original prompt with no generated suffix");
     if(std::filesystem::exists(path)||std::filesystem::exists(path+".tmp"))throw std::runtime_error("DeepSeek prefix destination exists");
@@ -433,6 +477,7 @@ void Session::save_prefix(const std::string& path)const {
 }
 void Session::load_prefix(const std::string& path,const std::vector<int>& expected) {
     auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    DeviceScope selected(r.device);
     if(s.position||s.transaction_active)throw std::runtime_error("DeepSeek prefix restore requires an empty session");
     const uint64_t file_bytes=std::filesystem::file_size(path);
     if(file_bytes<8)throw std::runtime_error("DeepSeek truncated prefix");
@@ -486,6 +531,7 @@ void Session::load_prefix(const std::string& path,const std::vector<int>& expect
     s.position=s.original_prompt=s.encoder_position=s.decoder_position=position;s.ced=ced;s.history=history;s.tokens=std::move(tokens);s.images=std::move(images);s.last_logits=std::move(last);
     s.boundary_begin=begin;s.boundary_end=end;++s.generation;s.index_epoch=s.candidate_epoch=0;
     s.draft_capture_position=draft_position;
+    s.restore_peer(true);
     }catch(...){
         for(auto& cache:s.local){cache.position=-1;cache.count=0;}
         for(auto& cache:s.global){cache.position=cache.rows=0;cache.partial=false;}

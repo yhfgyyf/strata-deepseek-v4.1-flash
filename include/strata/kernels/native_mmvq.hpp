@@ -34,6 +34,8 @@ bool native_mmvq_multi_exact();
 
 // Drained test/rollback control; preserve previously adopted single-column paths.
 void native_mmvq_multi_warp_set_enabled(bool enabled);
+void native_mmvq_l20_q5_n6_set_enabled(bool enabled);
+void native_mmvq_l20_q5_extra_set_enabled(bool enabled);
 bool native_mmvq_multi_warp_selected(int type,int n_in,int n_out,int tokens,bool pair);
 
 // One quantization may serve multiple weight matrices sharing the same input.
@@ -45,6 +47,7 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 // Exact DeepSeek output-A:8 groups of4096->1024,2..8 tokens. Scratch is
 // native_q8_1_bytes(32768,tokens); caller rounds output to BF16. False leaves buffers untouched.
 bool native_deepseek_output_a_batch(int type,const void* weights,const float* x,void* scratch,float* out,int tokens,void* stream);
+void native_q5_output_a_set_enabled(bool value);
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);

@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <atomic>
+#include <cstdlib>
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -17,9 +18,11 @@ namespace {
 std::atomic<bool> enabled{false};
 std::atomic<bool> short_enabled{false};
 std::atomic<bool> short_vector_enabled{true};
+std::atomic<bool> l20_n1_warp_enabled{[] { const char* v=std::getenv("STRATA_L20_N1_WARP");return v&&v[0]=='1'; }()};
 std::atomic<bool> short_warp_enabled{true};
 std::atomic<bool> projection_warp_enabled{true};
 std::atomic<bool> short_tokens_enabled{true};
+std::atomic<bool> l20_short_tile_enabled{false};
 std::atomic<bool> short_down_tokens_enabled{true};
 
 __device__ __forceinline__ float bf16(float x) {
@@ -614,6 +617,14 @@ void launch_short_gu(ShortBatch batch,int count,size_t up_offset,const float* x,
     const int* token_rows,const float* routing,float* gate,float* up,float* activation,bool fused,cudaStream_t stream) {
     if constexpr(N>=2)if(short_tokens_enabled.load()&&expert_mixed_short_tokens_selected(Type,N,count)&&
         (reinterpret_cast<uintptr_t>(x)&15)==0) {
+        if constexpr(Type==16&&N==3) {
+            if(l20_short_tile_enabled.load()&&expert_mixed_l20_short_tile_selected(Type,N,count)) {
+                constexpr int Tile=3;
+                if(fused)short_gu_tokens_kernel<Type,N,true,Tile><<<dim3(576,count,(N+Tile-1)/Tile),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+                else short_gu_tokens_kernel<Type,N,false,Tile><<<dim3(576,count,(N+Tile-1)/Tile),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
+                return;
+            }
+        }
         if(fused)short_gu_tokens_kernel<Type,N,true><<<dim3(576,count,(N+1)/2),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
         else short_gu_tokens_kernel<Type,N,false><<<dim3(576,count,(N+1)/2),128,0,stream>>>(batch,up_offset,x,token_rows,routing,gate,up,activation);
         return;
@@ -682,8 +693,16 @@ bool expert_mixed_fast_enabled(){return enabled.load();}
 void expert_mixed_short_set_enabled(bool value){short_enabled.store(value);}
 bool expert_mixed_short_enabled(){return short_enabled.load();}
 void expert_mixed_short_vector_set_enabled(bool value){short_vector_enabled.store(value);}
+void expert_mixed_l20_n1_warp_set_enabled(bool value){l20_n1_warp_enabled.store(value);}
+bool expert_mixed_l20_n1_warp_selected(uint32_t gu,uint32_t down,int groups){
+    return gu==16&&down==16&&expert_mixed_short_vector_selected(gu,down,groups);
+}
 void expert_mixed_short_warp_set_enabled(bool value){short_warp_enabled.store(value);}
 void expert_mixed_projection_warp_set_enabled(bool value){projection_warp_enabled.store(value);}
+void expert_mixed_l20_short_tile_set_enabled(bool value){l20_short_tile_enabled.store(value);}
+bool expert_mixed_l20_short_tile_selected(uint32_t type,int tokens,int groups){
+    return type==16&&tokens==3&&groups>=1&&groups<=8;
+}
 void expert_mixed_short_tokens_set_enabled(bool value){short_tokens_enabled.store(value);}
 void expert_mixed_short_down_tokens_set_enabled(bool value){short_down_tokens_enabled.store(value);}
 bool expert_mixed_short_down_tokens_selected(uint32_t type,int tokens,int groups) {
@@ -785,6 +804,10 @@ cudaError_t expert_mixed_short_gpu(const VerifyExpertGroup* groups,int count,
         ShortBatch batch{};int size=0;
         for(int i=0;i<count;++i)if(groups[i].tokens==n)batch.group[size++]=groups[i];
         if(!size)continue;
+        if(n==1&&l20_n1_warp_enabled.load()&&expert_mixed_l20_n1_warp_selected(gu_type,down_type,size)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(activation))&15)==0) {
+            launch_short_warp(batch,size,gu_type,down_type,up_offset,down_offset,x,token_rows,routing,slots,gate,up,activation,parts,stream);
+            continue;
+        }
         if(n==1&&short_vector_enabled.load()&&expert_mixed_short_vector_selected(gu_type,down_type,size)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(activation))&15)==0) {
             launch_short_vector(batch,size,gu_type,down_type,up_offset,down_offset,x,token_rows,routing,slots,gate,up,activation,parts,stream);
             continue;

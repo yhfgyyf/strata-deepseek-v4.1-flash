@@ -52,3 +52,29 @@ python tools/deepseek41/serve_experimental.py --config examples/local.json --che
 ```
 
 Default endpoint: `http://127.0.0.1:30011/v1`. Stop with `Ctrl+C`. Set a private `api_key` for a non-loopback bind. All four profiles enable image input. For manual GSQ installs, place the publisher’s [exp_probs_b_vl.f32](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/blob/65d53bc8be65123e255ff02f3ded958b6dbf54fd/exp_probs_b_vl.f32) next to the configured mmproj. The managed install includes it automatically. To serve text only, set `vision: false`. The process requires sufficient available host RAM/VRAM and 100% huge-page backing for its registered expert blocks; it does not alter system huge-page policy or stop other processes. [Configuration details](CONFIGURATION.md).
+
+## Dual L20 mask479
+
+Use this separate profile for two NVIDIA L20 48GB cards with peer access, available host RAM and local NVMe. It retains the C37 implementation and adds the validated CED pipeline and SM89 dispatches. The ordinary-page choice is specific to this L20 profile; the existing PRO 6000 examples still require 40 blocks and 100% huge-page coverage.
+
+With the Python requirements above already installed, build from the repository root:
+
+```bash
+cmake -S . -B build-l20 -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc \
+  -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DEEPSEEK41_TESTS=ON
+cmake --build build-l20 --parallel 2 --target strata-deepseek41-l20-mask479
+cp examples/l20-dual.gsq-rco-iq2-xs.json examples/local-l20.json
+# Edit model, draft and tokenizer paths in examples/local-l20.json.
+STRATA_PYTHON=.venv/bin/python ./start-l20-mask479.sh --config examples/local-l20.json --check-config
+STRATA_PYTHON=.venv/bin/python ./start-l20-mask479.sh --config examples/local-l20.json
+```
+
+The foreground service listens on `127.0.0.1:10002`; Ctrl+C stops it. Use this script with the `strata-deepseek41-l20-mask479` binary so both the process settings and native dispatch switches match. This custom binary is built by the command above, rather than by the generic launcher's install step. The existing `start.sh` and `rtxpro6000.*.json` examples remain the single-card entry.
+
+This example selects the six-shard GSQ PLE layout pinned in [models-gsq-rco-ple-1017.json](../data/models-gsq-rco-ple-1017.json): five main shards plus the IQ4_NL Engram file exposed as shard 00006. Keep all six names together; use a link or copy for the publisher's separately named Engram file, without merging or requantizing it. This pack and the older four-shard GSQ pack have different digests; do not mix them. The native proof validates all six files. DSpark and the tokenizer are unchanged. The L20 pipeline currently supports text only.
+
+The script selects devices 0 and 1, CED overlap and P2P, GPU cold experts, Maya, DSpark5, chunk8192, mHC/Gate-Up/shared-input reuse, Q5 N6, N1 warp, Q5 output-A batching, GU16 N3 Tile3 and shared GU Q5 N6. Grouped full-model dispatch stays off; its cp.async implementation remains available in the source. Rejected N2/N4 dispatches and the Maya 1.5 threshold are not enabled.
+
+The example can generate an uncalibrated starter profile. To reproduce an existing calibrated run, supply its matching `profile`, `heat` and `costs` paths; a starter ranking does not reproduce benchmark residency. The logical context capacity is 1M, but the latest five-request validation used 16,180 input and 512 output tokens. Historical operator/request checks and the HTTP smoke test do not establish broad model quality, concurrent capacity or long-term stability. The source publication is not a running deployment.

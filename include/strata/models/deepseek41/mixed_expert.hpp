@@ -14,6 +14,9 @@ void expert_mixed_short_set_enabled(bool enabled);
 bool expert_mixed_short_enabled();
 // Drained benchmark/rollback control for the exact N=1 vector path.
 void expert_mixed_short_vector_set_enabled(bool enabled);
+// L20 candidate for previously vector-selected N1 bins; drained boundaries only.
+void expert_mixed_l20_n1_warp_set_enabled(bool enabled);
+bool expert_mixed_l20_n1_warp_selected(uint32_t gu,uint32_t down,int groups);
 bool expert_mixed_short_vector_selected(uint32_t gu,uint32_t down,int groups);
 // Drained control for the experimental uncovered N=1 warp path.
 void expert_mixed_short_warp_set_enabled(bool enabled);
@@ -21,6 +24,8 @@ bool expert_mixed_short_warp_selected(uint32_t gu,uint32_t down,int groups);
 // Drained controls for the projection and multi-token GU experiments.
 void expert_mixed_projection_warp_set_enabled(bool enabled);
 bool expert_mixed_projection_warp_selected(uint32_t type,int rows,int cols,int tokens,bool pair);
+void expert_mixed_l20_short_tile_set_enabled(bool enabled);
+bool expert_mixed_l20_short_tile_selected(uint32_t type,int tokens,int groups);
 void expert_mixed_short_tokens_set_enabled(bool enabled);
 bool expert_mixed_short_tokens_selected(uint32_t gu,int tokens,int groups);
 // Drained control for the multi-token Down experiment; N1 retains its paths.

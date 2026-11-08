@@ -12,7 +12,7 @@ import urllib.request
 
 from tools.deepseek41.hash_proof import GSQ_ENGRAM_FILE
 from tools.deepseek41.startup_assets import (GSQ_UNCENSORED_VARIANT, GSQ_VARIANTS, GSQ_VISION_BIAS,
-                                            GSQ_VISION_BIAS_SHA256, TOKENIZER_SHA256, VARIANTS, vision_enabled)
+                                            GSQ_VISION_BIAS_SHA256, TOKENIZER_SHA256, VARIANTS, vision_enabled, gsq_ple_model)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCES = ("modelscope", "huggingface", "hf-mirror")
@@ -83,7 +83,12 @@ def asset_url(asset, source):
 
 def assets_for_config(cfg):
     assets = catalog(cfg["variant"], bool(cfg.get("mmproj")))
-    if cfg["variant"] in GSQ_VARIANTS and vision_enabled(cfg):
+    ple = gsq_ple_model(cfg)
+    if ple:
+        main = read_json(ROOT / "data/models-gsq-rco-ple-1017.json")
+        assets = [dict(x, repository=main["repository"], revision=main["huggingface_revision"], role="main")
+                  for x in main["files"]] + [x for x in assets if x["role"] != "main"]
+    if cfg["variant"] in GSQ_VARIANTS and vision_enabled(cfg) and not ple:
         assets.append(dict(path=GSQ_VISION_BIAS, bytes=61440, sha256=GSQ_VISION_BIAS_SHA256,
                            repository="ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
                            revision="65d53bc8be65123e255ff02f3ded958b6dbf54fd", role="vision_bias"))
@@ -94,6 +99,8 @@ def assets_for_config(cfg):
     for asset in assets:
         if asset["role"] == "main":
             destination = Path(cfg["model"]).with_name(Path(asset["path"]).name)
+            if ple and asset["path"] == GSQ_ENGRAM_FILE:
+                destination = Path(cfg["model"].replace("-00001-of-00006.gguf", "-00006-of-00006.gguf"))
         elif asset["role"] == "vision_bias":
             destination = Path(cfg["mmproj"]).with_name(GSQ_VISION_BIAS)
         else:

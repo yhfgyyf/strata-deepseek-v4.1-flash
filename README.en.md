@@ -19,6 +19,8 @@ The service supports **1M context capacity (1,048,576 tokens)**, **multimodal te
 
 **Recommended GPUs: one RTX PRO 6000 Blackwell 96GB, or two RTX 5090 cards.**
 
+The same source tree retains the **RTX PRO 6000 C37 cumulative baseline plus GSQ support** and includes the **dual L20 48GB CED/PP mask479 baseline**. The L20 profile uses SM89, P2P, text input and 40 ordinary-page pinned blocks per GPU. See the [dual L20 setup](docs/INSTALL.md#dual-l20-mask479) for its separate entry, six-shard GSQ PLE config and build commands. The PRO 6000 throughput tables below keep their original test conditions.
+
 ## Supported models
 
 **GSQ-RCO-IQ2_XS** is from **ISTA-DASLab / DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF**, with a separate IQ4_NL Engram file. The UD variants are from **Unsloth / DeepSeek-V4.1-Flash-1017-GGUF**.

@@ -70,6 +70,12 @@ struct V41AttentionParams {
   V41EpilogueParams epilogue;
 };
 
+template <bool FastMath>
+__device__ __forceinline__ float v41_exp(float value) {
+  if constexpr (FastMath) return __expf(value);
+  return expf(value);
+}
+
 __device__ __forceinline__ float decode_fp8_e4m3(uint8_t bits) {
   __nv_fp8_e4m3 value;
   value.__x = bits;
@@ -118,6 +124,13 @@ __device__ __forceinline__ bool resolve_v41_row(const SlotT* slots, int64_t slot
       cache_nbytes < payload_bytes) {
     *row_offset = 0;
     return false;
+  }
+  if (slot <= 0x7fffffffLL && row_stride <= 0x7fffffffLL &&
+      page_stride == row_stride * int64_t(page_size)) {
+    const int64_t offset = slot * row_stride;
+    if (offset > cache_nbytes - payload_bytes) { *row_offset = 0; return false; }
+    *row_offset = offset;
+    return true;
   }
   const int64_t page = slot / page_size;
   const int64_t row = slot % page_size;
@@ -215,7 +228,7 @@ __device__ __forceinline__ void load_v41_kv_tile(
   __syncthreads();
 }
 
-template <bool PadQ>
+template <bool PadQ, bool FastMath = false>
 __device__ __forceinline__ void compute_v41_tile(const bf16* q_tile, const bf16* kv_smem,
                                                  float* scratch, bf16* probs, const int* valid,
                                                  float* running_m, float* running_l, float* alpha,
@@ -263,12 +276,12 @@ __device__ __forceinline__ void compute_v41_tile(const bf16* q_tile, const bf16*
       if (has_value) {
         const float old_m = running_m[tid];
         const float new_m = fmaxf(old_m, tile_max);
-        const float scale_old = expf(old_m - new_m);
+        const float scale_old = v41_exp<FastMath>(old_m - new_m);
         float tile_sum = 0.0f;
 #pragma unroll
         for (int candidate = 0; candidate < kV41MmaTile; ++candidate) {
           const float probability =
-              valid[candidate] ? expf(scratch[tid * 16 + candidate] - new_m) : 0.0f;
+              valid[candidate] ? v41_exp<FastMath>(scratch[tid * 16 + candidate] - new_m) : 0.0f;
           probs[tid * 16 + candidate] = __float2bfloat16_rn(probability);
           tile_sum += probability;
         }
@@ -316,7 +329,7 @@ __device__ __forceinline__ void compute_v41_tile(const bf16* q_tile, const bf16*
   }
 }
 
-template <bool Global, typename SlotT, bool PadQ>
+template <bool Global, typename SlotT, bool PadQ, bool FastMath = false>
 __device__ __forceinline__ void run_v41_tile(
     const bf16* q_tile, const uint8_t* cache, const SlotT* slots, int64_t slots_stride_token,
     int token, int candidate_begin, int topk, int page_size, int64_t page_stride,
@@ -326,11 +339,11 @@ __device__ __forceinline__ void run_v41_tile(
   load_v41_kv_tile<Global>(cache, slots, slots_stride_token, token, candidate_begin, topk,
                            page_size, page_stride, row_stride, cache_nbytes, kv_smem, scratch,
                            valid_smem, row_smem);
-  compute_v41_tile<PadQ>(q_tile, kv_smem, scratch, probs, valid_smem, running_m, running_l, alpha,
+  compute_v41_tile<PadQ, FastMath>(q_tile, kv_smem, scratch, probs, valid_smem, running_m, running_l, alpha,
                          acc, sm_scale, valid_heads);
 }
 
-template <typename SwaSlotT, typename GlobalSlotT, bool PadQ, bool FuseEpilogue = false>
+template <typename SwaSlotT, typename GlobalSlotT, bool PadQ, bool FuseEpilogue = false, bool FastMath = false>
 __global__ void __launch_bounds__(kV41Threads)
     deepseek_v41_mixed_sparse_main_kernel(V41AttentionParams params) {
   const int token = blockIdx.x;
@@ -388,14 +401,14 @@ __global__ void __launch_bounds__(kV41Threads)
     const int unified_global_tiles = (params.global_topk + kV41MmaTile - 1) / kV41MmaTile;
     if (split < unified_swa_tiles) {
       const int begin = split * kV41MmaTile;
-      run_v41_tile<false, SwaSlotT, PadQ>(
+      run_v41_tile<false, SwaSlotT, PadQ, FastMath>(
           q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token, begin,
           params.swa_topk, params.swa_page_size, params.swa_page_stride, params.swa_row_stride,
           params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem, running_m, running_l,
           alpha, acc, params.sm_scale, valid_heads);
     } else if (params.has_global && split < unified_swa_tiles + unified_global_tiles) {
       const int begin = (split - unified_swa_tiles) * kV41MmaTile;
-      run_v41_tile<true, GlobalSlotT, PadQ>(
+      run_v41_tile<true, GlobalSlotT, PadQ, FastMath>(
           q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token, begin,
           params.global_topk, params.global_page_size, params.global_page_stride,
           params.global_row_stride, params.global_nbytes, kv_smem, scratch, probs, valid_smem,
@@ -404,13 +417,13 @@ __global__ void __launch_bounds__(kV41Threads)
   } else {
     for (int tile = split; tile < swa_tiles; tile += params.num_splits) {
       const int begin = tile * kV41CandidateTile;
-      run_v41_tile<false, SwaSlotT, PadQ>(
+      run_v41_tile<false, SwaSlotT, PadQ, FastMath>(
           q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token, begin,
           params.swa_topk, params.swa_page_size, params.swa_page_stride, params.swa_row_stride,
           params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem, running_m, running_l,
           alpha, acc, params.sm_scale, valid_heads);
       if (begin + kV41MmaTile < params.swa_topk) {
-        run_v41_tile<false, SwaSlotT, PadQ>(
+        run_v41_tile<false, SwaSlotT, PadQ, FastMath>(
             q_tile, params.swa_cache, swa_slots, params.swa_slots_stride_token, token,
             begin + kV41MmaTile, params.swa_topk, params.swa_page_size, params.swa_page_stride,
             params.swa_row_stride, params.swa_nbytes, kv_smem, scratch, probs, valid_smem, row_smem,
@@ -420,13 +433,13 @@ __global__ void __launch_bounds__(kV41Threads)
     if (params.has_global) {
       for (int tile = split; tile < global_tiles; tile += params.num_splits) {
         const int begin = tile * kV41CandidateTile;
-        run_v41_tile<true, GlobalSlotT, PadQ>(
+        run_v41_tile<true, GlobalSlotT, PadQ, FastMath>(
             q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token,
             begin, params.global_topk, params.global_page_size, params.global_page_stride,
             params.global_row_stride, params.global_nbytes, kv_smem, scratch, probs, valid_smem,
             row_smem, running_m, running_l, alpha, acc, params.sm_scale, valid_heads);
         if (begin + kV41MmaTile < params.global_topk) {
-          run_v41_tile<true, GlobalSlotT, PadQ>(
+          run_v41_tile<true, GlobalSlotT, PadQ, FastMath>(
               q_tile, params.global_cache, global_slots, params.global_slots_stride_token, token,
               begin + kV41MmaTile, params.global_topk, params.global_page_size,
               params.global_page_stride, params.global_row_stride, params.global_nbytes, kv_smem,
@@ -444,8 +457,8 @@ __global__ void __launch_bounds__(kV41Threads)
       if (sink > -CUDART_INF_F) {
         const float old_m = running_m[tid];
         const float new_m = fmaxf(old_m, sink);
-        const float scale_old = expf(old_m - new_m);
-        running_l[tid] = running_l[tid] * scale_old + expf(sink - new_m);
+        const float scale_old = v41_exp<FastMath>(old_m - new_m);
+        running_l[tid] = running_l[tid] * scale_old + v41_exp<FastMath>(sink - new_m);
         running_m[tid] = new_m;
         alpha[tid] = scale_old;
       }
@@ -462,12 +475,14 @@ __global__ void __launch_bounds__(kV41Threads)
   if (head < valid_heads) {
     const int global_head = head_start + head;
     const float denominator = running_l[head];
+    const float inverse_denominator = FastMath && denominator > 0.0f ? 1.0f / denominator : 0.0f;
     const int64_t out_base = static_cast<int64_t>(token) * params.partial_out_stride_token +
                              static_cast<int64_t>(split) * params.partial_out_stride_split +
                              static_cast<int64_t>(global_head) * params.partial_out_stride_head;
 #pragma unroll
     for (int tile = 0; tile < kV41OutputTiles; ++tile) {
-      const float value = denominator > 0.0f ? acc[tile] / denominator : 0.0f;
+      const float value = FastMath ? acc[tile] * inverse_denominator :
+          (denominator > 0.0f ? acc[tile] / denominator : 0.0f);
       if constexpr (FuseEpilogue) {
         const float peer = __shfl_xor_sync(0xffffffff, value, 1);
         if ((column & 1) == 0) {
@@ -506,7 +521,7 @@ struct V41MergeParams {
   V41EpilogueParams epilogue;
 };
 
-template <bool FuseEpilogue = false>
+template <bool FuseEpilogue = false, bool FastMath = false>
 __global__ void deepseek_v41_mixed_sparse_merge_kernel(V41MergeParams params) {
   const int token = blockIdx.x;
   const int head = blockIdx.y;
@@ -528,7 +543,7 @@ __global__ void deepseek_v41_mixed_sparse_merge_kernel(V41MergeParams params) {
         const int64_t offset = static_cast<int64_t>(token) * params.partial_lse_stride_token +
                                static_cast<int64_t>(split) * params.partial_lse_stride_split +
                                static_cast<int64_t>(head) * params.partial_lse_stride_head;
-        weights[split] = expf(params.partial_lse[offset] - max_lse);
+        weights[split] = v41_exp<FastMath>(params.partial_lse[offset] - max_lse);
         sum += weights[split];
       }
     } else {
@@ -638,79 +653,102 @@ __device__ __forceinline__ void v41_prefetch_stage(const V41AttentionParams& par
   asm volatile("cp.async.commit_group;\n" ::: "memory");
 }
 
-template <bool Global, typename SlotT>
+template <bool Global, typename SlotT, bool ExpandedCache = false>
 __device__ __forceinline__ void load_v41_prefill_tile(const V41AttentionParams& params, int token,
                                                       int begin, V41PrefillSmem& smem) {
-  constexpr int payload = Global ? kV41GlobalPayloadBytes : kV41SwaPayloadBytes;
-  constexpr int chunks = Global ? 16 : 32;
-  const auto* slots = static_cast<const SlotT*>(Global ? params.global_slots : params.swa_slots);
-  const int topk = Global ? params.global_topk : 128;
-  const int tid = threadIdx.x;
-  if (tid < kV41PrefillRows) {
-    smem.rows[tid] = 0;
-    smem.valid[tid] =
-        begin + tid < topk &&
-        resolve_v41_row(slots,
-                        static_cast<int64_t>(token) * (Global ? params.global_slots_stride_token
-                                                              : params.swa_slots_stride_token) +
-                            begin + tid,
-                        Global ? params.global_page_size : 32,
-                        Global ? params.global_page_stride : params.swa_page_stride,
-                        Global ? params.global_row_stride : params.swa_row_stride,
-                        Global ? params.global_nbytes : params.swa_nbytes, payload,
-                        &smem.rows[tid]);
-  }
-  __syncthreads();
-  v41_prefetch_stage<Global>(params, 0, smem);
-#pragma unroll
-  for (int stage = 0; stage < kV41PrefillRows / 8; ++stage) {
-    if (stage + 1 < kV41PrefillRows / 8) {
-      v41_prefetch_stage<Global>(params, stage + 1, smem);
-      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-    } else {
-      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+  if constexpr (ExpandedCache) {
+    const auto* slots = static_cast<const SlotT*>(Global ? params.global_slots : params.swa_slots);
+    const int topk = Global ? params.global_topk : 128;
+    const auto* cache = Global ? params.global_cache : params.swa_cache;
+    if (threadIdx.x < kV41PrefillRows) {
+      const int row = threadIdx.x;
+      const int64_t slot = begin + row < topk ? slots[int64_t(token) *
+          (Global ? params.global_slots_stride_token : params.swa_slots_stride_token) + begin + row] : -1;
+      const int64_t bytes = Global ? params.global_nbytes : params.swa_nbytes;
+      const bool valid = slot >= 0 && slot < bytes / 1024;
+      smem.valid[row] = valid;
+      smem.rows[row] = valid ? slot * 1024 : 0;
     }
     __syncthreads();
-    for (int linear = tid; linear < 8 * chunks; linear += kV41PrefillThreads) {
-      const int row = linear / chunks;
-      const int chunk = linear % chunks;
-      const uint8_t* src = smem.packed[stage & 1] + row * payload;
-      const uint4 packed = *reinterpret_cast<const uint4*>(src + chunk * 16);
-      float scales[2];
-      if constexpr (Global) {
-        scales[0] = decode_fp8_e4m3(src[256 + chunk * 2]);
-        scales[1] = decode_fp8_e4m3(src[256 + chunk * 2 + 1]);
+    for (int linear = threadIdx.x; linear < kV41PrefillRows * 64; linear += kV41PrefillThreads) {
+      const int row = linear / 64, chunk = linear % 64;
+      const uint4 data = smem.valid[row] ? *reinterpret_cast<const uint4*>(cache + smem.rows[row] + chunk * 16)
+                                        : make_uint4(0,0,0,0);
+      *reinterpret_cast<uint4*>(smem.kv + row * kV41SmemDim + chunk * 8) = data;
+    }
+    __syncthreads();
+  } else {
+    constexpr int payload = Global ? kV41GlobalPayloadBytes : kV41SwaPayloadBytes;
+    constexpr int chunks = Global ? 16 : 32;
+    const auto* slots = static_cast<const SlotT*>(Global ? params.global_slots : params.swa_slots);
+    const int topk = Global ? params.global_topk : 128;
+    const int tid = threadIdx.x;
+    if (tid < kV41PrefillRows) {
+      smem.rows[tid] = 0;
+      smem.valid[tid] =
+          begin + tid < topk &&
+          resolve_v41_row(slots,
+                          static_cast<int64_t>(token) * (Global ? params.global_slots_stride_token
+                                                                : params.swa_slots_stride_token) +
+                              begin + tid,
+                          Global ? params.global_page_size : 32,
+                          Global ? params.global_page_stride : params.swa_page_stride,
+                          Global ? params.global_row_stride : params.swa_row_stride,
+                          Global ? params.global_nbytes : params.swa_nbytes, payload,
+                          &smem.rows[tid]);
+    }
+    __syncthreads();
+    v41_prefetch_stage<Global>(params, 0, smem);
+  #pragma unroll
+    for (int stage = 0; stage < kV41PrefillRows / 8; ++stage) {
+      if (stage + 1 < kV41PrefillRows / 8) {
+        v41_prefetch_stage<Global>(params, stage + 1, smem);
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
       } else {
-        scales[0] = __uint_as_float(static_cast<uint32_t>(src[512 + chunk / 2]) << 23);
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
       }
-#pragma unroll
-      for (int half = 0; half < (Global ? 4 : 2); ++half) {
-        uint32_t words[4];
-#pragma unroll
-        for (int pair = 0; pair < 4; ++pair) {
-          float even, odd;
-          if constexpr (Global) {
-            const uint8_t codes = extract_u8(packed, half * 4 + pair);
-            even = decode_e2m1(codes & 0xf) * scales[half / 2];
-            odd = decode_e2m1(codes >> 4) * scales[half / 2];
-          } else {
-            const int byte = half * 8 + pair * 2;
-            even = decode_fp8_e4m3(extract_u8(packed, byte)) * scales[0];
-            odd = decode_fp8_e4m3(extract_u8(packed, byte + 1)) * scales[0];
-          }
-          const __nv_bfloat162_raw values = __floats2bfloat162_rn(even, odd);
-          words[pair] = static_cast<uint32_t>(values.x) | (static_cast<uint32_t>(values.y) << 16);
+      __syncthreads();
+      for (int linear = tid; linear < 8 * chunks; linear += kV41PrefillThreads) {
+        const int row = linear / chunks;
+        const int chunk = linear % chunks;
+        const uint8_t* src = smem.packed[stage & 1] + row * payload;
+        const uint4 packed = *reinterpret_cast<const uint4*>(src + chunk * 16);
+        float scales[2];
+        if constexpr (Global) {
+          scales[0] = decode_fp8_e4m3(src[256 + chunk * 2]);
+          scales[1] = decode_fp8_e4m3(src[256 + chunk * 2 + 1]);
+        } else {
+          scales[0] = __uint_as_float(static_cast<uint32_t>(src[512 + chunk / 2]) << 23);
         }
-        *reinterpret_cast<uint4*>(smem.kv + (stage * 8 + row) * kV41SmemDim +
-                                  chunk * (Global ? 32 : 16) + half * 8) =
-            make_uint4(words[0], words[1], words[2], words[3]);
+  #pragma unroll
+        for (int half = 0; half < (Global ? 4 : 2); ++half) {
+          uint32_t words[4];
+  #pragma unroll
+          for (int pair = 0; pair < 4; ++pair) {
+            float even, odd;
+            if constexpr (Global) {
+              const uint8_t codes = extract_u8(packed, half * 4 + pair);
+              even = decode_e2m1(codes & 0xf) * scales[half / 2];
+              odd = decode_e2m1(codes >> 4) * scales[half / 2];
+            } else {
+              const int byte = half * 8 + pair * 2;
+              even = decode_fp8_e4m3(extract_u8(packed, byte)) * scales[0];
+              odd = decode_fp8_e4m3(extract_u8(packed, byte + 1)) * scales[0];
+            }
+            const __nv_bfloat162_raw values = __floats2bfloat162_rn(even, odd);
+            words[pair] = static_cast<uint32_t>(values.x) | (static_cast<uint32_t>(values.y) << 16);
+          }
+          *reinterpret_cast<uint4*>(smem.kv + (stage * 8 + row) * kV41SmemDim +
+                                    chunk * (Global ? 32 : 16) + half * 8) =
+              make_uint4(words[0], words[1], words[2], words[3]);
+        }
       }
+      __syncthreads();
     }
-    __syncthreads();
   }
 }
 
-template <typename SwaSlotT, typename GlobalSlotT, bool HasGlobal, bool FuseEpilogue = false>
+template <typename SwaSlotT, typename GlobalSlotT, bool HasGlobal, bool FuseEpilogue = false, bool ExpandedCache = false, bool FastMath = false>
 __global__ void __launch_bounds__(kV41PrefillThreads)
     deepseek_v41_prefill_kernel(V41AttentionParams params) {
   const int token = blockIdx.x;
@@ -727,7 +765,7 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
 #if __CUDA_ARCH__ == 890
   // Ada needs more registers for FP8 decoding. Retain most Q fragments while
   // leaving enough registers for the mixed-cache loader without local spills.
-  constexpr int cached_query_tiles = 24;
+  constexpr int cached_query_tiles = ExpandedCache ? 32 : 24;
 #else
   constexpr int cached_query_tiles = kV41Dim / 16;
 #endif
@@ -747,13 +785,13 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
        ++tile) {
     if constexpr (HasGlobal) {
       if (tile < 128 / kV41PrefillRows) {
-        load_v41_prefill_tile<false, SwaSlotT>(params, token, tile * kV41PrefillRows, smem);
+        load_v41_prefill_tile<false, SwaSlotT, ExpandedCache>(params, token, tile * kV41PrefillRows, smem);
       } else {
-        load_v41_prefill_tile<true, GlobalSlotT>(
+        load_v41_prefill_tile<true, GlobalSlotT, ExpandedCache>(
             params, token, (tile - 128 / kV41PrefillRows) * kV41PrefillRows, smem);
       }
     } else {
-      load_v41_prefill_tile<false, SwaSlotT>(params, token, tile * kV41PrefillRows, smem);
+      load_v41_prefill_tile<false, SwaSlotT, ExpandedCache>(params, token, tile * kV41PrefillRows, smem);
     }
 
     float scores[4] = {};
@@ -795,13 +833,13 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
       for (int w = 0; w < kV41PrefillWarps; ++w) {
         maximum = fmaxf(maximum, smem.maxima[w * kV41HeadTile + head]);
       }
-      alpha[r] = maximum > -CUDART_INF_F ? expf(running_m[r] - maximum) : 1.0f;
+      alpha[r] = maximum > -CUDART_INF_F ? v41_exp<FastMath>(running_m[r] - maximum) : 1.0f;
       running_m[r] = maximum;
       float sum = 0.0f;
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
         const int candidate = warp * 8 + col + c;
-        const float p = smem.valid[candidate] ? expf(scores[r * 2 + c] - maximum) : 0.0f;
+        const float p = smem.valid[candidate] ? v41_exp<FastMath>(scores[r * 2 + c] - maximum) : 0.0f;
         sum += p;
         smem.probs[head * kV41PrefillRows + candidate] = __float2bfloat16_rn(p);
       }
@@ -846,10 +884,11 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
     float scale = 1.0f;
     if (sink > -CUDART_INF_F) {
       const float maximum = fmaxf(running_m[r], sink);
-      scale = expf(running_m[r] - maximum);
-      running_l[r] = running_l[r] * scale + expf(sink - maximum);
+      scale = v41_exp<FastMath>(running_m[r] - maximum);
+      running_l[r] = running_l[r] * scale + v41_exp<FastMath>(sink - maximum);
       running_m[r] = maximum;
     }
+    const float normalization = FastMath && running_l[r] > 0.0f ? scale / running_l[r] : 0.0f;
     const int64_t output_base = static_cast<int64_t>(token) * params.partial_out_stride_token +
                                 (head_start + head) * params.partial_out_stride_head;
 #pragma unroll
@@ -857,7 +896,8 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
       float values[2];
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
-        values[c] = running_l[r] > 0.0f ? acc[n][r * 2 + c] * scale / running_l[r] : 0.0f;
+        if constexpr (FastMath) values[c] = acc[n][r * 2 + c] * normalization;
+        else values[c] = running_l[r] > 0.0f ? acc[n][r * 2 + c] * scale / running_l[r] : 0.0f;
       }
       const int dim = warp * kV41PrefillOutputTiles * 8 + n * 8 + col;
       if constexpr (FuseEpilogue) {
@@ -877,17 +917,17 @@ __global__ void __launch_bounds__(kV41PrefillThreads)
   }
 }
 
-template <typename SwaSlotT, typename GlobalSlotT, bool FuseEpilogue>
+template <typename SwaSlotT, typename GlobalSlotT, bool FuseEpilogue, bool ExpandedCache = false, bool FastMath = false>
 inline cudaError_t launch_v41_attention_impl(const V41AttentionParams& params, bf16* output,
                                              int64_t out_stride_token, int64_t out_stride_head,
                                              cudaStream_t stream) {
   if (params.swa_topk == 128 && params.num_tokens > 32 && params.num_splits == 1) {
     if (params.has_global) {
-      deepseek_v41_prefill_kernel<SwaSlotT, GlobalSlotT, true, FuseEpilogue>
+      deepseek_v41_prefill_kernel<SwaSlotT, GlobalSlotT, true, FuseEpilogue, ExpandedCache, FastMath>
           <<<dim3(params.num_tokens, (params.num_heads + 15) / 16), kV41PrefillThreads,
              sizeof(V41PrefillSmem), stream>>>(params);
     } else {
-      deepseek_v41_prefill_kernel<SwaSlotT, SwaSlotT, false, FuseEpilogue>
+      deepseek_v41_prefill_kernel<SwaSlotT, SwaSlotT, false, FuseEpilogue, ExpandedCache, FastMath>
           <<<dim3(params.num_tokens, (params.num_heads + 15) / 16), kV41PrefillThreads,
              sizeof(V41PrefillSmem), stream>>>(params);
     }
@@ -902,18 +942,18 @@ inline cudaError_t launch_v41_attention_impl(const V41AttentionParams& params, b
                   params.num_splits);
   if (pad_q) {
     if (FuseEpilogue && params.num_splits == 1) {
-      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, true>
+      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, true, FastMath>
           <<<grid, kV41Threads, smem_bytes, stream>>>(params);
     } else {
-      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, false>
+      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, true, false, FastMath>
           <<<grid, kV41Threads, smem_bytes, stream>>>(params);
     }
   } else {
     if (FuseEpilogue && params.num_splits == 1) {
-      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, true>
+      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, true, FastMath>
           <<<grid, kV41Threads, smem_bytes, stream>>>(params);
     } else {
-      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, false>
+      deepseek_v41_mixed_sparse_main_kernel<SwaSlotT, GlobalSlotT, false, false, FastMath>
           <<<grid, kV41Threads, smem_bytes, stream>>>(params);
     }
   }
@@ -935,20 +975,20 @@ inline cudaError_t launch_v41_attention_impl(const V41AttentionParams& params, b
                        params.num_heads,
                        params.num_splits,
                        params.epilogue};
-  deepseek_v41_mixed_sparse_merge_kernel<FuseEpilogue>
+  deepseek_v41_mixed_sparse_merge_kernel<FuseEpilogue, FastMath>
       <<<dim3(params.num_tokens, params.num_heads), 256, 0, stream>>>(merge);
   return cudaGetLastError();
 }
 
-template <typename SwaSlotT, typename GlobalSlotT>
+template <typename SwaSlotT, typename GlobalSlotT, bool ExpandedCache = false, bool FastMath = false>
 inline cudaError_t launch_deepseek_v41_attention(const V41AttentionParams& params, bf16* output,
                                                  int64_t out_stride_token, int64_t out_stride_head,
                                                  cudaStream_t stream) {
   if (params.epilogue.output != nullptr) {
-    return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, true>(params, output, out_stride_token,
+    return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, true, ExpandedCache, FastMath>(params, output, out_stride_token,
                                                                   out_stride_head, stream);
   }
-  return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, false>(params, output, out_stride_token,
+  return launch_v41_attention_impl<SwaSlotT, GlobalSlotT, false, ExpandedCache, FastMath>(params, output, out_stride_token,
                                                                  out_stride_head, stream);
 }
 

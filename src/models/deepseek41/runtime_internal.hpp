@@ -26,6 +26,17 @@ namespace strata::models::deepseek41 {
 inline void gpu_check(cudaError_t error) {
     if (error != cudaSuccess) throw std::runtime_error(std::string("DeepSeek CUDA: ") + cudaGetErrorString(error));
 }
+inline int current_device(){int device=0;gpu_check(cudaGetDevice(&device));return device;}
+struct DeviceScope {
+    int previous=0;
+    explicit DeviceScope(int device) { gpu_check(cudaGetDevice(&previous));gpu_check(cudaSetDevice(device)); }
+    ~DeviceScope(){cudaSetDevice(previous);}
+};
+void add_execution_stats(ExecutionStats& destination,const ExecutionStats& source);
+bool pipeline_p2p_enabled(); // Process-level opt-in; pinned-host remains the default.
+// Source work must be ready; callers drain the destination stream before reuse.
+void pipeline_peer_copy(void* to,int to_device,const void* from,int from_device,uint64_t bytes,
+                        cudaStream_t stream,Pinned& staging,ExecutionStats& stats);
 inline uint64_t aligned(uint64_t n) { return (n + 255) / 256 * 256; }
 template<class T> T* allocate(core::DeviceArena& arena, uint64_t count) {
     if (count > UINT64_MAX / sizeof(T)) throw std::overflow_error("DeepSeek device allocation");
@@ -69,7 +80,7 @@ class WeightBank {
 public:
     WeightBank(const Model& model, Arithmetic arithmetic, cudaStream_t stream, bool draft = false, bool vision = false,
                bool dense_q8 = false,const std::vector<int32_t>* draft_vocab = nullptr,
-               const std::vector<int32_t>* draft_input_vocab = nullptr);
+               const std::vector<int32_t>* draft_input_vocab = nullptr,const RuntimeOptions* placement = nullptr);
     const Matrix& at(const std::string& name) const { return matrices_.at(name); }
     uint64_t bytes() const { return arena_->used(); }
 private:
@@ -290,7 +301,7 @@ private:
 };
 class EngramPipeline {
 public:
-    EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace = false,bool huge_pinned = true,uint32_t packed_type = 8);
+    EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace = false,bool huge_pinned = true,uint32_t packed_type = 8,int table_mask = 3);
     ~EngramPipeline();
     void start(std::shared_ptr<EngramBatch> ticket,uint64_t sequence,int count,const Matrix& first,const Matrix& second);
     void wait(int table,uint64_t generation,uint64_t sequence,cudaStream_t consumer);
@@ -311,6 +322,7 @@ private:
     std::thread worker_;
     std::array<Matrix,2> matrices_;
     int count_=0,device_id_=0;
+    int table_mask_=3;
     bool pending_=false,working_=false;
     void run();
     std::mutex mutex_;
@@ -322,6 +334,8 @@ private:
 };
 class DecodeRawCache;
 struct Runtime::Impl {
+    int device = 0;
+    bool bounded_moe_supported = false, bounded_moe_sm89 = false;
     Model model;
     RuntimeOptions options;
     Stream stream, upload, dequant_stream;
@@ -330,7 +344,7 @@ struct Runtime::Impl {
     cublasHandle_t blas = nullptr;
     std::unique_ptr<WeightBank> weights;
     std::unique_ptr<GgufExperts> experts;
-    std::unique_ptr<EngramReader> engram;
+    std::shared_ptr<EngramReader> engram;
     std::unique_ptr<kernels::cpu::ExpertPool> pool;
     std::unique_ptr<Workspace> work;
     std::array<std::array<core::CapturedGraph,8>,40> shared_graphs;
@@ -360,10 +374,13 @@ struct Runtime::Impl {
     uint64_t ring_slot_bytes = 0;
     int ring_slots = 0;
     std::mutex execution_mutex;
-    Impl(const std::string& main,const RuntimeOptions& options,const std::string& draft,const std::string& vision);
+    std::unique_ptr<Impl> peer;
+    std::unique_ptr<Pinned> peer_staging;
+    Impl(const std::string& main,const RuntimeOptions& options,const std::string& draft,const std::string& vision,
+         std::shared_ptr<EngramReader> shared_engram = {});
     ~Impl();
     void matmul(const Matrix& weight,const float* x,float* out,int tokens,Workspace& work,
-                int rows = 0,int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true);
+                int rows = 0,int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true,bool prepared_q8_input = false);
     void round(float* x,uint64_t n);
     const Matrix& tensor(int layer,const std::string& suffix) const {
         const auto name=model.ple_engram()&&suffix=="engram_wkv"?"engram_kv":suffix;
@@ -423,12 +440,14 @@ struct Session::Impl {
     std::unique_ptr<EngramPipeline> engram_pipeline;
     struct Snapshot;
     std::unique_ptr<Snapshot> transaction;
+    std::unique_ptr<Impl> peer;
     Impl(Runtime::Impl& runtime);
     ~Impl();
     void reset_local(int first,int64_t at);
     void check_cancel();
     void prefetch_engram(const std::vector<int>& prompt,int64_t start);
     void init(const std::vector<int>& ids,int64_t start);
+    void start_engram(int count);
     void image_mask(int count,int64_t start);
     void save_boundary(int count,int64_t start);
     void load_boundary(int count,int64_t start);
@@ -441,6 +460,14 @@ struct Session::Impl {
     void attention_output(int layer,int count,bool with_routes);
     void attention(int layer,int count,int64_t start);
     void layers(int count,int64_t start,int first,int last,bool prefill = false,const BlockBenchmarkHooks* hooks = nullptr);
+    void local_layers(int count,int64_t start,int first,int last,bool prefill,const BlockBenchmarkHooks* hooks);
+    void handoff(Impl& destination,int count,bool index,bool candidates);
+    void copy_global(Impl& source,int layer,bool full = false);
+    void collect_peer(bool kv_only = false);
+    void restore_peer(bool full = false);
+    void sync_peer_metadata();
+    void clear_transaction();
+    std::vector<float> pipeline_prefill(const std::vector<int>& ids,int tail_begin);
     std::vector<float> logits(int count,bool all = false);
     void dump(const std::string& name,const float* data,const std::vector<int64_t>& shape);
 };

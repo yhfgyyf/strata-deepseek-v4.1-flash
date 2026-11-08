@@ -159,6 +159,38 @@ class ManagerFixture(unittest.TestCase):
 
 
 class Configuration(ManagerFixture):
+    def test_pipeline_configuration_and_plan(self):
+        self.manager.save_config(dict(pipeline_peer=1, huge_pinned_memory=False, vision=False, decode_cpu_misses=True, pipeline_contiguous=True))
+        self.assertTrue(self.manager.config_value()["decode_cpu_misses"])
+        self.assertTrue(self.manager.config_value()["pipeline_contiguous"])
+        self.assertIn("dual L20", self.manager.plan()["profile"])
+        self.assertIn("ordinary pinned pages", self.manager.plan()["profile"])
+        for change in (dict(pipeline_peer=0), dict(pipeline_peer=True), dict(pipeline_peer=-2),
+                       dict(huge_pinned_memory="false"), dict(decode_cpu_misses=1), dict(pipeline_contiguous=1),
+                       dict(pipeline_peer=-1), dict(vision=True)):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.manager.save_config(change)
+
+    def test_pipeline_doctor_checks_both_visible_devices(self):
+        self.manager.save_config(dict(pipeline_peer=1, huge_pinned_memory=False, vision=False))
+        rows = "0, GPU-a, NVIDIA L20, 49140, 49000, 0, 8.9\n1, GPU-b, NVIDIA L20, 49140, 49000, 0, 8.9\n"
+        original_read = Path.read_text
+        def read(path, *args, **kwargs):
+            return "MemAvailable: 180000000 kB\n" if str(path) == "/proc/meminfo" else original_read(path, *args, **kwargs)
+        for visible, processes, expected in (("0,1", "", True), ("GPU-b,GPU-a", "", True),
+                                             ("0,0", "", False), ("0", "", False),
+                                             ("0,1", "GPU-b, 1234\n", False)):
+            def run(command):
+                output = processes if any("--query-compute-apps" in x for x in command) else rows if any("--query-gpu" in x for x in command) else ""
+                return 0, output, ""
+            with self.subTest(visible=visible, processes=processes), patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES":visible}), \
+                    patch.object(launcher.sys, "platform", "linux"), patch.object(launcher.sys, "version_info", (3, 10)), \
+                    patch.object(launcher.platform, "machine", return_value="x86_64"), \
+                    patch.object(launcher.os, "sched_getaffinity", return_value={8}, create=True), patch.object(Path, "read_text", read), \
+                    patch.object(launcher, "run_output", side_effect=run), patch("tools.deepseek41.serve_experimental.load_config", return_value={}):
+                result = self.manager.doctor()
+                self.assertIs(result["ok"], expected, result["checks"])
+
     def test_image_switch_round_trips_legacy_and_explicit_settings(self):
         for variant in launcher.VARIANTS:
             cfg = launcher.default_config(variant, self.manager.setup())

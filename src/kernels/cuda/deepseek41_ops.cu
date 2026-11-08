@@ -15,6 +15,7 @@
 namespace strata::models::deepseek41 {
 namespace {
 std::atomic<bool> hc_vector_enabled{true};
+std::atomic<bool> hc_reuse_enabled{false};
 // Stable expert order, then original token/slot order; at most48 selected slots.
 __global__ void route_group_short_kernel(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int count) {
     __shared__ int selected[48];
@@ -661,6 +662,36 @@ __global__ void hc_project_vector_kernel(const float* x,const float* fn,float* m
     if(!threadIdx.x)mixes[token*24+row]=product*inverse;
 }
 
+// Four output rows reuse one FP32 input load and one norm. The four virtual
+// lanes retain their original K stride, products and 256-lane reduction tree.
+__global__ void hc_project_reuse_kernel(const float* x,const float* fn,float* mixes,int hidden,float eps) {
+    const int first=blockIdx.x*4,token=blockIdx.y,width=hidden*4;
+    float square[4]{},dot[4][4]{};
+    for(int col=threadIdx.x*4;col<width;col+=256){
+        const float4 value=*reinterpret_cast<const float4*>(x+int64_t(token)*width+col);
+        const float values[4]={value.x,value.y,value.z,value.w};
+        #pragma unroll
+        for(int j=0;j<4;++j)square[j]+=values[j]*values[j];
+        #pragma unroll
+        for(int row=0;row<4;++row){
+            const float4 weight=*reinterpret_cast<const float4*>(fn+int64_t(first+row)*width+col);
+            const float weights[4]={weight.x,weight.y,weight.z,weight.w};
+            #pragma unroll
+            for(int j=0;j<4;++j)dot[row][j]+=values[j]*weights[j];
+        }
+    }
+    const float sum=hc_sum_virtual256(square);
+    __shared__ float inverse;
+    if(!threadIdx.x)inverse=rsqrtf(sum/width+eps);
+    __syncthreads();
+    #pragma unroll
+    for(int row=0;row<4;++row){
+        const float product=hc_sum_virtual256(dot[row]);
+        if(!threadIdx.x)mixes[token*24+first+row]=product*inverse;
+        __syncthreads(); // All readers finish before the next reduction reuses partial[].
+    }
+}
+
 __global__ void hc_project_kernel(const float* x, const float* fn, float* mixes, int hidden, float eps) {
     const int row = blockIdx.x, token = blockIdx.y, width = hidden * 4;
     float sum = 0, dot = 0;
@@ -996,10 +1027,14 @@ cudaError_t route_handoff_short_gpu(const int* ids,const float* weights,int* row
     route_handoff_short_kernel<<<1,64,0,stream>>>(ids,weights,rows,slots,grouped,handoff,tokens*6);return cudaGetLastError();
 }
 void hc_project_vector_set_enabled(bool value){hc_vector_enabled.store(value);}
+void hc_project_reuse_set_enabled(bool value){hc_reuse_enabled.store(value);}
 cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hidden, int tokens, float eps, cudaStream_t s) {
     if (hidden < 1 || tokens < 1 || tokens > 65535 || eps <= 0) return cudaErrorInvalidValue;
-    if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0)
-        hc_project_vector_kernel<<<dim3(24,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
+    if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
+        if(hc_reuse_enabled.load()&&tokens>=128)
+            hc_project_reuse_kernel<<<dim3(6,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
+        else hc_project_vector_kernel<<<dim3(24,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
+    }
     else hc_project_kernel<<<dim3(24,tokens),256,0,s>>>(x,fn,mixes,hidden,eps);
     return cudaGetLastError();
 }

@@ -59,7 +59,7 @@ DraftWeights::DraftWeights(const Model& model,Arithmetic arithmetic,cudaStream_t
         layer_offsets_[layer]=total;projection_bytes_[layer]=s.projection_bytes;expert_types_[layer]=s.type;
         total+=128*s.blob_bytes;largest=std::max(largest,s.blob_bytes);
     }
-    experts_=std::make_unique<core::DeviceArena>(total+aligned(vocab.size()*4)+2*aligned(129280*4));experts_->alloc(total);
+    experts_=std::make_unique<core::DeviceArena>(total+aligned(vocab.size()*4)+2*aligned(129280*4),current_device());experts_->alloc(total);
     gpu_vocab_ids=allocate<int>(*experts_,vocab.size());gpu_vocab_inverse=allocate<int>(*experts_,129280);
     gpu_input_inverse=allocate<int>(*experts_,129280);
     gpu_check(cudaMemcpyAsync(gpu_vocab_ids,vocab.ids.data(),vocab.size()*4,cudaMemcpyHostToDevice,stream));
@@ -409,7 +409,8 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     return proposal;
 }
 DraftProposal Session::propose(int first,const kernels::SamplerParams& sampling) {
-    auto& s=*impl_;auto& r=s.runtime;std::lock_guard<std::mutex> lock(r.execution_mutex);
+    auto& owner=*impl_;auto& s=owner.peer?*owner.peer:owner;auto& r=s.runtime;
+    std::lock_guard<std::mutex> lock(owner.runtime.execution_mutex);DeviceScope selected(r.device);
     if(!r.options.dspark||!r.draft_weights||!r.draft_work||s.position<1||s.draft_capture_position!=s.position||first<0||first>=129280)
         throw std::runtime_error("DSpark weights/capture/position contract");
     prefill::LedgerScope trace(r.options.trace,"ds41.draft");
@@ -419,12 +420,12 @@ DraftProposal Session::propose(int first,const kernels::SamplerParams& sampling)
         s.draft_hidden+((begin+t)%128)*15360,15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
     DraftContext context{r.model,r.options.arithmetic,*r.draft_weights,d,s.work,r.blas,r.stream.value,
                          &s.capture,[&]{s.check_cancel();}};
-    context.gpu_greedy=r.options.dspark_gpu_greedy;context.stats=&s.counters;
+    context.gpu_greedy=r.options.dspark_gpu_greedy;context.stats=&owner.counters;
     context.adaptive_confidence=r.options.dspark_adaptive_verification;context.draft_tokens=r.options.dspark_draft_tokens;
     context.kv_cache=r.options.dspark_incremental_kv?s.draft_kv.get():nullptr;
     context.fused_moe=r.options.dspark_fused_moe;context.batch_projection=r.options.dspark_batch_projection;
     auto proposal=draft_forward(context,d.main_hidden,window,s.position,first,s.tokens,sampling);
-    s.counters.draft_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
+    owner.counters.draft_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-before).count();
     return proposal;
 }
 } // namespace strata::models::deepseek41

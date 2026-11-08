@@ -17,6 +17,11 @@ VARIANTS = {"UD-IQ3_XXS": 67636039680, "UD-Q2_K_XL": 68664950784,
 TOKENIZER_SHA256 = "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
 
 
+def gsq_ple_model(cfg):
+    return (cfg.get("variant") == GSQ_VARIANT and
+            Path(cfg.get("model", "")).name == "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf")
+
+
 def vision_enabled(cfg):
     # A legacy GSQ config could reserve mmproj memory while serving only text.
     return cfg.get("vision", cfg.get("variant") not in GSQ_VARIANTS and bool(cfg.get("mmproj")))
@@ -58,10 +63,11 @@ def write_metadata(path, content):
 def gsq_launch_proof(cfg):
     lines = Path(cfg["integrity"]).read_text().splitlines()
     fourth = [row[1:] for row in map(str.split, lines) if row[:1] == ["main.4"]]
-    expected = (hash_proof.GSQ_UNCENSORED_SHARD4_SHA256 if cfg["variant"] == GSQ_UNCENSORED_VARIANT
+    expected = (hash_proof.GSQ_PLE_SHA256[3] if gsq_ple_model(cfg) else
+                hash_proof.GSQ_UNCENSORED_SHARD4_SHA256 if cfg["variant"] == GSQ_UNCENSORED_VARIANT
                 else hash_proof.GSQ_RCO_SHA256[3])
     model = Path(cfg["model"])
-    shard = model.with_name(model.name.replace("-00001-of-00004.gguf", "-00004-of-00004.gguf"))
+    shard = model.with_name(model.name.replace("-00001-of-", "-00004-of-"))
     if fourth != [[expected, *map(str, hash_proof.identity(shard))]]:
         raise ValueError("GSQ fourth-shard proof does not match the selected model")
     if not cfg.get("_gsq_vision_bias"):

@@ -33,6 +33,7 @@ struct PrefetchBlockBenchmark {
         }
     }
     static AdaptiveCache& cache(Runtime& r){return *rt(r).experts->adaptive_;}
+    static AdaptiveCache& cache(Runtime::Impl& r){return *r.experts->adaptive_;}
     static Snapshot snapshot(AdaptiveCache& a){
         if(a.state_!=AdaptiveCache::State::idle)throw std::logic_error("snapshot requires idle adaptive cache");
         a.record_exchanges_=true;a.committed_exchanges_.clear();

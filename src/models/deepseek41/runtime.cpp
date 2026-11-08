@@ -12,6 +12,15 @@
 #include <cstdlib>
 
 namespace strata::models::deepseek41 {
+bool pipeline_p2p_enabled() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("STRATA_DS41_PIPELINE_P2P");
+        if(!value||std::strcmp(value,"0")==0)return false;
+        if(std::strcmp(value,"1")==0)return true;
+        throw std::invalid_argument("pipeline P2P selection must be 0 or 1");
+    }();
+    return enabled;
+}
 namespace {
 const std::string& verified_path(const std::string& path,const RuntimeOptions& o,
                                  const std::string& draft,const std::string& vision) {
@@ -73,7 +82,7 @@ void Workspace::layout(WorkspaceLayout& memory,int tokens,int context,bool compa
     index_gpu_bytes=memory.bytes-index_begin;
 }
 Workspace::Workspace(uint64_t budget,int tokens,int context,bool compact_logits,bool compact_workspace,bool dspark) {
-    arena=std::make_unique<core::DeviceArena>(budget);
+    arena=std::make_unique<core::DeviceArena>(budget,current_device());
     WorkspaceLayout memory(arena.get());layout(memory,tokens,context,compact_logits,compact_workspace,dspark);
     // Pinned exchanges are request-independent and reused while the execution mutex owns this workspace.
     const uint64_t t=tokens,host_bytes=t*5120*4+t*6*5120*4+t*6*4*5+sizeof(int);
@@ -100,8 +109,10 @@ uint64_t Workspace::bytes_needed(int tokens,const RuntimeOptions& options,bool v
     if(options.dspark){DraftWork extra(memory,DraftVocab(options.draft_vocab).size());}
     return memory.bytes;
 }
-Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::string& draft,const std::string& vision)
+Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::string& draft,const std::string& vision,
+                    std::shared_ptr<EngramReader> shared_engram)
     : model(verified_path(path,o,draft,vision),draft,vision), options(o) {
+    gpu_check(cudaGetDevice(&device));
     if (o.context < 1 || o.context > model.geometry().context || o.chunk < 1 || o.chunk > PREFILL_CHUNK_MAX || o.slots < 1 || o.slots > 2)
         throw std::invalid_argument("DeepSeek context/chunk/slots bounds");
     if (o.arithmetic == Arithmetic::f32 && o.experts != ExpertMode::gpu)
@@ -120,12 +131,17 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
        std::filesystem::weakly_canonical(o.expert_profile_save)==std::filesystem::weakly_canonical(o.profile))
         throw std::invalid_argument("learned profile output must differ from the startup profile");
     if(!std::isfinite(o.pcie_frac) || o.pcie_frac<0 || o.pcie_frac>1)throw std::invalid_argument("DeepSeek pcie-frac bounds");
+    if(o.decode_cpu_misses && (o.arithmetic!=Arithmetic::production || o.experts!=ExpertMode::hybrid))
+        throw std::invalid_argument("CPU decode misses require production hybrid experts");
     if((o.expert_pipeline || o.pcie_frac>0) && (o.phase_residency || o.slots!=1))
         throw std::invalid_argument("expert issuer requires one slot without phase residency");
     if(o.pcie_frac>0 && (o.arithmetic!=Arithmetic::production || o.experts!=ExpertMode::hybrid || !o.expert_direct_gemv))
         throw std::invalid_argument("PCIe offload requires production hybrid direct BF16 GEMV");
-    const auto info = core::device_info();
+    const auto info = core::device_info(device);
     if (info.cc_major < 8) throw std::runtime_error("DeepSeek native attention requires CUDA SM80 or later");
+    // SM89 grouped arithmetic is retained behind an explicit experiment flag.
+    bounded_moe_supported = info.cc_major == 12 && info.cc_minor == 0;
+    bounded_moe_sm89 = info.cc_major == 8 && info.cc_minor == 9;
     struct BlasGuard {cublasHandle_t& handle;bool success=false;~BlasGuard(){if(!success&&handle)cublasDestroy(handle);}} guard{blas};
     if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas,stream.value) != CUBLAS_STATUS_SUCCESS ||
         cublasSetMathMode(blas,static_cast<cublasMath_t>(CUBLAS_PEDANTIC_MATH|CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)) != CUBLAS_STATUS_SUCCESS)
@@ -148,7 +164,7 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
         std::cerr<<"DeepSeek prefill auto: chunk="<<options.chunk<<" ceiling="<<o.chunk
                  <<" context="<<o.context<<" workspace="<<needed<<" budget="<<o.work<<'\n';
     }
-    weights=std::make_unique<WeightBank>(model,o.arithmetic,stream.value,false,false,o.dense_q8);
+    weights=std::make_unique<WeightBank>(model,o.arithmetic,stream.value,false,false,o.dense_q8,nullptr,nullptr,&o);
     if(model.has_vision())vision_weights=std::make_unique<WeightBank>(model,Arithmetic::f32,stream.value,false,true);
     if (!o.gsq_vision_bias.empty()) {
         if (!model.gsq_rco_1017() || !model.has_vision())
@@ -160,10 +176,10 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
             !std::all_of(rows.begin(), rows.end(), [](float value) { return std::isfinite(value); }))
             throw std::runtime_error("DeepSeek invalid 40 x 384 F32 image router bias");
         require_integrity(o.integrity_file, "vision_bias", o.gsq_vision_bias);
-        gsq_vision_bias = std::make_unique<core::DeviceArena>(sizeof(rows));
+        gsq_vision_bias = std::make_unique<core::DeviceArena>(sizeof(rows),device);
         gpu_check(cudaMemcpy(gsq_vision_bias->alloc(sizeof(rows)), rows.data(), sizeof(rows), cudaMemcpyHostToDevice));
     }
-    if(o.dspark){
+    if(o.dspark && o.pipeline_rank!=0){
         draft_weights=std::make_unique<DraftWeights>(model,o.arithmetic,stream.value,o.draft_vocab,o.draft_input_vocab);
         if(draft_weights->bytes()>(11ull<<30))throw std::runtime_error("DSpark weights exceed the 11 GiB draft region");
     }
@@ -186,10 +202,10 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     if (wanted_hot > capacity)
         throw std::runtime_error("DeepSeek GPU weight/ring/work/state/headroom budgets do not fit");
     experts=std::make_unique<GgufExperts>(model,options,upload.value);
-    engram=std::make_unique<EngramReader>(model,o.engram_cache,o.engram_continuous,o.engram_aio);
+    engram=shared_engram?std::move(shared_engram):std::make_shared<EngramReader>(model,o.engram_cache,o.engram_continuous,o.engram_aio);
     pool=std::make_unique<kernels::cpu::ExpertPool>(o.cpu_workers,true,true);
     // Fixed 64/128-slot byte ring, with two independent DMA/consumption lifetimes.
-    ring=std::make_unique<core::DeviceArena>(ring_bytes);
+    ring=std::make_unique<core::DeviceArena>(ring_bytes,device);
     host_ring=std::make_unique<Pinned>(ring_bytes);
     if(o.expert_pipeline || o.pcie_frac>0)expert_pipeline=std::make_unique<ExpertPipeline>(ring->base(),*host_ring,ring_slot_bytes,ring_slots,upload.value);
     if(o.decode_raw_cache){
@@ -199,14 +215,18 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     work=std::make_unique<Workspace>(o.work,std::max(128,options.chunk),o.context,o.compact_logits,o.compact_workspace,o.dspark);
     WorkspaceLayout memory(work->arena.get());work->extras(memory,o);
     if(model.has_vision())vision_work=std::make_unique<VisionWork>(*work->arena);
-    if(o.dspark)draft_work=std::make_unique<DraftWork>(*work->arena,draft_weights->vocab.size());
+    if(draft_weights)draft_work=std::make_unique<DraftWork>(*work->arena,draft_weights->vocab.size());
+    if(o.pipeline_rank>=0)peer_staging=std::make_unique<Pinned>(16ull<<20,false,false);
     if(const char* mode=std::getenv("STRATA_DS41_DECODE_SEGMENTS")){
         if(mode[0]<'0'||mode[0]>'3'||mode[1])throw std::invalid_argument("decode segment mask must be 0..3");
         decode_segment_mask=static_cast<unsigned>(mode[0]-'0');
     }
     guard.success=true;
 }
-Runtime::Impl::~Impl() { cudaStreamSynchronize(hc_stream.value);if (blas) cublasDestroy(blas); }
+Runtime::Impl::~Impl() {
+    peer.reset();cudaSetDevice(device);
+    cudaStreamSynchronize(hc_stream.value);if (blas) cublasDestroy(blas);
+}
 void Runtime::Impl::round(float* x,uint64_t n) {
     if (options.arithmetic == Arithmetic::production) gpu_check(round_bf16_gpu(x,n,stream.value));
 }
@@ -259,7 +279,10 @@ void matrix_product(const Matrix& m,const float* x,float* out,int tokens,cublasH
     }
 }
 void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,Workspace& w,
-                          int rows,int64_t ldx,int64_t ldy,uint64_t weight_offset,bool round_output) {
+                          int rows,int64_t ldx,int64_t ldy,uint64_t weight_offset,bool round_output,bool prepared_q8_input) {
+    if(prepared_q8_input&&(!m.packed_bf16||m.type!=13||m.rows!=2304||m.cols!=5120||rows||weight_offset||
+       !options.dense_q8_1||tokens<1||tokens>8||(tokens>1&&!options.dense_q8_batch)||(ldx&&ldx!=m.cols)))
+        throw std::invalid_argument("DeepSeek prepared shared Q8 input contract");
     if(tokens>w.max_tokens)throw std::invalid_argument("DeepSeek matrix exceeds workspace token capacity");
     if(m.type==30 && tokens>8 && m.cols>w.max_bf_input_cols)throw std::invalid_argument("DeepSeek matrix exceeds BF16 input scratch");
     if(m.packed_bf16) {
@@ -272,15 +295,17 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
         if(tokens<=8) {
             if(options.dense_q8_1&&options.dense_q8_batch&&tokens>1){
                 // Existing exact multi-column kernel shares each loaded weight across rows.
-                if(ldx==k)kernels::native_quantize_q8_1(x,w.dense_input_q8,k,tokens,stream.value);
-                else for(int t=0;t<tokens;++t)kernels::native_quantize_q8_1(x+int64_t(t)*ldx,
-                    w.dense_input_q8+int64_t(t)*k/32*36,k,1,stream.value);
+                if(!prepared_q8_input){
+                    if(ldx==k)kernels::native_quantize_q8_1(x,w.dense_input_q8,k,tokens,stream.value);
+                    else for(int t=0;t<tokens;++t)kernels::native_quantize_q8_1(x+int64_t(t)*ldx,
+                        w.dense_input_q8+int64_t(t)*k/32*36,k,1,stream.value);
+                }
                 float* result=ldy==n?out:reinterpret_cast<float*>(w.dense_weight);
                 kernels::native_mmvq(m.type,packed,w.dense_input_q8,result,k,n,tokens,stream.value);
                 if(ldy!=n)gpu_check(cudaMemcpy2DAsync(out,ldy*4,result,n*4,n*4,tokens,cudaMemcpyDeviceToDevice,stream.value));
             }else for(int t=0;t<tokens;++t) {
                 if(options.dense_q8_1){
-                    kernels::native_quantize_q8_1(x+int64_t(t)*ldx,w.dense_input_q8,k,1,stream.value);
+                    if(!prepared_q8_input)kernels::native_quantize_q8_1(x+int64_t(t)*ldx,w.dense_input_q8,k,1,stream.value);
                     kernels::native_mmvq(m.type,packed,w.dense_input_q8,out+int64_t(t)*ldy,k,n,1,stream.value);
                 }else gpu_check(packed_bf16_gemv_gpu(packed,m.type,x+int64_t(t)*ldx,out+int64_t(t)*ldy,n,k,1,stream.value));
             }
@@ -313,17 +338,58 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
     matrix_product(m,x,out,tokens,blas,stream.value,w.bf_input,options.arithmetic,rows,ldx,ldy,weight_offset,round_output,options.target_verify_batch,w.max_bf_input_cols);
 }
 Runtime::Runtime(const std::string& main,const RuntimeOptions& options,const std::string& draft,const std::string& vision)
-    : impl_(std::make_unique<Impl>(main,options,draft,vision)) {}
+{
+    if(pipeline_p2p_enabled()&&options.pipeline_peer<0)
+        throw std::invalid_argument("pipeline P2P requires a peer device");
+    if(options.pipeline_contiguous && options.pipeline_peer<0)
+        throw std::invalid_argument("contiguous pipeline requires a peer device");
+    auto local=options;
+    if(options.pipeline_peer>=0){
+        int device=0,count=0;gpu_check(cudaGetDevice(&device));gpu_check(cudaGetDeviceCount(&count));
+        if(options.pipeline_peer>=count || options.pipeline_peer==device || options.slots!=1 || options.phase_residency || !vision.empty())
+            throw std::invalid_argument("CED pipeline requires two distinct CUDA devices, one slot, text input and no phase lending");
+        local.pipeline_rank=0;
+    }
+    impl_=std::make_unique<Impl>(main,local,draft,vision);
+    if(options.pipeline_peer>=0){
+        DeviceScope selected(options.pipeline_peer);local.pipeline_rank=1;
+        if(!local.capture_directory.empty())local.capture_directory+="/gpu1";
+        impl_->peer=std::make_unique<Impl>(main,local,draft,vision,impl_->engram);
+    }
+    if(impl_->peer){
+        if(pipeline_p2p_enabled())for(auto* owner:{impl_.get(),impl_->peer.get()}){
+            const int other=owner==impl_.get()?impl_->peer->device:impl_->device;
+            DeviceScope selected(owner->device);int available=0;
+            gpu_check(cudaDeviceCanAccessPeer(&available,owner->device,other));
+            if(!available)throw std::runtime_error("pipeline P2P access unavailable");
+            const auto error=cudaDeviceEnablePeerAccess(other,0);
+            if(error==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();
+            else gpu_check(error);
+        }
+        // Keep identical staging allocation and residency budgets in both modes.
+        std::cerr<<"DeepSeek pipeline transfer="<<(pipeline_p2p_enabled()?"p2p":"pinned_host")
+                 <<" staging_bytes_per_device="<<(16ull<<20)<<'\n';
+    }
+}
 Runtime::~Runtime()=default;
 const Model& Runtime::model() const { return impl_->model; }
 std::unique_ptr<Session> Runtime::create_session() {
+    DeviceScope selected(impl_->device);
     std::lock_guard<std::mutex> lock(impl_->execution_mutex);
     if (impl_->active_sessions >= impl_->options.slots) throw std::runtime_error("DeepSeek session slot limit");
     auto session=std::unique_ptr<Session>(new Session(*impl_));++impl_->active_sessions;return session;
 }
 void Runtime::write_ledger(std::ostream& out) const {
     const auto& p=*impl_;
-    out << "{\"dense_gpu_bytes\":" << p.weights->bytes() << ",\"expert_gpu_bytes\":" << p.experts->gpu_bytes()
+    out << "{\"cuda_device\":"<<p.device<<",\"pipeline_peer\":"<<(p.peer?p.peer->device:-1)
+        <<",\"pipeline_transfer\":\""<<(p.peer?(pipeline_p2p_enabled()?"p2p":"pinned_host"):"none")<<"\""
+        <<",\"pipeline_contiguous\":"<<(p.options.pipeline_contiguous?"true":"false")
+        <<",\"peer_dense_gpu_bytes\":"<<(p.peer?p.peer->weights->bytes():0)
+        <<",\"peer_expert_gpu_bytes\":"<<(p.peer?p.peer->experts->gpu_bytes():0)
+        <<",\"peer_draft_gpu_bytes\":"<<(p.peer&&p.peer->draft_weights?p.peer->draft_weights->bytes():0)
+        <<",\"peer_expert_ram_bytes\":"<<(p.peer?p.peer->experts->ram_bytes():0)
+        <<",\"pipeline_staging_bytes\":"<<(p.peer?p.peer_staging->bytes+p.peer->peer_staging->bytes:0)
+        <<",\"dense_gpu_bytes\":" << p.weights->bytes() << ",\"expert_gpu_bytes\":" << p.experts->gpu_bytes()
         <<",\"prefill_chunk\":"<<p.options.chunk<<",\"prefill_chunk_auto\":"<<(p.options.chunk_auto?"true":"false")
         <<",\"dense_q8\":"<<(p.options.dense_q8?"true":"false")<<",\"dense_q8_1\":"<<(p.options.dense_q8_1?"true":"false")
         <<",\"dense_q8_batch\":"<<(p.options.dense_q8_batch?"true":"false")
@@ -334,6 +400,7 @@ void Runtime::write_ledger(std::ostream& out) const {
         <<",\"dspark_fused_moe\":"<<(p.options.dspark_fused_moe?"true":"false")
         <<",\"dspark_batch_projection\":"<<(p.options.dspark_batch_projection?"true":"false")
         <<",\"expert_gu_mode\":"<<p.options.expert_gu_mode<<",\"cpu_gu_q8_0\":"<<(p.options.cpu_gu_q8_0?"true":"false")
+        <<",\"decode_cpu_misses\":"<<(p.options.decode_cpu_misses?"true":"false")
         <<",\"decode_segment_mask\":"<<p.decode_segment_mask
         <<",\"decode_segment_cache_bytes\":"<<p.work->segment_cache_bytes
         <<",\"decode_segment_captures\":"<<(p.work->segment_captures[0]+p.work->segment_captures[1])

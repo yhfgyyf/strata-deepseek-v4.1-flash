@@ -5,8 +5,9 @@
 namespace strata::models::deepseek41 {
 namespace {std::atomic<bool> engram_short_enabled{true};}
 void engram_short_set_enabled(bool value){engram_short_enabled.store(value);}
-EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type)
+EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type,int table_mask)
     : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==20?144:packed_type==13?176:packed_type==14?210:272) {
+    if(table_mask<1||table_mask>3)throw std::invalid_argument("Engram table mask");table_mask_=table_mask;
     if(packed_type!=8&&packed_type!=13&&packed_type!=14&&packed_type!=20)throw std::invalid_argument("Engram pipeline type");
     host_=std::make_unique<Pinned>(uint64_t(work.max_tokens)*24*row_bytes_,false,huge_pinned);
     if (!work.engram_input || !host_->pinned) throw std::runtime_error("Engram pipeline requires private BF16/pinned scratch");
@@ -27,15 +28,16 @@ void EngramPipeline::stop() {
     cudaStreamSynchronize(stream_.value);
 }
 void EngramPipeline::start(std::shared_ptr<EngramBatch> ticket,uint64_t sequence,int count,const Matrix& first,const Matrix& second) {
+    const int last=(table_mask_&2)?1:0;
     {std::unique_lock<std::mutex> lock(mutex_);
      if(stopped_ || !ticket || sequence<=sequence_ || count<1 || count>work_.max_tokens)throw std::runtime_error("Engram pipeline generation/count");
-     if(sequence_ && used_[1]!=sequence_)throw std::runtime_error("Engram previous generation not consumed");
+     if(sequence_ && used_[last]!=sequence_)throw std::runtime_error("Engram previous generation not consumed");
      changed_.wait(lock,[&]{return stopped_ || error_ || (!working_ && !pending_);});
      if(error_)std::rethrow_exception(error_);if(stopped_)throw std::runtime_error("Engram pipeline stopped");}
     // All old waits were enqueued by consume before a new job can be started.
     if(sequence_) {
-        if(used_[1]!=sequence_)throw std::runtime_error("Engram previous generation not consumed");
-        gpu_check(cudaStreamWaitEvent(stream_.value,consumed_[1].value,0));
+        if(used_[last]!=sequence_)throw std::runtime_error("Engram previous generation not consumed");
+        gpu_check(cudaStreamWaitEvent(stream_.value,consumed_[last].value,0));
         gpu_check(cudaStreamSynchronize(stream_.value));
     }
     { std::lock_guard<std::mutex> lock(mutex_);
@@ -52,8 +54,9 @@ void EngramPipeline::run(){
          ticket=ticket_;sequence=sequence_;count=count_;matrices=matrices_;pending_=false;working_=true;}
         try {
             for(int table=0;table<2;++table) {
+                if(!(table_mask_&(1<<table)))continue;
                 const auto& data=ticket->wait_layer(table);
-                if(table) {
+                if(table && (table_mask_&1)) {
                     std::unique_lock<std::mutex> lock(mutex_);
                     changed_.wait(lock,[&]{return stopped_ || used_[0]==sequence;});
                     if(stopped_)return;

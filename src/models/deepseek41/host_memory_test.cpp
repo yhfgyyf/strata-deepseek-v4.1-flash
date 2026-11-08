@@ -111,7 +111,9 @@ void block_checks(const std::string& mode){
     arena.allocate(boundaries.back(),mode!="blocks-ordinary",boundaries);
     arena.register_if_needed();arena.register_if_needed();
     need(arena.pinned(),"block arena is not pinned");coverage(arena.memory_info(),huge,true);
-    need(arena.memory_info().registration_count==(huge?3:1),"wrong registration count or fallback");
+    need(arena.memory_info().registration_count==((huge||mode=="blocks-ordinary")?3:1),"wrong registration count or fallback");
+    if(mode=="blocks-ordinary")need(std::string(arena.memory_info().mode)=="registered_ordinary_blocks"&&
+        arena.memory_info().required_huge_percent==0,"ordinary blocks changed page policy");
     if(huge)need(arena.memory_info().largest_registration==16777216,"wrong maximum registration span");
     if(mode=="blocks-fail")need(std::string(arena.memory_info().fallback)=="registration","partial failure did not fall back");
     d::Pinned readback(*std::max_element(sizes.begin(),sizes.end()));

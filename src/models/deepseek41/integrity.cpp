@@ -57,6 +57,11 @@ void require_integrity(const std::string& proof, const std::string& kind, const 
     }
     if(kind=="main"){
         const auto shards=gguf_split_paths(path);
+        if(shards.size()==gsq_rco_1017_ple_sha256.size()) {
+            for(size_t i=0;i<shards.size();++i)
+                require_file(proof,"main."+std::to_string(i+1),shards[i],gsq_rco_1017_ple_sha256[i]);
+            return;
+        }
         if(shards.size()==4) {
             for(size_t i=0;i<shards.size();++i)
                 require_file(proof,"main."+std::to_string(i+1),shards[i],gsq_rco_1017_sha256[i],

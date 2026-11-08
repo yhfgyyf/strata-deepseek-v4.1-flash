@@ -112,6 +112,23 @@ public:
         info.fallback="platform";return false;
 #endif
     }
+    bool allocate_ordinary(uint64_t count,HostMemoryInfo& info){
+        if(data_)throw std::logic_error("host region already allocated");
+        if(!count || count>SIZE_MAX-4*page)return false;
+#ifdef __linux__
+        const auto start=std::chrono::steady_clock::now();
+        bytes_=(count+page-1)/page*page;reserved_=bytes_+3*page;
+        reservation_=mmap(nullptr,reserved_,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+        if(reservation_==MAP_FAILED){reservation_=nullptr;reserved_=bytes_=0;return false;}
+        const auto base=reinterpret_cast<uintptr_t>(reservation_);
+        data_=reinterpret_cast<uint8_t*>((base+2*page-1)/page*page);
+        if(mprotect(data_,bytes_,PROT_READ|PROT_WRITE)||madvise(data_,bytes_,MADV_NOHUGEPAGE)){reset();return false;}
+        info.logical=count;info.mapped=bytes_;info.required_huge_percent=0;info.mode="ordinary_blocks";
+        info.allocation_ms=host_elapsed(start);return true;
+#else
+        return false;
+#endif
+    }
     uint64_t huge_bytes()const{
         if(!data_)return 0;
         std::ifstream input("/proc/self/smaps");std::string line;
@@ -207,6 +224,13 @@ public:
                 throw std::runtime_error("DeepSeek block-pinned memory requires "+std::to_string(minimum)+"% huge-page registration");
             }
         }
+        if(!prefer_huge&&!boundaries.empty()){
+            if(boundaries.front()!=0||boundaries.back()!=count)throw std::invalid_argument("ordinary host block bounds");
+            for(size_t i=1;i<boundaries.size();++i)
+                if(boundaries[i]<=boundaries[i-1]||boundaries[i]%HugeHostRegion::page)throw std::invalid_argument("ordinary host block alignment");
+            if(!huge_.allocate_ordinary(count,info))throw std::runtime_error("ordinary host block allocation");
+            boundaries_=boundaries;return;
+        }
         const auto start=std::chrono::steady_clock::now();
         heap_.reset(new uint8_t[count]);info.allocation_ms+=host_elapsed(start);
         info.mapped=count;info.mode="ordinary";
@@ -214,9 +238,13 @@ public:
     void register_if_needed(){
         if(!registrations_.empty())return;
         const auto start=std::chrono::steady_clock::now();
-        registrations_.push_back(std::make_unique<HostRegistration>(get(),info.logical));
-        info.registration_count=1;info.largest_registration=info.logical;
-        info.registration_ms+=host_elapsed(start);info.mode="registered_ordinary";
+        const auto spans=boundaries_.empty()?std::vector<uint64_t>{0,info.logical}:boundaries_;
+        for(size_t i=1;i<spans.size();++i){
+            registrations_.push_back(std::make_unique<HostRegistration>(get()+spans[i-1],spans[i]-spans[i-1]));
+            info.largest_registration=std::max(info.largest_registration,spans[i]-spans[i-1]);
+        }
+        info.registration_count=registrations_.size();
+        info.registration_ms+=host_elapsed(start);info.mode=boundaries_.empty()?"registered_ordinary":"registered_ordinary_blocks";
     }
     uint8_t* get()const{return huge_.get()?huge_.get():heap_.get();}
     explicit operator bool()const{return get()!=nullptr;}
@@ -227,6 +255,7 @@ private:
     std::unique_ptr<uint8_t[]> heap_;
     HugeHostRegion huge_;
     std::vector<std::unique_ptr<HostRegistration>> registrations_;
+    std::vector<uint64_t> boundaries_;
 };
 struct Pinned {
     uint8_t* data=nullptr;

@@ -32,6 +32,7 @@ void stats(const ExecutionStats& s) {
     std::cout<<"{\"encoder_token_layers\":"<<s.encoder_token_layers<<",\"decoder_token_layers\":"<<s.decoder_token_layers
         <<",\"kv_only_tokens\":"<<s.kv_only_tokens<<",\"replay_tokens\":"<<s.replay_tokens<<",\"decoded_tokens\":"<<s.decoded_tokens
         <<",\"gpu_expert_tokens\":"<<s.expert_gpu<<",\"cpu_expert_tokens\":"<<s.expert_cpu<<",\"expert_h2d_bytes\":"<<s.h2d_expert_bytes
+        <<",\"peer_copy_bytes\":"<<s.peer_copy_bytes<<",\"pipeline_encoder_chunks\":"<<s.pipeline_encoder_chunks
         <<",\"prefill_ms\":"<<s.prefill_ms<<",\"decode_ms\":"<<s.decode_ms<<",\"engram_wait_ms\":"<<s.engram_wait_ms
         <<",\"proposed_tokens\":"<<s.proposed_tokens<<",\"accepted_tokens\":"<<s.accepted_tokens<<",\"draft_ms\":"<<s.draft_ms<<",\"verify_ms\":"<<s.verify_ms
         <<",\"verify_calls\":"<<s.verify_calls<<",\"verify_rows\":"<<s.verify_rows
@@ -81,6 +82,8 @@ int main(int argc,char** argv) {
             else if(a=="--arithmetic"){const auto value=next();if(value!="f32"&&value!="production")throw std::invalid_argument("arithmetic");options.arithmetic=value=="f32"?Arithmetic::f32:Arithmetic::production;}
             else if(a=="--expert-mode"){const auto value=next();if(value!="hybrid"&&value!="gpu"&&value!="cpu")throw std::invalid_argument("expert mode");options.experts=value=="hybrid"?ExpertMode::hybrid:value=="cpu"?ExpertMode::cpu:ExpertMode::gpu;}
             else if(a=="--context")options.context=std::stoi(next());
+            else if(a=="--pipeline-peer")options.pipeline_peer=std::stoi(next());
+            else if(a=="--pipeline-serial")options.pipeline_overlap=false;
             else if(a=="--chunk"||a=="--prefill"){
                 const auto chunk=parse_prefill_chunk(next());options.chunk=chunk.tokens;options.chunk_auto=chunk.automatic;
             }

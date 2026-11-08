@@ -1235,6 +1235,7 @@ struct SmallTraits<IQ4NLBlock, 4> {
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+bool g_q5_output_a = [] {const char* v=std::getenv("STRATA_Q5_OUTPUT_A_BATCH");return v&&v[0]=='1';}();
 
 // S26 STRATA_TSUM=1 (TS): warp 0's NCOLS x ROWS sums as one transposed butterfly (s26_tsum.cuh), bitwise the same
 static bool s26_tsum_on() {
@@ -1343,6 +1344,8 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 // Two physical warps per row keep the four original warp accumulators.
 // Warp0 owns original0/2; warp1 supplies1/3. The addition order stays0+1+2+3.
 bool g_multi_warp = true;
+bool g_l20_q5_extra = false;
+bool g_l20_q5_n6 = [] { const char* v=std::getenv("STRATA_L20_Q5_N6");return v&&v[0]=='1'; }();
 template<typename F,int N,bool Pair=false>
 __launch_bounds__(128,4)
 __global__ void native_mmvq_multi_two_warp_kernel(const typename F::Block* __restrict__ w,
@@ -2378,28 +2381,35 @@ bool native_deepseek_output_a_batch(int type,const void* weights,const float* x,
 #if defined(__HIPCC__)
     return false;
 #else
-    if ((type!=8&&type!=14)||tokens<2||tokens>8||!g_multi_exact||s26_tsum_on()||!weights||!x||!scratch||!out||!stream) return false;
+    if ((type!=8&&type!=14&&!(type==13&&g_q5_output_a))||tokens<2||tokens>8||!g_multi_exact||s26_tsum_on()||!weights||!x||!scratch||!out||!stream) return false;
     static const bool rows1=[] {const char* v=std::getenv("STRATA_NO_MMVQ_ROWS2");return v&&v[0]&&v[0]!='0';}();
     if(rows1) return false;
-    const int row_bytes=type==8?4096/32*34:4096/256*210;
+    const int row_bytes=type==8?4096/32*34:4096/256*(type==13?176:210);
     for(int group=0;group<8;++group) {
         const void* w=static_cast<const uint8_t*>(weights)+std::size_t(group)*1024*row_bytes;
         if(q8_packed_registry().count(w)||q6_packed_registry().count(w))return false;
     }
     native_quantize_q8_1(x,scratch,32768,tokens,stream);
     if(type==8)launch_output_a<SmallTraits<Q80Block,8>>(weights,scratch,out,tokens,static_cast<cudaStream_t>(stream));
+    else if(type==13)launch_output_a<Q5KTraits>(weights,scratch,out,tokens,static_cast<cudaStream_t>(stream));
     else launch_output_a<Q6KTraits>(weights,scratch,out,tokens,static_cast<cudaStream_t>(stream));
     launch_check();return true;
 #endif
 }
 
 void native_mmvq_multi_warp_set_enabled(bool value){g_multi_warp=value;}
+void native_q5_output_a_set_enabled(bool value){g_q5_output_a=value;}
+void native_mmvq_l20_q5_n6_set_enabled(bool value){g_l20_q5_n6=value;}
+void native_mmvq_l20_q5_extra_set_enabled(bool value){g_l20_q5_extra=value;}
 bool native_mmvq_multi_warp_selected(int type,int ni,int no,int n,bool pair) {
 #if defined(__HIPCC__)
     return false;
 #else
     static const bool rows1=[] {const char* v=std::getenv("STRATA_NO_MMVQ_ROWS2");return v&&v[0]&&v[0]!='0';}();
     if(n<2||n>8||!g_multi_exact||s26_tsum_on()||pdl_scope()||rows1)return false;
+    if(g_l20_q5_n6&&type==13&&ni==1280&&no==32768&&n==6&&!pair)return true;
+    // L20: shared Gate/Up N6 passed every frozen component condition.
+    if(g_l20_q5_extra&&type==13&&!pair&&n==6&&ni==5120&&no==2304)return true;
     // Passed independent fixed and eight-matrix rotation checks; other bins keep33.
     struct Choice {int type,ni,no;bool pair;unsigned mask;};
     static constexpr Choice choices[]={

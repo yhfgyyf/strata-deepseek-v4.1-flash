@@ -156,7 +156,8 @@ class GsqReleaseConfigTests(unittest.TestCase):
         header = root / "include/strata/models/deepseek41/gsq_rco_1017_digests.hpp"
         native = re.findall(r'"([0-9a-f]{64})"', header.read_text())
         self.assertEqual(hash_proof.GSQ_RCO_SHA256, native[:5])
-        self.assertEqual([hash_proof.GSQ_UNCENSORED_SHARD4_SHA256, startup_assets.GSQ_VISION_BIAS_SHA256], native[5:])
+        self.assertEqual(hash_proof.GSQ_PLE_SHA256, native[5:11])
+        self.assertEqual([hash_proof.GSQ_UNCENSORED_SHARD4_SHA256, startup_assets.GSQ_VISION_BIAS_SHA256], native[11:])
 
     def test_uncensored_proof_uses_exact_fourth_shard_and_preserves_original(self):
         paths = {"main": self.files[0]}

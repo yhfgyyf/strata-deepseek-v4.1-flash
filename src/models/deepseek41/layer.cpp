@@ -270,8 +270,8 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
             work.q,count,64,128,own.compression&&rows?512:0,total,rows,stream));
     }else {
         gpu_check(float_to_bf16_gpu(work.q,work.q_bf,int64_t(count)*32768,stream));
-        PackedAttention p;p.q=work.q_bf;p.swa=contiguous(work.temp_swa,work.max_tokens+128,528,32);
-        if(compressed)p.global=contiguous(compressed->packed,runtime.options.context/own.compression,288,64);
+        PackedAttention p;p.q=work.q_bf;p.swa=contiguous(work.temp_swa,total,528,32);
+        if(compressed)p.global=contiguous(compressed->packed,rows,288,64);
         p.swa_slots=work.swa_slots;p.global_slots=own.compression?work.global_slots:nullptr;
         p.sinks=static_cast<const float*>(runtime.tensor(layer,"attn_sinks").data);p.partial=work.partial_out;p.lse=work.lse;p.output=work.out_bf;
         p.tokens=count;p.global_topk=own.compression&&rows?512:0;p.splits=count<=8?8:1;
@@ -296,7 +296,7 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
     dump("attn_derope-"+std::to_string(layer),work.q,{count,64,512});
 
 }
-void Session::Impl::layers(int count,int64_t start,int first,int last,bool prefill,const BlockBenchmarkHooks* hooks) {
+void Session::Impl::local_layers(int count,int64_t start,int first,int last,bool prefill,const BlockBenchmarkHooks* hooks) {
     const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
     // Small replay windows keep demand-only uploads: streaming every expert
     // there would transfer many blobs that their routing never selects.
@@ -338,6 +338,10 @@ void Session::Impl::layers(int count,int64_t start,int first,int last,bool prefi
     if(lookahead){runtime.end_expert_prefetch();prefetch_guard.enabled=false;}
 }
 std::vector<float> Session::Impl::logits(int count,bool all) {
+    if(peer){
+        DeviceScope selected(peer->runtime.device);peer->greedy_capture=greedy_capture;
+        auto result=peer->logits(count,all);last_greedy=peer->last_greedy;return result;
+    }
     const auto stream=runtime.stream.value;const auto& g=runtime.model.geometry();
     gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.pre,work.x,5120,count,stream));
     dump("hc_out",work.x,{count,5120});

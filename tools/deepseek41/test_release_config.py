@@ -194,6 +194,37 @@ class ReleaseConfigTests(unittest.TestCase):
             maps.append(set(ids))
         self.assertTrue(maps[1].issubset(maps[0]))
 
+    def test_gsq_six_shard_proof_and_engram_destination(self):
+        from tools.deepseek41.download_assets import assets_for_config
+        self.cfg = {key: "asset" for key in ("engine", "draft", "tokenizer")}
+        self.cfg.update(variant="GSQ-RCO-IQ2_XS", vision=False)
+        files = []
+        for i in range(1, 7):
+            path = self.root / f"DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-{i:05d}-of-00006.gguf"
+            path.write_bytes(b"six-shard fixture " + bytes([i]))
+            files.append(path)
+        self.cfg["model"] = files[0].name
+        cfg = self.load()
+        assets = assets_for_config(cfg)
+        main = [a for a in assets if a["role"] == "main"]
+        self.assertEqual(len(main), 6)
+        self.assertEqual(main[-1]["path"], hash_proof.GSQ_ENGRAM_FILE)
+        self.assertEqual(main[-1]["destination"], str(files[-1]))
+        self.assertFalse(any(a["role"] == "vision_bias" for a in assets))
+        digests = [hashlib.sha256(p.read_bytes()).hexdigest() for p in files]
+        with patch.object(hash_proof, "GSQ_PLE_SHA256", digests), \
+                patch.object(hash_proof, "SIDECARS_1017", {"draft": hashlib.sha256(b"fixture").hexdigest()}), \
+                patch.object(startup_assets, "TOKENIZER_SHA256", hashlib.sha256(b"fixture").hexdigest()):
+            prepare(cfg)
+            approved = hash_proof.approved_files({"main": files[0], "draft": self.root / "asset"}, main_gsq_rco=True)
+            self.assertTrue(proof_matches(Path(cfg["integrity"]), approved))
+            files[5].write_bytes(b"changed Engram")
+            with self.assertRaisesRegex(ValueError, "SHA-256 failed"):
+                prepare(cfg)
+        self.cfg["variant"] = startup_assets.GSQ_UNCENSORED_VARIANT
+        with self.assertRaisesRegex(ValueError, "first of the four"):
+            self.load()
+
 
 if __name__ == "__main__":
     unittest.main()
