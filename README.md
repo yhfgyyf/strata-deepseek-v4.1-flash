@@ -13,13 +13,20 @@
 
 在家用电脑运行 DeepSeek-V4.1-Flash：**Intel Core i7-14700KF、单张 RTX PRO 6000 Blackwell 96GB、192GB DDR5-4800**。
 
-基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。适配模型共用一个启动脚本，直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
+基于 [Strata](https://github.com/Niko1221/Strata) 与 [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4)，提供原生 DeepSeek 推理、SSD Engram、GPU/内存专家缓存及 **DSpark 推测解码**。适配模型直接读取下载的原始 GGUF，**无需离线转换权重、合并分片或额外量化**。
 
 支持 **1M 上下文容量（1,048,576 tokens）**、**文本＋图片多模态输入**、工具调用，以及 OpenAI Chat Completions / Responses 和 Anthropic Messages。启动配置为单请求槽位、chunk 8192、默认最大输出 32768 tokens。长上下文场景可调整为 **chunk 32K（32768 tokens）**、**最大输出 128K（131072 tokens）**。
 
 **推荐显卡：单张 RTX PRO 6000 Blackwell 96GB，或双张 RTX 5090。**
 
-同一代码树保留 **RTX PRO 6000 的 C37 累计基线＋GSQ 适配**，并包含 **双 L20 48GB 的 CED/PP mask479 基线**。双 L20 使用 SM89、P2P、文本模式及每卡 40 段普通页锁页内存；独立入口、六分片 GSQ PLE 配置和构建命令见[双 L20 启动说明](docs/INSTALL.md#dual-l20-mask479)。下方 PRO 6000 吞吐表仍对应原测试条件。
+同一代码树保留两条累计基线：
+
+| 显卡 | 基线 | 启动入口 |
+|---|---|---|
+| 单张 RTX PRO 6000 Blackwell 96GB | **C37＋GSQ 适配**，支持文本与图片 | [`start.sh`](start.sh) |
+| 双张 L20，每卡 48GB | **CED/PP mask479＋DSpark5**，文本模式 | [`start-l20-mask479.sh`](start-l20-mask479.sh) |
+
+双 L20 使用 SM89、P2P 及每卡 40 段普通页锁页内存，配套六分片 GSQ PLE 配置；详见[双 L20 启动说明](docs/INSTALL.md#dual-l20-mask479)。下方 PRO 6000 吞吐表仍对应原测试条件。
 
 ## 适配模型
 
@@ -39,7 +46,7 @@
 | **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
 | **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
 
-容量按主模型 GGUF 和 Engram 文件的十进制 GB 统计，不含 DSpark 与 mmproj。GSQ-RCO 使用四个主分片和一个外置 Engram 文件，五个文件需放在同一目录。
+容量按主模型 GGUF 和 Engram 文件的十进制 GB 统计，不含 DSpark 与 mmproj。上表单卡 GSQ-RCO 配置使用四个主分片和一个外置 Engram 文件，五个文件需放在同一目录。
 
 - **DSpark**：[Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
 - **mmproj**：[Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/mmproj-BF16.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
@@ -75,7 +82,7 @@ GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和�
 
 已使用更广泛的代码、agent 和通用推理 prompt 采集专家路由统计，来源包括 DeepSWE、SWE-bench Pro 与 Verified、R2E-Gym、LongSWE、LiveCodeBench、BigCodeBench、ProgramBench、Terminal-Bench、BFCL 和 HLE，据此调整初始 profile 的专家排序与热度，并保留运行期间的在线自适应。
 
-当前运行时的专家内存使用 **block-pinned memory（分块锁页内存）＋大页存储**：40 段 CUDA 注册、100% 的 2 MiB 大页覆盖。在 PCIe 5.0 ×16 上，独立 CPU→GPU（H2D）传输对照从单次注册／4 KiB 页的 **23.952 GB/s 提升到 45.104 GB/s（+88.31%）**，详见[性能记录](docs/PERFORMANCE_HISTORY.zh-CN.md)。
+上述 PRO 6000 配置的专家内存使用 **block-pinned memory（分块锁页内存）＋大页存储**：40 段 CUDA 注册、100% 的 2 MiB 大页覆盖。在 PCIe 5.0 ×16 上，独立 CPU→GPU（H2D）传输对照从单次注册／4 KiB 页的 **23.952 GB/s 提升到 45.104 GB/s（+88.31%）**，详见[性能记录](docs/PERFORMANCE_HISTORY.zh-CN.md)。
 
 **要达到上述传输速度，必须使用 PCIe 5.0 显卡，且 CPU／主板链路实际运行在 PCIe 5.0 ×16。** 如果 PCIe 4.0 或更低版本的链路已经饱和，分块锁页与大页带来的额外传输提升几乎为零。
 
@@ -85,7 +92,7 @@ GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和�
 
 ## 构建与启动
 
-测试目标为 Linux x86-64、Python 3.10+、C++20、CMake 3.24+、CUDA 13.2 / SM120；indexer 与 CAKE 对象使用 SM120a。需事先准备 CUDA 和大页运行环境，脚本不会修改系统设置。
+以下单卡入口的测试目标为 Linux x86-64、Python 3.10+、C++20、CMake 3.24+、CUDA 13.2 / SM120；indexer 与 CAKE 对象使用 SM120a。需事先准备 CUDA 和大页运行环境，脚本不会修改系统设置。
 
 ```bash
 git clone https://github.com/yhfgyyf/strata-deepseek-v4.1-flash.git
@@ -107,6 +114,14 @@ cd strata-deepseek-v4.1-flash
 Uncensored 使用独立配置。运行 `./start.sh configure --config config.uncensored.json --model GSQ-RCO-IQ2_XS-Uncensored --data-dir /path/to/models --source huggingface`，后续命令均带 `--config config.uncensored.json`。
 
 默认从 ModelScope 下载；可明确指定 `--source huggingface` 或 `--source hf-mirror`，都必须通过同一组摘要校验。管理页仅监听本机，下载中断保留断点，启停仅针对本工具创建的服务。API 与原有 Web 聊天默认使用 **30011** 端口。原 `serve_experimental.py --config FILE` 入口继续可用。
+
+**双 L20 启动：**先按[安装说明](docs/INSTALL.md#dual-l20-mask479)编译专用 SM89 引擎，将[示例配置](examples/l20-dual.gsq-rco-iq2-xs.json)复制为 `examples/local-l20.json` 并填写模型路径，然后运行：
+
+```bash
+STRATA_PYTHON=.venv/bin/python ./start-l20-mask479.sh --config examples/local-l20.json
+```
+
+双 L20 API 默认监听 `127.0.0.1:10002`，前台运行，按 `Ctrl+C` 停止。
 
 支持 **OpenAI Chat Completions / Responses** 和 **Anthropic Messages** 兼容接口。
 

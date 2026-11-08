@@ -13,13 +13,20 @@ The goal is practical use in agent harnesses such as [DeepSeek Harness](https://
 
 DeepSeek-V4.1-Flash on a home PC: **Intel Core i7-14700KF, one RTX PRO 6000 Blackwell 96GB, and 192GB DDR5-4800**.
 
-Built on [Strata](https://github.com/Niko1221/Strata) and [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4), with a native DeepSeek runtime, SSD-backed Engram, GPU/RAM expert residency, and **DSpark speculative decoding**. The supported models use the same launch script and their original GGUF files: **no offline weight conversion, shard merging, or extra quantization is required**.
+Built on [Strata](https://github.com/Niko1221/Strata) and [strata-nvfp4](https://github.com/yhfgyyf/strata-nvfp4), with a native DeepSeek runtime, SSD-backed Engram, GPU/RAM expert residency, and **DSpark speculative decoding**. The supported models use their original GGUF files: **no offline weight conversion, shard merging, or extra quantization is required**.
 
 The service supports **1M context capacity (1,048,576 tokens)**, **multimodal text + image input**, tool calls, OpenAI Chat Completions / Responses, and Anthropic Messages. The starter uses one request slot, chunk 8192, and a default maximum output of 32768 tokens. For long contexts, the setup can be adjusted to **chunk 32K (32768 tokens)** and **a maximum output of 128K (131072 tokens)**.
 
 **Recommended GPUs: one RTX PRO 6000 Blackwell 96GB, or two RTX 5090 cards.**
 
-The same source tree retains the **RTX PRO 6000 C37 cumulative baseline plus GSQ support** and includes the **dual L20 48GB CED/PP mask479 baseline**. The L20 profile uses SM89, P2P, text input and 40 ordinary-page pinned blocks per GPU. See the [dual L20 setup](docs/INSTALL.md#dual-l20-mask479) for its separate entry, six-shard GSQ PLE config and build commands. The PRO 6000 throughput tables below keep their original test conditions.
+The same source tree retains two cumulative baselines:
+
+| GPUs | Baseline | Launcher |
+|---|---|---|
+| One RTX PRO 6000 Blackwell 96GB | **C37 plus GSQ support**, text and images | [`start.sh`](start.sh) |
+| Two L20 cards, 48GB each | **CED/PP mask479 plus DSpark5**, text only | [`start-l20-mask479.sh`](start-l20-mask479.sh) |
+
+The L20 profile uses SM89, P2P, 40 ordinary-page pinned blocks per GPU and the six-shard GSQ PLE configuration. See the [dual L20 setup](docs/INSTALL.md#dual-l20-mask479). The PRO 6000 throughput tables below keep their original test conditions.
 
 ## Supported models
 
@@ -39,7 +46,7 @@ The same source tree retains the **RTX PRO 6000 C37 cumulative baseline plus GSQ
 | **UD-IQ3_XXS** | **394.737** | 233.452 | 161.285 |
 | **UD-Q2_K_XL** | **334.794** | 199.622 | 135.172 |
 
-Sizes are decimal GB of the main GGUF files and Engram file, excluding DSpark and mmproj. GSQ-RCO uses four main shards plus the external Engram file; keep all five together.
+Sizes are decimal GB of the main GGUF files and Engram file, excluding DSpark and mmproj. The single-card GSQ-RCO configurations above use four main shards plus the external Engram file; keep all five together.
 
 - **DSpark**: [Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
 - **mmproj**: [Hugging Face](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/blob/main/mmproj-BF16.gguf) · [ModelScope](https://modelscope.cn/models/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/files)
@@ -75,7 +82,7 @@ Rates are means ± sample standard deviations. Prefill uses native prompt time; 
 
 The calibrated startup profile was refined using expert-routing statistics from a broader mix of coding, agent and general-reasoning prompts: DeepSWE, SWE-bench Pro and Verified, R2E-Gym, LongSWE, LiveCodeBench, BigCodeBench, ProgramBench, Terminal-Bench, BFCL and HLE. These observations inform the initial expert ranking and heat, followed by online adaptive residency.
 
-The current runtime uses **block-pinned memory with huge pages** for expert RAM: 40 CUDA-registered blocks with 100% 2 MiB huge-page coverage. On PCIe 5.0 ×16, the isolated CPU→GPU (H2D) transfer comparison improved from **23.952 to 45.104 GB/s (+88.31%)** versus a single registration with 4 KiB pages. See the [performance history](docs/PERFORMANCE_HISTORY.md).
+The PRO 6000 configuration above uses **block-pinned memory with huge pages** for expert RAM: 40 CUDA-registered blocks with 100% 2 MiB huge-page coverage. On PCIe 5.0 ×16, the isolated CPU→GPU (H2D) transfer comparison improved from **23.952 to 45.104 GB/s (+88.31%)** versus a single registration with 4 KiB pages. See the [performance history](docs/PERFORMANCE_HISTORY.md).
 
 **Reaching this transfer rate requires a PCIe 5.0 GPU and a CPU/motherboard link operating at PCIe 5.0 ×16.** If a PCIe 4.0 or older link is already saturated, block pinning and huge pages provide little or no additional transfer throughput.
 
@@ -85,7 +92,7 @@ On a server with **AVX-512, ample RAM and high memory bandwidth**, it is also wo
 
 ## Build and launch
 
-The tested target is Linux x86-64, Python 3.10+, a C++20 compiler, CMake 3.24+, and CUDA 13.2 / SM120. The indexer and CAKE objects use SM120a. Existing CUDA/huge-page prerequisites remain necessary; the launcher does not change system settings.
+The single-card launcher below targets Linux x86-64, Python 3.10+, a C++20 compiler, CMake 3.24+, and CUDA 13.2 / SM120. The indexer and CAKE objects use SM120a. Existing CUDA/huge-page prerequisites remain necessary; the launcher does not change system settings.
 
 ```bash
 git clone https://github.com/yhfgyyf/strata-deepseek-v4.1-flash.git
@@ -107,6 +114,14 @@ For a terminal or AI agent:
 For Uncensored, run `./start.sh configure --config config.uncensored.json --model GSQ-RCO-IQ2_XS-Uncensored --data-dir /path/to/models --source huggingface` and pass `--config config.uncensored.json` to subsequent commands.
 
 Downloads default to ModelScope; `--source huggingface` and `--source hf-mirror` are explicit alternatives with the same required hashes. The manager stays on localhost, preserves interrupted downloads and controls only its own service. The API and existing web chat use port **30011** by default. The original `serve_experimental.py --config FILE` entry remains supported.
+
+**Dual L20 launch:** follow the [installation instructions](docs/INSTALL.md#dual-l20-mask479) to build the dedicated SM89 engine, copy the [example config](examples/l20-dual.gsq-rco-iq2-xs.json) to `examples/local-l20.json`, and fill in your model paths. Then run:
+
+```bash
+STRATA_PYTHON=.venv/bin/python ./start-l20-mask479.sh --config examples/local-l20.json
+```
+
+The dual L20 API listens on `127.0.0.1:10002` by default. It runs in the foreground; press `Ctrl+C` to stop.
 
 Supports **OpenAI Chat Completions / Responses** and **Anthropic Messages** compatible APIs.
 
