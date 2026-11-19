@@ -9,6 +9,10 @@
 
 [简体中文](README.md)
 
+## Changelog
+
+- **2026-11-19**: Faster single RTX PRO 6000 decode. Routed MoE and the attention q_b projection use tensor cores by default (MATH500 accuracy matches the bit-exact path at 91.2%); grouped routed MoE, de-duplicated and fused draft MoE, and fused RoPE / hyper-connection boundaries; expert migrations rotate without host copies and copy from GPU-resident blobs when available, decode uses the idle prefill workspace as extra expert cache, and background copy threads no longer share the request CPU. Decode peak about 207 tokens/s. The dual L20 profile is unchanged.
+
 The goal is practical use in agent harnesses such as [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): make inference as fast as possible while maintaining a useful level of model reasoning quality.
 
 DeepSeek-V4.1-Flash on a home PC: **Intel Core i7-14700KF, one RTX PRO 6000 Blackwell 96GB, and 192GB DDR5-4800**.
@@ -66,9 +70,9 @@ Sizes are decimal GB of the main GGUF files and Engram file, excluding DSpark an
 
 **Maximum measured prefill: 6,261.998 tokens/s**, at 32,768 input tokens, chunk 32768, with GSQ-RCO-IQ2_XS and original DSpark. This is one formal, profiler-free run; the corresponding three-run mean is **6,245.142 tokens/s**.
 
-**Maximum measured decode: 114.472 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark, 524,288 input tokens, chunk 32768 and exactly 512 output tokens. This profiler-free run includes generation and final adaptive drain/synchronization; the three-run mean is **112.323 tokens/s**. The peaks are selected independently from the formal runs.
+**Maximum measured decode: about 207 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark and the default starter configuration (chunk 8192), measured in real harness use. LongSWE, 16,180 input and exactly 512 output tokens: the first request in a process decodes at 127.2 tokens/s, later requests at 162.2–163.1 tokens/s, with prefill at 4,481–5,077 tokens/s.
 
-The GSQ-RCO-IQ2_XS measurements keep the same machine, original DSpark, 1M context capacity and cumulative runtime. Each input length uses a fresh process, one warmup and three formal runs, a new session per request and no prefix reuse. Greedy decoding ignores EOS to produce exactly 512 output tokens. Maya expert heat carries across the four requests within each process.
+The table below was measured with the previous code version. The GSQ-RCO-IQ2_XS measurements keep the same machine, original DSpark, 1M context capacity and cumulative runtime. Each input length uses a fresh process, one warmup and three formal runs, a new session per request and no prefix reuse. Greedy decoding ignores EOS to produce exactly 512 output tokens. Maya expert heat carries across the four requests within each process.
 
 | Input tokens | Output tokens | Chunk | Startup resident experts | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|---:|
@@ -135,9 +139,9 @@ Supports **OpenAI Chat Completions / Responses** and **Anthropic Messages** comp
 | Original GSQ-RCO GGUF support | Four main shards, external IQ4_NL Engram, mixed IQ2/IQ3 experts, Q5_K projections and automatic GPU expert budgeting. |
 | Original Unsloth GGUF support | Seven-shard loading, mixed IQ3/Q2_K/Q6_K expert formats, shared main/draft vocabulary tensors and original BF16 vision files. |
 | DSpark | Five-token proposals, confidence-adaptive greedy verification, incremental KV, accepted-prefix commit and selected vocabulary rows. |
-| SM120 operators | Mixed-format expert dequantization, bounded grouped GEMM, short-row IQ/MMVQ verification, grouped projections, boundary fusions, indexer and CAKE attention paths. |
+| SM120 operators | Tensor-core routed MoE and q_b projection, mixed-format expert dequantization, bounded grouped GEMM, short-row IQ/MMVQ verification, grouped projections, boundary fusions, indexer and CAKE attention paths. |
 | CUDA Graphs | Accepted decode output/router segments, shared-expert early submission and compact route handoff, with dynamic routing and migration boundaries retained. |
-| Residency and Engram | Online Maya adaptation within format groups, expert lookahead, SSD row cache, asynchronous I/O and 40-segment block-pinned memory with 100% huge-page admission. |
+| Residency and Engram | Online Maya adaptation within format groups, copy-free migration rotation, decode-time expert cache extension, expert lookahead, SSD row cache, asynchronous I/O and 40-segment block-pinned memory with 100% huge-page admission. |
 | APIs and images | DeepSeek message/tokenizer integration, thinking/tool encoding, automatic text-prefix checkpoints, cancellation recovery, image preprocessing and native vision encoder. |
 | Setup and management | Shared CLI/browser configuration, resumable verified downloads, local build, identified service processes, health checks, start/stop and logs. |
 

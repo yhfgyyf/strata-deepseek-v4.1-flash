@@ -1,5 +1,6 @@
 #include "expert_pipeline.hpp"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <chrono>
 #include <cstdlib>
@@ -10,21 +11,34 @@ namespace strata::models::deepseek41 {
 namespace {
 int64_t ring_now(){return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 }
+std::atomic<bool> decode_lru_enabled{true};
+void decode_lru_set_enabled(bool value){decode_lru_enabled.store(value);}
 DecodeRawCache::DecodeRawCache(void* data,uint64_t stride,int slots,cudaStream_t stream)
-    :data_(static_cast<uint8_t*>(data)),stride_(stride),stream_(stream),keys_(std::max(0,slots),-1),ages_(std::max(0,slots)) {
+    :stride_(stride),stream_(stream),base_(std::max(0,slots)) {
     if(!data || !stride || slots<1)throw std::invalid_argument("decode raw cache capacity");
+    for(int i=0;i<slots;++i)slots_.push_back(static_cast<uint8_t*>(data)+uint64_t(i)*stride);
+    keys_.assign(slots_.size(),-1);ages_.assign(slots_.size(),0);
 }
+void DecodeRawCache::add_slots(const std::vector<uint8_t*>& extra){
+    for(auto* p:extra){if(!p)throw std::invalid_argument("decode raw cache extra slot");slots_.push_back(p);}
+    keys_.assign(slots_.size(),-1);ages_.assign(slots_.size(),0);clock_=0;
+}
+size_t DecodeRawCache::active()const{return decode_lru_enabled.load()?slots_.size():base_;}
 const uint8_t* DecodeRawCache::find(int key){
-    const auto at=std::find(keys_.begin(),keys_.end(),key);
-    if(key<0 || at==keys_.end())return nullptr;
-    const size_t slot=at-keys_.begin();ages_[slot]=++clock_;return data_+slot*stride_;
+    const auto end=keys_.begin()+active();const auto at=std::find(keys_.begin(),end,key);
+    if(key<0 || at==end)return nullptr;
+    const size_t slot=at-keys_.begin();ages_[slot]=++clock_;return slots_[slot];
+}
+const uint8_t* DecodeRawCache::peek(int key)const{
+    const auto end=keys_.begin()+active();const auto at=std::find(keys_.begin(),end,key);
+    return key<0||at==end?nullptr:slots_[at-keys_.begin()];
 }
 const uint8_t* DecodeRawCache::retain(int key,const uint8_t* source,uint64_t bytes){
     if(key<0 || !source || !bytes || bytes>stride_)throw std::invalid_argument("decode raw cache blob");
     if(const auto* present=find(key))return present;
-    const size_t slot=std::min_element(ages_.begin(),ages_.end())-ages_.begin();
-    gpu_check(cudaMemcpyAsync(data_+slot*stride_,source,bytes,cudaMemcpyDeviceToDevice,stream_));
-    keys_[slot]=key;ages_[slot]=++clock_;return data_+slot*stride_;
+    const size_t slot=std::min_element(ages_.begin(),ages_.begin()+active())-ages_.begin();
+    gpu_check(cudaMemcpyAsync(slots_[slot],source,bytes,cudaMemcpyDeviceToDevice,stream_));
+    keys_[slot]=key;ages_[slot]=++clock_;return slots_[slot];
 }
 void DecodeRawCache::clear(cudaStream_t overwrite){
     // Before a prefill issuer may overwrite the whole ring, fence every main

@@ -13,9 +13,18 @@ namespace strata::models::deepseek41 {
 void hc_overlap_set_enabled(bool enabled);
 void engram_short_set_enabled(bool enabled);
 void output_a_batch_set_enabled(bool enabled);
+// Drained controls: pinned logits staging; shared expert submitted before the route wait for every format.
+void pinned_logits_set_enabled(bool enabled);
+void shared_early_all_set_enabled(bool enabled);
 void route_group_set_enabled(bool enabled);
 void target_greedy_set_enabled(bool enabled);
 void state_copy_set_enabled(bool enabled);
+// Drained controls: helper threads off the request CPU, zero-copy rotation for any number of format
+// groups, migrations copied from the decode raw cache, decode-time expert LRU in idle workspace tails.
+void helper_affinity_set_enabled(bool enabled);
+void adaptive_rotation_all_set_enabled(bool enabled);
+void adaptive_promote_set_enabled(bool enabled);
+void decode_lru_set_enabled(bool enabled);
 enum class Arithmetic { f32, production };
 enum class ExpertMode { hybrid, gpu, cpu };
 struct RuntimeOptions {

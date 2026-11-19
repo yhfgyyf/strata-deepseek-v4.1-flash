@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 #include <cmath>
+#include <type_traits>
 #include <atomic>
 
 namespace strata::models::deepseek41 {
@@ -288,8 +289,76 @@ __global__ void q5_projection_warp(const uint8_t* __restrict__ weights,const flo
         for(int t=0;t<NT;++t)out[int64_t(t)*ldy+row]=round_output?__bfloat162float(__float2bfloat16_rn(sum[t])):sum[t];
     }
 }
+// Eight physical lanes per row, four consecutive virtual lanes (elements) per physical lane:
+// virtual lane l still owns elements b*256+g*32+l in (b,g) order with one accumulator, and the
+// 32-lane shfl_down tree is replayed (deltas 16/8/4 across lanes, 2/1 in registers).
+template<int NT>
+__global__ void __launch_bounds__(128) q5_v2_kernel(const uint8_t* __restrict__ weights,const float* __restrict__ x,
+                                  float* __restrict__ out,int rows,int cols,int64_t ldx,int64_t ldy,
+                                  bool round_weights,bool round_output) {
+    const int lane=threadIdx.x&31,sub=lane&7;
+    const int row=(blockIdx.x*4+threadIdx.x/32)*4+(lane>>3);
+    const bool valid=row<rows;
+    const int blocks=cols/256;float sum[NT][4]{};
+    const uint8_t* p=weights+int64_t(valid?row:0)*blocks*176;
+    const float* xl=x+4*sub;
+#pragma unroll 2
+    for(int b=0;b<blocks;++b,p+=176){
+        const uint4 h=__ldg(reinterpret_cast<const uint4*>(p));
+        const uint32_t qh=__ldg(reinterpret_cast<const uint32_t*>(p+16)+sub);
+        uint32_t qs[4];
+#pragma unroll
+        for(int k=0;k<4;++k)qs[k]=__ldg(reinterpret_cast<const uint32_t*>(p+48+k*32)+sub);
+        const float d=__half2float(__ushort_as_half(uint16_t(h.x))),dm=__half2float(__ushort_as_half(uint16_t(h.x>>16)));
+        uint8_t sc[12];
+        const uint32_t sw[3]={h.y,h.z,h.w};
+#pragma unroll
+        for(int i=0;i<12;++i)sc[i]=uint8_t(sw[i/4]>>(8*(i%4)));
+#pragma unroll
+        for(int g=0;g<8;++g){
+            const int scale=g<4?sc[g]&63:(sc[g+4]&15)|((sc[g-4]>>6)<<4);
+            const int minimum=g<4?sc[g+4]&63:(sc[g+4]>>4)|((sc[g]>>6)<<4);
+            float w[4];
+#pragma unroll
+            for(int e=0;e<4;++e){
+                const int code=((int(qs[g/2]>>(8*e))>>((g&1)*4))&15)|((int(qh>>(8*e))>>g&1)<<4);
+                w[e]=(d*scale)*code-dm*minimum;
+                if(round_weights)w[e]=__bfloat162float(__float2bfloat16_rn(w[e]));
+            }
+#pragma unroll
+            for(int t=0;t<NT;++t){
+                const float4 v=__ldg(reinterpret_cast<const float4*>(xl+int64_t(t)*ldx+b*256+g*32));
+                sum[t][0]+=w[0]*v.x;sum[t][1]+=w[1]*v.y;sum[t][2]+=w[2]*v.z;sum[t][3]+=w[3]*v.w;
+            }
+        }
+    }
+    // Virtual deltas 16, 8, 4 are physical deltas 4, 2, 1 inside each 8-lane row group.
+#pragma unroll
+    for(int delta=4;delta;delta>>=1){
+#pragma unroll
+        for(int t=0;t<NT;++t){
+#pragma unroll
+            for(int e=0;e<4;++e)sum[t][e]+=__shfl_down_sync(0xffffffff,sum[t][e],delta,8);
+        }
+    }
+    if(sub==0&&valid){
+#pragma unroll
+        for(int t=0;t<NT;++t){
+            const float s=(sum[t][0]+sum[t][2])+(sum[t][1]+sum[t][3]);
+            out[int64_t(t)*ldy+row]=round_output?__bfloat162float(__float2bfloat16_rn(s)):s;
+        }
+    }
+}
+std::atomic<bool> q5_rows8_enabled{true};
 cudaError_t q5_projection(const void* weights,const float* x,float* out,int rows,int cols,int tokens,
                          int64_t ldx,int64_t ldy,bool round_weights,bool round_output,cudaStream_t stream) {
+    if(q5_rows8_enabled.load()&&tokens>=1&&tokens<=8&&cols%256==0&&ldx%4==0&&
+       ((reinterpret_cast<uintptr_t>(weights)|reinterpret_cast<uintptr_t>(x))&15)==0){
+#define Q5_ROWS8(N) case N:q5_v2_kernel<N><<<(rows+15)/16,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);break
+        switch(tokens){Q5_ROWS8(1);Q5_ROWS8(2);Q5_ROWS8(3);Q5_ROWS8(4);Q5_ROWS8(5);Q5_ROWS8(6);Q5_ROWS8(7);Q5_ROWS8(8);}
+#undef Q5_ROWS8
+        return cudaGetLastError();
+    }
 #define Q5_PROJECTION(N) case N:q5_projection_warp<N><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);break
     switch(tokens){Q5_PROJECTION(1);Q5_PROJECTION(2);Q5_PROJECTION(3);Q5_PROJECTION(4);Q5_PROJECTION(5);Q5_PROJECTION(6);Q5_PROJECTION(7);Q5_PROJECTION(8);default:return cudaErrorInvalidValue;}
 #undef Q5_PROJECTION
@@ -297,7 +366,9 @@ cudaError_t q5_projection(const void* weights,const float* x,float* out,int rows
 }
 __device__ float bf16(float value){return __bfloat162float(__float2bfloat16_rn(value));}
 __global__ void draft_projection5_kernel(const uint8_t* weights,int type,const float* x,float* out,
-                                         int cols,int64_t ldx,int64_t ldy,bool round_weights,bool round_output){
+                                         int cols,int64_t ldx,int64_t ldy,bool round_weights,bool round_output,
+                                         int64_t group_weight_bytes=0,int64_t group_x=0,int64_t group_out=0){
+    weights+=blockIdx.y*group_weight_bytes;x+=blockIdx.y*group_x;out+=blockIdx.y*group_out;
     const int row=blockIdx.x;float values[5]{};
     for(int col=threadIdx.x;col<cols;col+=256){
         float weight=weight_value(weights,type,int64_t(row)*cols+col);
@@ -426,6 +497,46 @@ __global__ void verify_projection_kernel(const uint8_t* p,int type,const float* 
         #pragma unroll
         for(int t=0;t<N;++t)out[int64_t(t)*ldy+row]=values[t];
     }
+}
+// FP32/BF16 rows with every weight of a thread loaded before the dot products: removes the
+// per-iteration load latency chain. Same thread/column assignment, order and tree as above.
+template<int N,int MAXI,bool BF>
+__global__ void __launch_bounds__(256) verify_projection_prefetch(const uint8_t* __restrict__ p,const float* __restrict__ x,
+                                                                 float* __restrict__ out,int cols,int64_t ldx,int64_t ldy){
+    const int row=blockIdx.x;
+    using W=typename std::conditional<BF,__nv_bfloat16,float>::type;
+    const W* w=reinterpret_cast<const W*>(p)+int64_t(row)*cols;
+    W weights[MAXI];
+    #pragma unroll
+    for(int i=0;i<MAXI;++i){const int col=threadIdx.x+256*i;if(col<cols)weights[i]=__ldg(w+col);}
+    float values[N]{};
+    #pragma unroll
+    for(int i=0;i<MAXI;++i){
+        const int col=threadIdx.x+256*i;
+        if(col<cols){
+            float weight;
+            if constexpr(BF)weight=__bfloat162float(weights[i]);else weight=weights[i];
+            #pragma unroll
+            for(int t=0;t<N;++t)values[t]+=weight*x[int64_t(t)*ldx+col];
+        }
+    }
+    sum_columns(values);
+    if(threadIdx.x==0){
+        #pragma unroll
+        for(int t=0;t<N;++t)out[int64_t(t)*ldy+row]=values[t];
+    }
+}
+std::atomic<bool> projection_prefetch_enabled{true};
+template<int N>
+bool launch_projection_prefetch(const void* p,uint32_t type,const float* x,float* out,int rows,int cols,int64_t ldx,int64_t ldy,cudaStream_t stream){
+    if(!projection_prefetch_enabled.load()||(type!=0&&type!=30)||cols>8192)return false;
+    const auto* w=static_cast<const uint8_t*>(p);
+    #define VPP(M) do{if(type==30)verify_projection_prefetch<N,M,true><<<rows,256,0,stream>>>(w,x,out,cols,ldx,ldy);\
+        else verify_projection_prefetch<N,M,false><<<rows,256,0,stream>>>(w,x,out,cols,ldx,ldy);}while(0)
+    const int iters=(cols+255)/256;
+    if(iters<=4)VPP(4);else if(iters<=8)VPP(8);else if(iters<=16)VPP(16);else if(iters<=20)VPP(20);else if(iters<=24)VPP(24);else VPP(32);
+    #undef VPP
+    return true;
 }
 // Q3_K blocks alternate between four-byte and two-byte alignment.
 __device__ uint32_t load_quant_four(const uint8_t* p){
@@ -692,6 +803,111 @@ __global__ void hc_project_reuse_kernel(const float* x,const float* fn,float* mi
     }
 }
 
+// Same reduction as hc_sum_virtual256, synchronizing only the two compute warps.
+__device__ float hc_sum_virtual256_64(float (&v)[4]) {
+    __shared__ float partial[8];
+    #pragma unroll
+    for(int delta=4;delta;delta>>=1) {
+        #pragma unroll
+        for(int j=0;j<4;++j)v[j]+=__shfl_down_sync(0xffffffff,v[j],delta,8);
+    }
+    const float even=v[0]+v[2],odd=v[1]+v[3];
+    if((threadIdx.x&7)==0)partial[threadIdx.x>>3]=even+odd;
+    asm volatile("bar.sync 1, 64;");
+    float sum=threadIdx.x<8?partial[threadIdx.x]:0.f;
+    if(threadIdx.x<32)for(int delta=16;delta;delta>>=1)
+        sum+=__shfl_down_sync(0xffffffff,sum,delta);
+    return sum;
+}
+// hc_project, bit-exact with hc_project_vector_kernel: 64 compute threads keep the four
+// virtual lanes per thread and their 80-step chains; all 256 threads stream x and fn rows into
+// shared memory with cp.async (double-buffered 16-step chunks) so many loads are in flight.
+__device__ __forceinline__ void hc_cp16(void* dst, const void* src) {
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(src));
+}
+// hc_split_warp_kernel for one token on lanes 0..15 of a warp (same expressions and shuffles).
+__device__ void hc_split_token(const float* mixes,const float* scale,const float* base,float* pre,float* post,float* comb,
+                               int token,int lane,float eps,int iterations){
+ constexpr unsigned mask=0xffffu;
+ const float* x=mixes+token*24;
+ if(lane<4){pre[token*4+lane]=sigmoid(__ldcg(x+lane)*scale[0]+base[lane])+eps;post[token*4+lane]=2.f*sigmoid(__ldcg(x+4+lane)*scale[1]+base[4+lane]);}
+ float v=__ldcg(x+8+lane)*scale[2]+base[8+lane];const int row=lane/4,col=lane%4;
+ float maximum=-INFINITY;
+ #pragma unroll
+ for(int i=0;i<4;++i)maximum=fmaxf(maximum,__shfl_sync(mask,v,row*4+i,16));
+ v=expf(v-maximum);float sum=0;
+ #pragma unroll
+ for(int i=0;i<4;++i)sum+=__shfl_sync(mask,v,row*4+i,16);
+ v=v/sum+eps;
+ for(int it=0;it<iterations;++it){
+  if(it){sum=eps;
+   #pragma unroll
+   for(int i=0;i<4;++i)sum+=__shfl_sync(mask,v,row*4+i,16);
+   v/=sum;
+  }
+  sum=eps;
+  #pragma unroll
+  for(int i=0;i<4;++i)sum+=__shfl_sync(mask,v,i*4+col,16);
+  v/=sum;
+ }
+ comb[token*16+lane]=v;
+}
+__device__ unsigned hc_split_counters[2][8];
+struct HcSplitArgs{const float* scale;const float* base;float* pre;float* post;float* comb;float eps;int iterations;int slot;};
+template<int CH,bool SPLIT=false>
+__global__ void __launch_bounds__(256) hc_staged_kernel(const float* x,const float* fn,float* mixes,int hidden,float eps,HcSplitArgs split={}) {
+    constexpr int STEP = 256, CHUNK = CH * STEP;      // floats per chunk per operand
+    extern __shared__ __align__(16) float sm[];      // [2][2][CHUNK]
+    const int row=blockIdx.x,token=blockIdx.y,width=hidden*4,tid=threadIdx.x;
+    const float* xs=x+int64_t(token)*width; const float* fs=fn+int64_t(row)*width;
+    const int chunks=width/CHUNK;
+    auto issue=[&](int c,int buf){
+        float* dx=sm+(buf*2)*CHUNK; float* df=dx+CHUNK;
+        for(int i=tid*4;i<CHUNK;i+=1024){hc_cp16(dx+i,xs+c*CHUNK+i);hc_cp16(df+i,fs+c*CHUNK+i);}
+        asm volatile("cp.async.commit_group;");
+    };
+    float square[4]{},dot[4]{};
+    issue(0,0);
+    for(int c=0;c<chunks;++c){
+        if(c+1<chunks)issue(c+1,(c+1)&1); else asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+        if(tid<64){
+            const float* dx=sm+((c&1)*2)*CHUNK; const float* df=dx+CHUNK;
+#pragma unroll
+            for(int k=0;k<CH;++k){
+                const float4 value=*reinterpret_cast<const float4*>(dx+k*STEP+tid*4);
+                const float4 weight=*reinterpret_cast<const float4*>(df+k*STEP+tid*4);
+                const float values[4]={value.x,value.y,value.z,value.w};
+                const float weights[4]={weight.x,weight.y,weight.z,weight.w};
+#pragma unroll
+                for(int j=0;j<4;++j){square[j]+=values[j]*values[j];dot[j]+=values[j]*weights[j];}
+            }
+        }
+        __syncthreads();
+    }
+    if(tid>=64)return;   // the reductions below use only the first two warps
+    const float sum=hc_sum_virtual256_64(square);
+    __shared__ float inverse;
+    if(!tid)inverse=rsqrtf(sum/width+eps);
+    asm volatile("bar.sync 1, 64;");
+    const float product=hc_sum_virtual256_64(dot);
+    if(!tid)mixes[token*24+row]=product*inverse;
+    if constexpr(SPLIT){
+        // The last of the token's 24 row blocks runs the split on the published mixes.
+        __shared__ bool last;
+        if(!tid){__threadfence();last=atomicAdd(&hc_split_counters[split.slot][token],1u)==gridDim.x-1;}
+        asm volatile("bar.sync 1, 64;");
+        if(last&&tid<16){
+            __threadfence();
+            if(!tid)hc_split_counters[split.slot][token]=0;
+            hc_split_token(mixes,split.scale,split.base,split.pre,split.post,split.comb,token,tid,split.eps,split.iterations);
+        }
+    }
+}
+std::atomic<bool> hc_staged_enabled{true};
+std::atomic<bool> hc_split_fused_enabled{true};
 __global__ void hc_project_kernel(const float* x, const float* fn, float* mixes, int hidden, float eps) {
     const int row = blockIdx.x, token = blockIdx.y, width = hidden * 4;
     float sum = 0, dot = 0;
@@ -815,6 +1031,120 @@ cudaError_t dequant_round_bf16_gpu(const void* p, uint32_t type, float* out, int
     const cudaError_t decoded=dequant_gpu(p,type,out,n,s);
     return decoded==cudaSuccess?round_bf16_gpu(out,n,s):decoded;
 }
+// Q8_0 draft projection (5 or 7 tokens): one warp per row, eight virtual lanes per lane.
+// Same per-element value (half(d) * q, optional BF16 round), per-virtual-lane column order and
+// the 256-thread sum_columns tree (replayed as in short_sum_warp).
+template<int Count>
+__device__ __forceinline__ void dp_sum_warp(float (&values)[Count][8], float (&sums)[Count]) {
+    const int lane = threadIdx.x & 31;
+    for (int delta = 2; delta; delta >>= 1) {
+#pragma unroll
+        for (int c = 0; c < Count; ++c) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) values[c][j] += __shfl_down_sync(0xffffffff, values[c][j], delta, 4);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < Count; ++c) {
+        const float partial = ((values[c][0] + values[c][4]) + (values[c][2] + values[c][6])) +
+                              ((values[c][1] + values[c][5]) + (values[c][3] + values[c][7]));
+        const float gathered = __shfl_sync(0xffffffff, partial, (lane & 7) * 4);
+        sums[c] = lane < 8 ? gathered : 0.f;
+    }
+    for (int delta = 16; delta; delta >>= 1) {
+#pragma unroll
+        for (int c = 0; c < Count; ++c) sums[c] += __shfl_down_sync(0xffffffff, sums[c], delta);
+    }
+}
+template<int NT>
+__global__ void __launch_bounds__(128) dp_q8_warp(const uint8_t* __restrict__ weights, const float* __restrict__ x, float* out,
+                                                  int rows, int cols, int64_t ldx, int64_t ldy, bool round_weights, bool round_output) {
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const int bpr = cols / 32;
+    const uint8_t* p = weights + (int64_t(row) * bpr + lane / 4) * 34;
+    const int off = 2 + (lane & 3) * 8;
+    const float* xl = x + lane * 8;
+    float values[NT][8]{};
+    const int iters = cols / 256;
+#pragma unroll 4
+    for (int i = 0; i < iters; ++i, p += 8 * 34) {
+        const float d = __half2float(*reinterpret_cast<const __half*>(p));
+        const uint16_t* q16 = reinterpret_cast<const uint16_t*>(p + off);
+        float w[8];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint16_t u = __ldg(q16 + k);
+            w[2 * k] = d * int(int8_t(u & 255));
+            w[2 * k + 1] = d * int(int8_t(u >> 8));
+        }
+        if (round_weights) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) w[j] = __bfloat162float(__float2bfloat16_rn(w[j]));
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4 a = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256));
+            const float4 b = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256 + 4));
+            const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) values[t][j] += w[j] * v[j];
+        }
+    }
+    float sums[NT];
+    dp_sum_warp(values, sums);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) out[int64_t(t) * ldy + row] = round_output ? __bfloat162float(__float2bfloat16_rn(sums[t])) : sums[t];
+    }
+}
+// BF16 rows: eight virtual lanes per lane via one 16-byte load; same order/tree as above.
+template<int NT>
+__global__ void __launch_bounds__(128) dp_bf16_warp(const uint8_t* __restrict__ weights, const float* __restrict__ x, float* out,
+                                                    int rows, int cols, int64_t ldx, int64_t ldy, bool round_output) {
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const uint4* wrow = reinterpret_cast<const uint4*>(weights + (int64_t(row) * cols + lane * 8) * 2);
+    const float* xl = x + lane * 8;
+    float values[NT][8]{};
+    const int iters = cols / 256;
+#pragma unroll 2
+    for (int i = 0; i < iters; ++i) {
+        const uint4 u = __ldg(wrow + i * 32);
+        const uint32_t ws[4] = {u.x, u.y, u.z, u.w};
+        float w[8];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { w[2 * k] = __uint_as_float(ws[k] << 16); w[2 * k + 1] = __uint_as_float(ws[k] & 0xffff0000u); }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4 a = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256));
+            const float4 b = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256 + 4));
+            const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int j = 0; j < 8; ++j) values[t][j] += w[j] * v[j];
+        }
+    }
+    float sums[NT];
+    dp_sum_warp(values, sums);
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) out[int64_t(t) * ldy + row] = round_output ? __bfloat162float(__float2bfloat16_rn(sums[t])) : sums[t];
+    }
+}
+std::atomic<bool> draft_q8_warp_enabled{true};
+std::atomic<bool> draft_dedup_enabled{true};
+std::atomic<bool> draft_group_enabled{true};
+// Large Q8_0 draft matrices only: small ones keep more CTAs with the block-per-row kernel.
+template<int NT>
+bool draft_q8_warp(const void* weights,uint32_t type,const float* x,float* out,int rows,int cols,int64_t ldx,int64_t ldy,
+                   bool round_weights,bool round_output,cudaStream_t stream){
+    if(!draft_q8_warp_enabled.load()||(type!=8&&type!=30)||rows<4096||cols%256||ldx%4||
+       (reinterpret_cast<uintptr_t>(x)&15)||(reinterpret_cast<uintptr_t>(weights)&(type==30?15:1)))return false;
+    // BF16 values are unchanged by the optional weight rounding.
+    if(type==30){dp_bf16_warp<NT><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_output);return true;}
+    dp_q8_warp<NT><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);
+    return true;
+}
 cudaError_t draft_projection5_gpu(const void* weights,uint32_t type,const float* x,float* out,
                                  int rows,int cols,int64_t ldx,int64_t ldy,bool round_weights,
                                  bool round_output,cudaStream_t stream){
@@ -822,7 +1152,51 @@ cudaError_t draft_projection5_gpu(const void* weights,uint32_t type,const float*
        (type!=0&&type!=2&&type!=8&&type!=13&&type!=14&&type!=30)||((type==13||type==14)?cols%256:(type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
     if(type==13)return q5_projection(weights,x,out,rows,cols,5,ldx,ldy,round_weights,round_output,stream);
     if(type==14)return q6_projection(weights,x,out,rows,cols,5,ldx,ldy,round_weights,round_output,stream);
+    if(draft_q8_warp<5>(weights,type,x,out,rows,cols,ldx,ldy,round_weights,round_output,stream))return cudaGetLastError();
     draft_projection5_kernel<<<rows,256,0,stream>>>(static_cast<const uint8_t*>(weights),type,x,out,cols,ldx,ldy,round_weights,round_output);
+    return cudaGetLastError();
+}
+// draft_projection5_kernel for FP32/BF16 weights (BF16 rounding of BF16 values is the identity) with
+// every weight of a thread loaded first; same order and tree.
+template<bool BF>
+__global__ void __launch_bounds__(256) draft_projection5_prefetch(const uint8_t* weights,const float* x,float* out,int cols,int64_t ldx,int64_t ldy,
+                                                                bool round_output,int64_t group_weight_bytes,int64_t group_x,int64_t group_out){
+    weights+=blockIdx.y*group_weight_bytes;x+=blockIdx.y*group_x;out+=blockIdx.y*group_out;
+    using W=typename std::conditional<BF,__nv_bfloat16,float>::type;
+    const W* w=reinterpret_cast<const W*>(weights)+int64_t(blockIdx.x)*cols;
+    W cache[16];
+    #pragma unroll
+    for(int i=0;i<16;++i){const int col=threadIdx.x+256*i;if(col<cols)cache[i]=__ldg(w+col);}
+    float values[5]{};
+    #pragma unroll
+    for(int i=0;i<16;++i){
+        const int col=threadIdx.x+256*i;
+        if(col<cols){
+            float weight;if constexpr(BF)weight=__bfloat162float(cache[i]);else weight=cache[i];
+            #pragma unroll
+            for(int t=0;t<5;++t)values[t]+=weight*x[int64_t(t)*ldx+col];
+        }
+    }
+    sum_columns(values);
+    if(threadIdx.x==0){
+        #pragma unroll
+        for(int t=0;t<5;++t)out[int64_t(t)*ldy+blockIdx.x]=round_output?bf16(values[t]):values[t];
+    }
+}
+cudaError_t draft_projection5_grouped_gpu(const void* weights,uint32_t type,const float* x,float* out,
+                                         int rows,int cols,int64_t ldx,int64_t ldy,int groups,int64_t group_weight_bytes,
+                                         int64_t group_x,int64_t group_out,bool round_weights,bool round_output,cudaStream_t stream){
+    if(!draft_group_enabled.load()||!weights||!x||!out||rows<1||cols<1||ldx<cols||ldy<rows||groups<1||groups>65535||
+       (type!=0&&type!=30)||rows>=4096)return cudaErrorNotSupported;
+    if(cols<=4096&&projection_prefetch_enabled.load()&&(type==30||!round_weights)){
+        if(type==30)draft_projection5_prefetch<true><<<dim3(rows,groups),256,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,cols,ldx,ldy,
+            round_output,group_weight_bytes,group_x,group_out);
+        else draft_projection5_prefetch<false><<<dim3(rows,groups),256,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,cols,ldx,ldy,
+            round_output,group_weight_bytes,group_x,group_out);
+        return cudaGetLastError();
+    }
+    draft_projection5_kernel<<<dim3(rows,groups),256,0,stream>>>(static_cast<const uint8_t*>(weights),type,x,out,cols,ldx,ldy,
+        round_weights,round_output,group_weight_bytes,group_x,group_out);
     return cudaGetLastError();
 }
 cudaError_t draft_projection7_gpu(const void* weights,uint32_t type,const float* x,float* out,
@@ -832,16 +1206,30 @@ cudaError_t draft_projection7_gpu(const void* weights,uint32_t type,const float*
        (type!=0&&type!=2&&type!=8&&type!=13&&type!=14&&type!=30)||((type==13||type==14)?cols%256:(type==2||type==8)&&cols%32))return cudaErrorInvalidValue;
     if(type==13)return q5_projection(weights,x,out,rows,cols,7,ldx,ldy,round_weights,round_output,stream);
     if(type==14)return q6_projection(weights,x,out,rows,cols,7,ldx,ldy,round_weights,round_output,stream);
+    if(draft_q8_warp<7>(weights,type,x,out,rows,cols,ldx,ldy,round_weights,round_output,stream))return cudaGetLastError();
     draft_projection7_kernel<<<rows,256,0,stream>>>(static_cast<const uint8_t*>(weights),type,x,out,cols,ldx,ldy,round_weights,round_output);
     return cudaGetLastError();
 }
 cudaError_t draft_fused_moe_gpu(const void* experts,uint32_t expert_type,uint64_t projection,const void* shared_gate,
                                const void* shared_up,const void* shared_down,uint32_t shared_type,
                                const float* x,const int* ids,const float* routing,float* scratch,
-                               float* out,int tokens,cudaStream_t stream){
+                               float* out,int tokens,cudaStream_t stream,float* parts){
     const uint64_t expected=expert_type==39?uint64_t(5120)*2304/32*17:uint64_t(5120)*2304/256*84;
     if((expert_type!=10&&expert_type!=39)||!experts||projection!=expected||!shared_gate||!shared_up||!shared_down||
        (shared_type!=2&&shared_type!=8&&shared_type!=30)||!x||!ids||!routing||!scratch||!out||tokens<1||tokens>7)return cudaErrorInvalidValue;
+    if(expert_type==39 && shared_type==30 && parts && draft_dedup_enabled.load()) {
+        const auto* e=static_cast<const uint8_t*>(experts);
+        int* desc=reinterpret_cast<int*>(parts+int64_t(7)*4*5120);
+        draft_dedup::plan<<<1,32,0,stream>>>(ids,routing,tokens,desc);
+        auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        draft_dedup::gu<<<dim3(576,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_gate),
+            static_cast<const uint8_t*>(shared_up),x,ids,desc,scratch,tokens);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        draft_dedup::down<<<dim3(1280,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_down),ids,scratch,desc,parts,tokens);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        draft_dedup::combine<<<(tokens*5120+255)/256,256,0,stream>>>(parts,ids,out,tokens);
+        return cudaGetLastError();
+    }
     if(expert_type==39 && shared_type==30) {
         draft_warp::draft_gu_warp<<<dim3(576,tokens*4),128,0,stream>>>(static_cast<const uint8_t*>(experts),projection,
             static_cast<const uint8_t*>(shared_gate),static_cast<const uint8_t*>(shared_up),x,ids,routing,scratch);
@@ -878,7 +1266,7 @@ cudaError_t packed_verify_gpu(const void* p,uint32_t type,const float* x,float* 
        (type!=0&&type!=30&&type!=8&&type!=13&&type!=14)||((type==13||type==14)?cols%256:type==8&&cols%32))return cudaErrorInvalidValue;
     if(type==13)return q5_projection(p,x,out,rows,cols,tokens,ldx,ldy,false,false,stream);
     if(type==14)return q6_projection(p,x,out,rows,cols,tokens,ldx,ldy,false,false,stream);
-    #define VERIFY_PROJECTION(N) case N: verify_projection_kernel<N><<<rows,256,0,stream>>>(static_cast<const uint8_t*>(p),type,x,out,cols,ldx,ldy);break
+    #define VERIFY_PROJECTION(N) case N: if(!launch_projection_prefetch<N>(p,type,x,out,rows,cols,ldx,ldy,stream))verify_projection_kernel<N><<<rows,256,0,stream>>>(static_cast<const uint8_t*>(p),type,x,out,cols,ldx,ldy);break
     switch(tokens){VERIFY_PROJECTION(2);VERIFY_PROJECTION(3);VERIFY_PROJECTION(4);VERIFY_PROJECTION(5);VERIFY_PROJECTION(6);VERIFY_PROJECTION(7);VERIFY_PROJECTION(8);}
     #undef VERIFY_PROJECTION
     return cudaGetLastError();
@@ -970,6 +1358,7 @@ cudaError_t packed_gemv_gpu(const void* p, uint32_t type, const float* x, float*
         (type == 10 || type == 11 || type == 13 || type == 14 ? cols % 256 : type == 42 ? cols % 64 : type == 2 || type == 8 || type == 20 || type == 39 ? cols % 32 : 0)) return cudaErrorInvalidValue;
     if(type==13&&tokens<=8)return q5_projection(p,x,out,rows,cols,tokens,cols,rows,false,false,s);
     if(type==14&&tokens<=8)return q6_projection(p,x,out,rows,cols,tokens,cols,rows,false,false,s);
+    if(tokens==1&&launch_projection_prefetch<1>(p,type,x,out,rows,cols,cols,rows,s))return cudaGetLastError();
     gemv_kernel<false><<<dim3(rows,tokens),256,0,s>>>(static_cast<const uint8_t*>(p), type, x, out, rows, cols); return cudaGetLastError();
 }
 cudaError_t rms_gpu(const float* x, const float* w, float* out, int width, int tokens, float eps, cudaStream_t s) {
@@ -1028,9 +1417,18 @@ cudaError_t route_handoff_short_gpu(const int* ids,const float* weights,int* row
 }
 void hc_project_vector_set_enabled(bool value){hc_vector_enabled.store(value);}
 void hc_project_reuse_set_enabled(bool value){hc_reuse_enabled.store(value);}
+void q5_rows8_set_enabled(bool value){q5_rows8_enabled.store(value);}
+void hc_staged_set_enabled(bool value){hc_staged_enabled.store(value);}
+void draft_q8_warp_set_enabled(bool value){draft_q8_warp_enabled.store(value);}
+void draft_dedup_set_enabled(bool value){draft_dedup_enabled.store(value);}
+void projection_prefetch_set_enabled(bool value){projection_prefetch_enabled.store(value);}
+void draft_group_set_enabled(bool value){draft_group_enabled.store(value);}
+bool draft_group_enabled_value(){return draft_group_enabled.load();}
 cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hidden, int tokens, float eps, cudaStream_t s) {
     if (hidden < 1 || tokens < 1 || tokens > 65535 || eps <= 0) return cudaErrorInvalidValue;
-    if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
+    if(hc_vector_enabled.load()&&hc_staged_enabled.load()&&hidden==5120&&tokens<=8&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0)
+        hc_staged_kernel<8><<<dim3(24,tokens),256,2*2*8*256*4,s>>>(x,fn,mixes,hidden,eps);
+    else if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
         if(hc_reuse_enabled.load()&&tokens>=128)
             hc_project_reuse_kernel<<<dim3(6,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
         else hc_project_vector_kernel<<<dim3(24,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
@@ -1038,6 +1436,20 @@ cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hi
     else hc_project_kernel<<<dim3(24,tokens),256,0,s>>>(x,fn,mixes,hidden,eps);
     return cudaGetLastError();
 }
+cudaError_t hc_project_split_gpu(const float* x, const float* fn, float* mixes, const float* scale, const float* base,
+                                 float* pre, float* post, float* comb, int hidden, int tokens, float norm_eps, float hc_eps,
+                                 int iterations, int slot, cudaStream_t s) {
+    if(hc_split_fused_enabled.load()&&hc_vector_enabled.load()&&hc_staged_enabled.load()&&hidden==5120&&tokens>=1&&tokens<=8&&
+       norm_eps>0&&hc_eps>0&&iterations>=1&&(slot==0||slot==1)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
+        hc_staged_kernel<8,true><<<dim3(24,tokens),256,2*2*8*256*4,s>>>(x,fn,mixes,hidden,norm_eps,
+            HcSplitArgs{scale,base,pre,post,comb,hc_eps,iterations,slot});
+        return cudaGetLastError();
+    }
+    const auto error=hc_project_gpu(x,fn,mixes,hidden,tokens,norm_eps,s);
+    if(error!=cudaSuccess)return error;
+    return hc_split_gpu(mixes,scale,base,pre,post,comb,tokens,hc_eps,iterations,s);
+}
+void hc_split_fused_set_enabled(bool value){hc_split_fused_enabled.store(value);}
 cudaError_t hc_split_gpu(const float* x, const float* scale, const float* base, float* pre, float* post, float* comb,
                          int tokens, float eps, int iterations, cudaStream_t s) {
     if (tokens < 1 || eps <= 0 || iterations < 1) return cudaErrorInvalidValue;
@@ -1052,6 +1464,51 @@ cudaError_t hc_post_gpu(const float* x, const float* branch, const float* post, 
     if (hidden < 1 || tokens < 1) return cudaErrorInvalidValue;
     hc_post_kernel<<<grid(int64_t(hidden)*tokens),256,0,s>>>(x,branch,post,comb,out,hidden,int64_t(hidden)*tokens); return cudaGetLastError();
 }
+// Fused production glue: [BF16 -> FP32] -> rotate the last 64 dims of each head -> BF16 round
+// -> optional BF16 copy. Rotation math equals rotate_kernel (Shared=false) or
+// rotary_detail::rotate_shared (Shared=true), whichever rotate_gpu selects for the shape.
+template<bool Shared>
+__global__ void rope_round_kernel(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int head_dim, int64_t start,
+                                  RotaryFrequencies f, bool inverse, int64_t pairs) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < pairs; i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t e = 2 * i;
+        const int col = int(e % head_dim);
+        const int64_t token = e / (int64_t(heads) * head_dim);
+        float a, b;
+        if (in_bf) { a = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e]); b = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e + 1]); }
+        else { a = x[e]; b = x[e + 1]; }
+        if (col >= head_dim - 64) {
+            const int pair = (col - (head_dim - 64)) / 2;
+            float sn, cs;
+            if constexpr (Shared) {
+                const float angle = float(start + token) * f.value[pair];
+                sincosf(angle, &sn, &cs); if (inverse) sn = -sn;
+            } else {
+                const float angle = float(start + token) * f.value[pair] * (inverse ? -1.f : 1.f);
+                sincosf(angle, &sn, &cs);
+            }
+            const float p0 = a * cs - b * sn, p1 = a * sn + b * cs;
+            a = p0; b = p1;
+        }
+        const __nv_bfloat16 ra = __float2bfloat16_rn(a), rb = __float2bfloat16_rn(b);
+        x[e] = __bfloat162float(ra); x[e + 1] = __bfloat162float(rb);
+        if (out_bf) { reinterpret_cast<__nv_bfloat16*>(out_bf)[e] = ra; reinterpret_cast<__nv_bfloat16*>(out_bf)[e + 1] = rb; }
+    }
+}
+std::atomic<bool> rope_fused_enabled{true};
+cudaError_t rope_round_gpu(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int head_dim, int tokens, int64_t start,
+                           const Geometry& g, bool compressed, bool inverse, cudaStream_t s) {
+    if (!rope_fused_enabled.load()) return cudaErrorNotSupported;
+    if (heads < 1 || g.rope_dim != 64 || head_dim < g.rope_dim || head_dim % 2 || tokens < 1 || start < 0) return cudaErrorInvalidValue;
+    // rotate_shared's FMA contraction is not reproduced; those shapes keep the separate kernels.
+    if (rotary_detail::shared_shape(heads, head_dim, tokens)) return cudaErrorNotSupported;
+    const auto frequencies = rotary_frequencies(g, compressed);
+    const int64_t pairs = int64_t(tokens) * heads * head_dim / 2;
+    rope_round_kernel<false><<<grid(pairs), 256, 0, s>>>(x, in_bf, out_bf, heads, head_dim, start, frequencies, inverse, pairs);
+    return cudaGetLastError();
+}
+void rope_fused_set_enabled(bool value) { rope_fused_enabled.store(value); }
+bool rope_fused_enabled_value() { return rope_fused_enabled.load(); }
 cudaError_t rotate_gpu(float* x, int heads, int head_dim, int tokens, int64_t start, const Geometry& g,
                        bool compressed, bool inverse, cudaStream_t s) {
     if (heads < 1 || g.rope_dim != 64 || head_dim < g.rope_dim || tokens < 1 || start < 0) return cudaErrorInvalidValue;

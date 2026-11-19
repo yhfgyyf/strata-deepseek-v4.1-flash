@@ -46,6 +46,13 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 
 // Exact DeepSeek output-A:8 groups of4096->1024,2..8 tokens. Scratch is
 // native_q8_1_bytes(32768,tokens); caller rounds output to BF16. False leaves buffers untouched.
+// Drained control: Q5_K weights in the grouped output-A batch (bit-identical to the per-group path).
+void native_output_a_q5_set_enabled(bool enabled);
+// Drained control: two-warp multi-column kernel for every Q8_0/Q5_K shape (exact by construction).
+void native_mmvq_two_warp_all_set_enabled(bool enabled);
+// Opt-in: int8 tensor-core Q5_K also for 2304/5120-wide inputs (not bit-exact vs dp4a).
+void native_q5_mma_long_set_enabled(bool enabled);
+bool output_a_q5_enabled();
 bool native_deepseek_output_a_batch(int type,const void* weights,const float* x,void* scratch,float* out,int tokens,void* stream);
 void native_q5_output_a_set_enabled(bool value);
 
@@ -153,6 +160,10 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+/// Opt-in int8 tensor-core Q5_K x Q8_1 path for 1..8 columns on short-K matrices (<= 2048 inputs; exact
+/// integer sub-block dots, FP32 combine in a fixed order; not bit-identical to the dp4a kernels).
+void native_q5_mma_set_enabled(bool enabled);
+bool native_q5_mma_enabled();
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,

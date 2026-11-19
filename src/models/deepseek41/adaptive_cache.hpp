@@ -4,6 +4,7 @@
 #include <future>
 
 namespace strata::models::deepseek41 {
+class DecodeRawCache;
 // Single-slot decode exchanges. Only the inference thread changes residency/offsets;
 // the worker copies host bytes, and the independent CUDA stream moves expert blobs.
 class AdaptiveCache {
@@ -25,6 +26,8 @@ public:
     uint64_t staging_bytes()const{return staging_->bytes;}
     void write_status(std::ostream& out)const;
     const std::vector<double>& learned_heat()const{return learned_;}
+    // Decode raw cache on the reader stream: incoming experts found there are copied D2D.
+    void set_promote_source(DecodeRawCache* cache){promote_=cache;}
 private:
     friend struct PrefetchBlockBenchmark;
     enum class State { idle,saving,loading,committing };
@@ -41,9 +44,11 @@ private:
     std::array<uint64_t,40> sizes_;
     std::array<int,40> groups_;
     uint64_t budget_,stride_,capacity_,rows_=0,since_pick_=0,batches_=0,published_=0;
-    bool trace_,grouped_,pinned_ram_,rotation_eligible_=false,aligned_=true,maya_=false;
+    bool trace_,grouped_,pinned_ram_,rotation_eligible_=false,rotation_many_=false,aligned_=true,maya_=false;
     uint64_t decay_rows_=0;
     std::vector<uint8_t> recent_;
+    DecodeRawCache* promote_=nullptr;
+    uint64_t promoted_=0,promoted_bytes_=0;
     uint64_t windows_=0,direct_bytes_=0,rotated_=0,avoided_prepare_=0,avoided_commit_=0;
     State state_=State::idle;
     Stream copies_;
@@ -54,7 +59,7 @@ private:
     std::vector<const uint8_t*> overrides_;
     // Non-owning views. Original RAM/staging allocations remain alive until all readers drain.
     std::vector<uint8_t*> sources_;
-    std::array<std::vector<uint8_t*>,2> spares_;
+    std::vector<std::vector<uint8_t*>> spares_;
     std::vector<uint8_t> unavailable_;
     std::vector<Swap> swaps_;
     // Enabled only by the controlled test harness: inverse exchanges restore

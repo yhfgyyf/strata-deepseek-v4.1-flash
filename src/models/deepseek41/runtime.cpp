@@ -211,12 +211,27 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     if(o.decode_raw_cache){
         if(ring_slots<=8)throw std::invalid_argument("decode raw cache requires more than eight ring slots");
         decode_raw_cache=std::make_unique<DecodeRawCache>(static_cast<uint8_t*>(ring->base())+8*ring_slot_bytes,ring_slot_bytes,ring_slots-8,stream.value);
+        experts->set_promote_source(decode_raw_cache.get());
     }
     work=std::make_unique<Workspace>(o.work,std::max(128,options.chunk),o.context,o.compact_logits,o.compact_workspace,o.dspark);
     WorkspaceLayout memory(work->arena.get());work->extras(memory,o);
     if(model.has_vision())vision_work=std::make_unique<VisionWork>(*work->arena);
     if(draft_weights)draft_work=std::make_unique<DraftWork>(*work->arena,draft_weights->vocab.size());
     if(o.pipeline_rank>=0)peer_staging=std::make_unique<Pinned>(16ull<<20,false,false);
+    if(decode_raw_cache && work->max_tokens>=1024){
+        // Decode-time expert LRU in idle prefill workspace tails. Decode (verify <= 8 rows,
+        // tail replay <= 128 rows) never reaches row 256 of these per-layer scratch buffers;
+        // all are written on the main stream only, and session prefill clears the cache first.
+        // q also backs parts (slot stride 6 rows); o_low also backs group_x (5120 per row).
+        const uint64_t t=work->max_tokens,rows=256;std::vector<uint8_t*> extra;
+        auto carve=[&](void* base,uint64_t row_floats){
+            uint64_t offset=(rows*row_floats*4+255)/256*256;
+            for(;offset+ring_slot_bytes<=t*row_floats*4;offset+=ring_slot_bytes)extra.push_back(static_cast<uint8_t*>(base)+offset);
+        };
+        carve(work->q,32768);carve(work->o_low,8192);carve(work->index_q,4096);carve(work->shared_out,5120);carve(work->branch,5120);
+        decode_raw_cache->add_slots(extra);
+        std::cerr<<"DeepSeek decode LRU slots base="<<ring_slots-8<<" workspace_tail="<<extra.size()<<'\n';
+    }
     if(const char* mode=std::getenv("STRATA_DS41_DECODE_SEGMENTS")){
         if(mode[0]<'0'||mode[0]>'3'||mode[1])throw std::invalid_argument("decode segment mask must be 0..3");
         decode_segment_mask=static_cast<unsigned>(mode[0]-'0');

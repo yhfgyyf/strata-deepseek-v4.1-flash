@@ -42,7 +42,7 @@ To reuse calibrated startup assets, provide both `profile` and `heat`. An explic
 
 The launcher sets `STRATA_DS41_BLOCK_SEGMENTS=40`, `STRATA_DS41_BLOCK_HUGE_MIN_PERCENT=100` and `STRATA_DS41_DECODE_SEGMENTS=2`, and defaults `CUDA_DEVICE_DEFAULT_STACK_SIZE_MAX=0`, matching the adopted profile. It does not change system configuration. `--check-config` only checks paths and executable permissions; startup checks generated metadata and full model identity.
 
-It also defaults `STRATA_DS41_ADAPTIVE_POLICY=maya`, `OMP_NUM_THREADS=6` and `OPENBLAS_NUM_THREADS=1`. Set the policy to `legacy` to select the earlier residency policy. The experimental starter requires CPU 8 to be available in the process CPU set.
+It also defaults `STRATA_DS41_ADAPTIVE_POLICY=maya`, `OMP_NUM_THREADS=6` and `OPENBLAS_NUM_THREADS=1`. Set the policy to `legacy` to select the earlier residency policy. It defaults `STRATA_DS41_OPT_MASK=0x7FFFFF`, which enables tensor-core routed MoE (`0x8000`) and q_b projection (`0x40000`); `0x7B7FFF` selects the bit-exact decode path. `start-l20-mask479.sh` sets `0`. The experimental starter requires CPU 8 to be available in the process CPU set.
 
 ## Explicit dual-L20 profile
 

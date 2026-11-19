@@ -13,12 +13,13 @@ void DraftWork::init(WorkspaceLayout& layout,int vocab) {
     auto f=[&](uint64_t n){return layout.alloc<float>(n);};
     main_hidden=f(128*15360);main_x=f(128*5120);h=f(7*20480);pre=f(7*4);attn_pre=f(7*4);post=f(7*4);comb=f(7*16);mixes=f(7*24);
     x=f(7*5120);qr=f(7*1280);q=f(7*32768);kv=f(7*512);o_low=f(7*8192);branch=f(7*5120);seed_kv=f(128*512);
-    shared_gate=f(7*2304);shared_up=f(7*2304);shared_act=f(7*2304);shared_out=f(7*5120);route_logits=f(7*128);route_weights=f(7*3);parts=f(7*3*5120);
+    shared_gate=f(7*2304);shared_up=f(7*2304);shared_act=f(7*2304);shared_out=f(7*5120);route_logits=f(7*128);route_weights=f(7*3);parts=f(7*4*5120+2048);
     mean=f(7*5120);markov=f(7*256);bias=f(vocab);confidence_input=f(5376);confidence=f(7);head=f(7*vocab);
     cache=layout.alloc<uint8_t>(160*528);q_bf=layout.alloc<uint16_t>(7*32768);kv_bf=layout.alloc<uint16_t>(128*512);
     out_bf=layout.alloc<uint16_t>(7*32768);partial=layout.alloc<uint16_t>(8*32768);lse=f(8*64);
     ids=layout.alloc<int>(7);routes=layout.alloc<int>(7*3);slots=layout.alloc<int64_t>(7*135);writes=layout.alloc<int64_t>(135);
     greedy_ids=layout.alloc<int>(9);penalty_counts=layout.alloc<int>(vocab);
+    chain_values=layout.alloc<double>(kDraftChainBlocks);chain_tokens=layout.alloc<int>(kDraftChainBlocks);chain_counter=layout.alloc<unsigned>(1);
     inject_hidden=f(128*15360);
 }
 DraftKvCache::DraftKvCache(core::DeviceArena& arena,bool floating) {
@@ -123,7 +124,14 @@ void Session::Impl::capture_hidden(int layer,int count,int64_t start) {
     gpu_check(mean_residual_gpu(work.h,work.engram_emb,count,runtime.stream.value));runtime.round(work.engram_emb,int64_t(count)*5120);
     dump("draft_capture_before_attn-"+std::to_string(layer),work.engram_emb,{count,5120});
     const int skip=std::max(0,count-128);
-    for(int t=skip;t<count;++t)gpu_check(cudaMemcpyAsync(draft_hidden+((start+t)%128)*15360+(layer-37)*5120,
+    if(draft_group_enabled_value()){
+        for(int t=skip;t<count;){
+            const int at=int((start+t)%128),n=std::min(count-t,128-at);
+            gpu_check(cudaMemcpy2DAsync(draft_hidden+int64_t(at)*15360+(layer-37)*5120,15360*4,work.engram_emb+int64_t(t)*5120,5120*4,
+                5120*4,n,cudaMemcpyDeviceToDevice,runtime.stream.value));
+            t+=n;
+        }
+    }else for(int t=skip;t<count;++t)gpu_check(cudaMemcpyAsync(draft_hidden+((start+t)%128)*15360+(layer-37)*5120,
         work.engram_emb+int64_t(t)*5120,5120*4,cudaMemcpyDeviceToDevice,runtime.stream.value));
     if(layer==39)draft_capture_position=start+count;
 }
@@ -213,8 +221,9 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
     for(int layer=0;layer<3;++layer){
         check_cancel();auto hc=[&](const char* stage,float* pre){
             const std::string p=std::string("hc_")+stage;
-            gpu_check(hc_project_gpu(d.h,static_cast<const float*>(weights.tensor(layer,p+"_fn").data),d.mixes,5120,draft_tokens,g.norm_eps,stream));
-            gpu_check(hc_split_gpu(d.mixes,static_cast<const float*>(weights.tensor(layer,p+"_scale").data),static_cast<const float*>(weights.tensor(layer,p+"_base").data),pre,d.post,d.comb,draft_tokens,g.hc_eps,20,stream));
+            gpu_check(hc_project_split_gpu(d.h,static_cast<const float*>(weights.tensor(layer,p+"_fn").data),d.mixes,
+                static_cast<const float*>(weights.tensor(layer,p+"_scale").data),static_cast<const float*>(weights.tensor(layer,p+"_base").data),
+                pre,d.post,d.comb,5120,draft_tokens,g.norm_eps,g.hc_eps,20,0,stream));
         };
         hc("attn",d.attn_pre);gpu_check((c.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(d.h,d.pre,d.x,5120,draft_tokens,stream));norm(d.x,"attn_norm",d.x,5120,draft_tokens,layer);
         const std::string prefix="draft.blk."+std::to_string(layer)+".";
@@ -269,7 +278,12 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         }
         gpu_check(rotate_gpu(d.q,64,512,draft_tokens,position,g,false,true,stream));round(d.q,draft_tokens*32768);
         dump(prefix+"attention",d.q,{draft_tokens,64,512});
-        const auto& wo=weights.tensor(layer,"attn_output_a");for(int group=0;group<8;++group)matmul(wo,d.q+group*4096,d.o_low+group*1024,draft_tokens,w,1024,32768,8192,int64_t(group)*1024*4096);
+        const auto& wo=weights.tensor(layer,"attn_output_a");
+        const bool grouped=c.batch_projection&&draft_tokens==5&&(wo.type==0||wo.type==30)&&wo.elements>=uint64_t(8)*1024*4096&&wo.cols==4096&&
+            draft_projection5_grouped_gpu(wo.data,wo.type,d.q,d.o_low,1024,4096,32768,8192,8,int64_t(1024)*4096*(wo.type==0?4:2),4096,1024,
+                wo.packed_bf16&&c.arithmetic==Arithmetic::production,c.arithmetic==Arithmetic::production,stream)==cudaSuccess;
+        if(grouped){if(c.stats)c.stats->draft_batch_projection_calls+=8;}
+        else for(int group=0;group<8;++group)matmul(wo,d.q+group*4096,d.o_low+group*1024,draft_tokens,w,1024,32768,8192,int64_t(group)*1024*4096);
         matmul(weights.tensor(layer,"attn_output_b"),d.o_low,d.branch,draft_tokens,w);
         dump(prefix+"attn_out",d.branch,{draft_tokens,5120});
         gpu_check((c.arithmetic==Arithmetic::production?hc_post_bf16_gpu:hc_post_gpu)(d.h,d.branch,d.post,d.comb,d.h,5120,draft_tokens,stream));
@@ -297,7 +311,7 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         }
         if(fused){
             gpu_check(draft_fused_moe_gpu(weights.expert(layer,0),weights.expert_type(layer),weights.projection_bytes(layer),shared_gate.data,
-                shared_up.data,shared_down.data,shared_gate.type,d.x,d.routes,d.route_weights,w.group_act,d.branch,draft_tokens,stream));
+                shared_up.data,shared_down.data,shared_gate.type,d.x,d.routes,d.route_weights,w.group_act,d.branch,draft_tokens,stream,d.parts));
             if(c.stats)++c.stats->draft_fused_moe_calls;
         }else{
         matmul(shared_gate,d.x,d.shared_gate,draft_tokens,w);matmul(shared_up,d.x,d.shared_up,draft_tokens,w);
@@ -351,7 +365,20 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
             gpu_check(cudaMemsetAsync(d.penalty_counts,0,vocab*4,stream));
             gpu_check(draft_penalty_counts_gpu(w.ids,history_size,weights.gpu_vocab_inverse,d.penalty_counts,stream));
         }
-        for(int i=0;i<draft_tokens;++i){
+        const auto& markov_w1=weights.dense.at("markov_w1.weight");const auto& markov_w2=weights.dense.at("markov_w2.weight");
+        const bool chain_fused=draft_chain_enabled()&&(markov_w2.type==8||markov_w2.type==30)&&!markov_w2.packed_bf16&&markov_w2.cols==256&&
+            markov_w2.rows==vocab&&(vocab+8*4-1)/(8*4)<=kDraftChainBlocks;
+        if(chain_fused){
+            gpu_check(cudaMemsetAsync(d.chain_counter,0,sizeof(unsigned),stream));
+            for(int i=0;i<draft_tokens;++i){
+                check_cancel();
+                gpu_check(draft_chain_gpu(markov_w1.data,markov_w1.type,markov_w2.data,markov_w2.type,d.head+int64_t(i)*vocab,weights.gpu_vocab_ids,
+                    weights.gpu_input_inverse,weights.gpu_vocab_inverse,vocab,penalties?w.ids:nullptr,history_size,i,d.greedy_ids,
+                    penalties?d.penalty_counts:nullptr,sampling,d.greedy_ids+draft_tokens+1,d.markov+i*256,d.bias,
+                    c.arithmetic==Arithmetic::production,d.chain_values,d.chain_tokens,d.chain_counter,stream));
+            }
+        }
+        for(int i=0;i<draft_tokens&&!chain_fused;++i){
             check_cancel();const auto& markov=weights.dense.at("markov_w1.weight");
             gpu_check(draft_markov_row_gpu(markov.data,markov.type,d.greedy_ids+i,weights.gpu_input_inverse,
                 d.markov+i*256,c.arithmetic==Arithmetic::production,d.greedy_ids+draft_tokens+1,stream));
@@ -416,7 +443,14 @@ DraftProposal Session::propose(int first,const kernels::SamplerParams& sampling)
     prefill::LedgerScope trace(r.options.trace,"ds41.draft");
     s.check_cancel();const auto before=std::chrono::steady_clock::now();auto& d=*r.draft_work;
     const int window=std::min<int64_t>(128,s.position);const int64_t begin=s.position-window;
-    for(int t=0;t<window;++t)gpu_check(cudaMemcpyAsync(d.main_hidden+int64_t(t)*15360,
+    if(draft_group_enabled_value()){
+        for(int t=0;t<window;){
+            const int at=int((begin+t)%128),n=std::min(window-t,128-at);
+            gpu_check(cudaMemcpyAsync(d.main_hidden+int64_t(t)*15360,s.draft_hidden+int64_t(at)*15360,int64_t(n)*15360*4,
+                cudaMemcpyDeviceToDevice,r.stream.value));
+            t+=n;
+        }
+    }else for(int t=0;t<window;++t)gpu_check(cudaMemcpyAsync(d.main_hidden+int64_t(t)*15360,
         s.draft_hidden+((begin+t)%128)*15360,15360*4,cudaMemcpyDeviceToDevice,r.stream.value));
     DraftContext context{r.model,r.options.arithmetic,*r.draft_weights,d,s.work,r.blas,r.stream.value,
                          &s.capture,[&]{s.check_cancel();}};

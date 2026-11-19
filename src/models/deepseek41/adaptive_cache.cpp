@@ -1,4 +1,7 @@
 #include "adaptive_cache.hpp"
+#include "helper_affinity.hpp"
+#include "expert_pipeline.hpp"
+#include <atomic>
 #include "strata/prefill/ledger_scope.hpp"
 #include <algorithm>
 #include <chrono>
@@ -7,6 +10,12 @@
 #include <iostream>
 
 namespace strata::models::deepseek41 {
+std::atomic<bool> helper_affinity_enabled{true};
+void helper_affinity_set_enabled(bool value){helper_affinity_enabled.store(value);}
+std::atomic<bool> adaptive_rotation_all_enabled{true};
+void adaptive_rotation_all_set_enabled(bool value){adaptive_rotation_all_enabled.store(value);}
+std::atomic<bool> adaptive_promote_enabled{true};
+void adaptive_promote_set_enabled(bool value){adaptive_promote_enabled.store(value);}
 namespace {
 constexpr int keys=40*384;
 constexpr uint64_t no_ram=core::detail::kNoCacheComplement;
@@ -33,20 +42,41 @@ AdaptiveCache::AdaptiveCache(core::ExpertCache& cache,std::vector<ExpertKey>& ho
     if(!staging_->pinned)throw std::runtime_error("adaptive overlap requires pinned exchange buffers");
     for(size_t i=0;i<hot_.size();++i){const auto [l,e]=hot_[i];if(cache_.slot_of(l,e)!=static_cast<int>(i))throw std::invalid_argument("adaptive cache slot order");}
     for(int l=0;l<40;++l)groups_[l]=layout_groups?layout_groups->at(l):adaptive_group(l);
-    rotation_eligible_=pinned_ram_;
+    rotation_eligible_=rotation_many_=pinned_ram_;
+    int ngroups=0;
     for(int l=0;l<40;++l){
         if(groups_[l]<0||groups_[l]>=40)throw std::invalid_argument("adaptive format group ID");
-        // Two bounded spare pools retain the existing Q2/Q3 zero-copy rotation.
-        // More layouts use direct pinned H2D and a host commit within the same budget.
+        // Two bounded spare pools retain the existing Q2/Q3 zero-copy rotation. More layouts
+        // rotate through per-group pools carved from the same staging (rotation_many_), or
+        // fall back to direct pinned H2D and a host commit within the same budget.
+        ngroups=std::max(ngroups,groups_[l]+1);
         if(groups_[l]>=2)rotation_eligible_=false;
         for(int j=0;j<l;++j)if(groups_[j]==groups_[l]&&sizes[j]!=sizes[l]){
-            rotation_eligible_=false;
+            rotation_eligible_=rotation_many_=false;
             if(grouped_)throw std::invalid_argument("adaptive format-group sizes differ");
         }
     }
     for(int k=0;k<keys;++k)if(offsets_[k]!=no_ram)sources_[k]=ram_+offsets_[k];
-    for(int g=0;g<2;++g)for(size_t i=0;i<capacity_;++i)
-        spares_[g].push_back(staging_->data+(g*capacity_+i)*stride_);
+    const size_t buffers=2*capacity_;
+    if(ngroups<=2){
+        spares_.resize(2);
+        for(int g=0;g<2;++g)for(size_t i=0;i<capacity_;++i)spares_[g].push_back(staging_->data+(g*capacity_+i)*stride_);
+    }else{
+        // Per-group pools: a small floor each, the rest by layer count. A batch may not
+        // exchange more experts of a group than that group's pool holds.
+        spares_.resize(ngroups);
+        std::vector<size_t> layers(ngroups),share(ngroups);
+        for(int l=0;l<40;++l)++layers[groups_[l]];
+        const size_t floor=std::min<size_t>(8,buffers/ngroups);size_t used=0;
+        for(int g=0;g<ngroups;++g){share[g]=floor;used+=floor;}
+        const size_t rest=buffers-used;size_t given=0;
+        for(int g=0;g<ngroups;++g){const size_t extra=rest*layers[g]/40;share[g]+=extra;given+=extra;}
+        for(int g=0;given<rest;g=(g+1)%ngroups,++given)++share[g];
+        size_t next=0;
+        for(int g=0;g<ngroups;++g)for(size_t i=0;i<share[g];++i)spares_[g].push_back(staging_->data+(next++)*stride_);
+        if(next!=buffers)throw std::logic_error("adaptive spare pool partition");
+        if(share.end()!=std::find(share.begin(),share.end(),size_t(0)))rotation_many_=false;
+    }
     // A spare never crosses its format group after rotation, even though the
     // initial allocation uses max-size strides. No CUDA aliases are needed:
     // this engine computes experts on the GPU, never through host-mapped weights.
@@ -71,11 +101,14 @@ void AdaptiveCache::choose(cudaStream_t readers,ExecutionStats& stats){
     std::vector<int32_t> slots(keys);
     for(int k=0;k<keys;++k)slots[k]=cache_.slot_of(k/384,k%384);
     swaps_.clear();std::array<size_t,40> spare{};
+    const bool rotate=(aligned_||maya_)&&(rotation_eligible_||(rotation_many_&&adaptive_rotation_all_enabled.load()));
     for(const auto& choice:choose_adaptive_exchanges(sizes_,heat_,slots,offsets_,grouped_,capacity_,budget_,&groups_,maya_?&recent_:nullptr)){
         Swap s;static_cast<AdaptiveExchange&>(s)=choice;
+        const int group=groups_[s.in.first];
+        if(rotate&&spare[group]>=spares_[group].size())continue;
         s.generation=generations_.at(s.slot);s.source=sources_.at(adaptive_index(s.in));
-        s.direct=(aligned_||maya_)&&pinned_ram_;s.rotate=(aligned_||maya_)&&rotation_eligible_;
-        s.spare=spare[groups_[s.in.first]]++;
+        s.direct=(aligned_||maya_)&&pinned_ram_;s.rotate=rotate;
+        s.spare=spare[group]++;
         s.saved=s.rotate?spares_[groups_[s.in.first]].at(s.spare):saved(swaps_.size());
         validate(s);swaps_.push_back(s);
     }
@@ -91,7 +124,8 @@ void AdaptiveCache::choose(cudaStream_t readers,ExecutionStats& stats){
         stats.phase_dynamic_d2h_bytes+=s.bytes;
     }
     gpu_check(cudaEventRecord(copies_done_.value,copies_.value));
-    if(!swaps_.front().direct)host_job_=std::async(std::launch::async,[this]{
+    if(!swaps_.front().direct)host_job_=std::async(std::launch::async,[this,away=helper_affinity_enabled.load()?HelperAffinity::away_from_caller():HelperAffinity{}]{
+        away.apply();
         prefill::LedgerScope trace(trace_,"ds41.adapt.host.prepare");
         const auto start=std::chrono::steady_clock::now();
         for(size_t i=0;i<swaps_.size();++i)std::memcpy(incoming(i),swaps_[i].source,swaps_[i].bytes);
@@ -116,11 +150,23 @@ void AdaptiveCache::advance(cudaStream_t readers,ExecutionStats& stats,bool wait
         prefill::LedgerScope trace(trace_,"ds41.adapt.h2d.submit");
         // All previously planned readers precede this fence. CPU readers from the
         // just-finished forward have drained before tick(), and the saved bytes are ready.
+        // Incoming experts still in the decode raw cache are copied D2D on the reader
+        // stream: ordered after the retain that filled the raw slot and before any later
+        // overwrite of it, and (through the fence below) before publication.
+        std::vector<uint8_t> promoted(swaps_.size());
+        if(promote_&&adaptive_promote_enabled.load())for(size_t i=0;i<swaps_.size();++i){
+            const auto& s=swaps_[i];validate(s);
+            if(const auto* raw=promote_->peek(adaptive_index(s.in))){
+                gpu_check(cudaMemcpyAsync(cache_.device_slot(s.slot),raw,s.bytes,cudaMemcpyDeviceToDevice,readers));
+                promoted[i]=1;++promoted_;promoted_bytes_+=s.bytes;
+            }
+        }
         gpu_check(cudaEventRecord(readers_done_.value,readers));
         gpu_check(cudaStreamWaitEvent(copies_.value,readers_done_.value,0));
         for(size_t i=0;i<swaps_.size();++i){
             const auto& s=swaps_[i];validate(s);const int old=adaptive_index(s.out);
             overrides_[old]=s.saved;unavailable_[old]=1;
+            if(promoted[i])continue;
             gpu_check(cudaMemcpyAsync(cache_.device_slot(s.slot),s.direct?s.source:incoming(i),s.bytes,cudaMemcpyHostToDevice,copies_.value));
             stats.phase_dynamic_h2d_bytes+=s.bytes;stats.h2d_expert_bytes+=s.bytes;
             if(s.direct){direct_bytes_+=s.bytes;avoided_prepare_+=s.bytes;}
@@ -144,7 +190,8 @@ void AdaptiveCache::advance(cudaStream_t readers,ExecutionStats& stats,bool wait
         }
         // Incoming experts are now GPU-visible. Old experts remain CPU-visible in
         // exchange buffers until the next safe boundary publishes the RAM ownership flip.
-        host_job_=std::async(std::launch::async,[this]{
+        host_job_=std::async(std::launch::async,[this,away=helper_affinity_enabled.load()?HelperAffinity::away_from_caller():HelperAffinity{}]{
+            away.apply();
             prefill::LedgerScope trace(trace_,"ds41.adapt.host.commit");
             const auto start=std::chrono::steady_clock::now();
             for(size_t i=0;i<swaps_.size();++i)std::memcpy(swaps_[i].source,swaps_[i].saved,swaps_[i].bytes);
@@ -217,7 +264,7 @@ void AdaptiveCache::write_status(std::ostream& out)const{
        <<",\"observed_rows\":"<<rows_<<",\"migration_budget_bytes\":"<<budget_<<",\"host_staging_bytes\":"<<staging_->bytes
        <<",\"host_copy_worker_ms\":"<<host_copy_ms_<<",\"policy\":\""<<(maya_?"maya":"legacy")<<"\",\"period\":"<<(maya_?1:4)<<",\"period_unit\":\""<<((aligned_||maya_)?"verify_window":"accepted_row")<<"\",\"decay\":"<<(maya_?.9:.7)<<",\"decay_rows\":"<<decay_rows_
        <<",\"windows\":"<<windows_<<",\"exchange_limit\":"<<capacity_<<",\"pinned_direct_bytes\":"<<direct_bytes_
-       <<",\"rotated_exchanges\":"<<rotated_<<",\"avoided_prepare_bytes\":"<<avoided_prepare_<<",\"avoided_commit_bytes\":"<<avoided_commit_
+       <<",\"rotated_exchanges\":"<<rotated_<<",\"promoted_exchanges\":"<<promoted_<<",\"promoted_bytes\":"<<promoted_bytes_<<",\"avoided_prepare_bytes\":"<<avoided_prepare_<<",\"avoided_commit_bytes\":"<<avoided_commit_
        <<",\"minimum_candidate_heat\":"<<(maya_?0:candidate_heat)<<",\"minimum_gain\":"<<(maya_?1:migration_gain)<<",\"relative_margin\":"<<(maya_?1.25:1.0)
        <<",\"heat_sum\":"<<std::accumulate(heat_.begin(),heat_.end(),0.0)<<",\"previous_sum\":"<<std::accumulate(previous_.begin(),previous_.end(),0.0)
        <<",\"cpu_overrides\":"<<std::count_if(overrides_.begin(),overrides_.end(),[](auto p){return p!=nullptr;})

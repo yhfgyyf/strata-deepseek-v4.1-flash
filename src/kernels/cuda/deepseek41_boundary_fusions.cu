@@ -1,5 +1,6 @@
 // Validated 2026-10-21 operator candidates; preserve the existing BF16 boundaries.
 #include <cuda_runtime.h>
+#include <atomic>
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <cmath>
@@ -128,10 +129,45 @@ __global__ void hc_split_warp_kernel(const float* mixes,const float* scale,const
  comb[token*16+lane]=v;
 }
 
+// Same per-thread column chain, block tree and output expression as rms_fused_kernel; the
+// row stays in registers (all loads in flight at once). In-place safe: each thread reads its
+// own columns before the barrier and writes them after.
+template<int W>
+__global__ void __launch_bounds__(256) rms_resident_kernel(const float* x, const float* __restrict__ weight, float* out, float eps) {
+    constexpr int P = W / 256;
+    const int token = blockIdx.x;
+    const float* xr = x + int64_t(token) * W + threadIdx.x;
+    float v[P], wv[P];
+#pragma unroll
+    for (int i = 0; i < P; ++i) v[i] = xr[i * 256];
+#pragma unroll
+    for (int i = 0; i < P; ++i) wv[i] = weight ? __ldg(weight + threadIdx.x + i * 256) : 1.f;
+    float square = 0;
+#pragma unroll
+    for (int i = 0; i < P; ++i) square += v[i] * v[i];
+    square = sum_block(square);
+    __shared__ float inverse;
+    if (threadIdx.x == 0) inverse = rsqrtf(square / W + eps);
+    __syncthreads();
+    const float inv = inverse;
+    float* o = out + int64_t(token) * W + threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < P; ++i) o[i * 256] = __bfloat162float(__float2bfloat16_rn(v[i] * inv * wv[i]));
+}
+std::atomic<bool> rms_resident_enabled{true};
 } // namespace boundary_detail
 using namespace boundary_detail;
+void rms_resident_set_enabled(bool value) { rms_resident_enabled.store(value); }
 cudaError_t rms_bf16_gpu(const float* x, const float* w, float* out, int width, int tokens, float eps, cudaStream_t s) {
     if (width < 1 || tokens < 1 || eps <= 0) return cudaErrorInvalidValue;
+    if (rms_resident_enabled.load()) {
+        switch (width) {
+            case 5120: rms_resident_kernel<5120><<<tokens,256,0,s>>>(x,w,out,eps); return cudaGetLastError();
+            case 1280: rms_resident_kernel<1280><<<tokens,256,0,s>>>(x,w,out,eps); return cudaGetLastError();
+            case 512: rms_resident_kernel<512><<<tokens,256,0,s>>>(x,w,out,eps); return cudaGetLastError();
+            default: break;
+        }
+    }
     rms_fused_kernel<<<tokens,256,0,s>>>(x,w,out,width,eps); return cudaGetLastError();
 }
 cudaError_t hc_pre_bf16_gpu(const float* x, const float* pre, float* out, int hidden, int tokens, cudaStream_t s) {
