@@ -321,6 +321,7 @@ uint64_t GgufExperts::ram_bytes()const{return ram_bytes_+backup_bytes();}
 uint64_t GgufExperts::gpu_bytes()const{return cache_.bytes()+(phase_?phase_->gpu_bytes():0);}
 uint64_t GgufExperts::backup_bytes()const{return phase_?phase_->backup_bytes():0;}
 uint64_t GgufExperts::phase_staging_bytes()const{return phase_?phase_->staging_bytes():0;}
+void GgufExperts::set_promote_source(DecodeRawCache* cache){if(adaptive_)adaptive_->set_promote_source(cache);}
 uint64_t GgufExperts::adaptive_staging_bytes()const{return adaptive_?adaptive_->staging_bytes():0;}
 std::vector<ExpertKey> GgufExperts::hot_pairs()const{
     if(!adaptive_)return hot_;

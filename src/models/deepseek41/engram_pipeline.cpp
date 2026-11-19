@@ -1,9 +1,11 @@
 #include "runtime_internal.hpp"
+#include "helper_affinity.hpp"
 #include "strata/prefill/ledger_scope.hpp"
 #include <cstring>
 
 namespace strata::models::deepseek41 {
 namespace {std::atomic<bool> engram_short_enabled{true};}
+extern std::atomic<bool> helper_affinity_enabled;
 void engram_short_set_enabled(bool value){engram_short_enabled.store(value);}
 EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,bool huge_pinned,uint32_t packed_type,int table_mask)
     : work_(work),arithmetic_(arithmetic),trace_(trace),packed_type_(packed_type),row_bytes_(packed_type==20?144:packed_type==13?176:packed_type==14?210:272) {
@@ -17,7 +19,7 @@ EngramPipeline::EngramPipeline(Workspace& work,Arithmetic arithmetic,bool trace,
         cublasSetMathMode(blas_,CUBLAS_PEDANTIC_MATH)!=CUBLAS_STATUS_SUCCESS) {
         cublasDestroy(blas_);blas_=nullptr;throw std::runtime_error("Engram cuBLAS initialization");
     }
-    try{gpu_check(cudaGetDevice(&device_id_));worker_=std::thread([this]{run();});}
+    try{gpu_check(cudaGetDevice(&device_id_));worker_=std::thread([this,away=HelperAffinity::away_from_caller()]{if(helper_affinity_enabled.load())away.apply();run();});}
     catch(...){cublasDestroy(blas_);blas_=nullptr;throw;}
 }
 EngramPipeline::~EngramPipeline() { stop();if(blas_)cublasDestroy(blas_); }

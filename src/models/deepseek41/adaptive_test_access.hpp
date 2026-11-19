@@ -14,7 +14,7 @@ struct PrefetchBlockBenchmark {
         uint64_t rows,since,batches,published;
         double host_ms;
         std::vector<uint8_t*> sources;
-        std::array<std::vector<uint8_t*>,2> spares;
+        std::vector<std::vector<uint8_t*>> spares;
         uint64_t windows,direct,rotated,prepare,commit;
         uint64_t decay_rows;
         std::vector<uint8_t> recent;

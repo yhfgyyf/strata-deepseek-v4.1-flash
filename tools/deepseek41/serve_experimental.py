@@ -137,6 +137,8 @@ def main():
     os.environ.setdefault("OMP_NUM_THREADS", "6")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("STRATA_DS41_ADAPTIVE_POLICY", "maya")
+    # Single-GPU default: exact decode paths plus tensor-core routed MoE (0x8000) and q_b (0x40000).
+    os.environ.setdefault("STRATA_DS41_OPT_MASK", "0x7FFFFF")
     os.environ["STRATA_DS41_BLOCK_SEGMENTS"] = "40"
     os.environ["STRATA_DS41_BLOCK_HUGE_MIN_PERCENT"] = "100"
     os.environ["STRATA_DS41_DECODE_SEGMENTS"] = "2"

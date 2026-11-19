@@ -1,6 +1,9 @@
 #include "adaptive_test_access.hpp"
 #include "strata/kernels/cpu/deepseek41_down.hpp"
 #include "strata/models/deepseek41/mixed_expert.hpp"
+#include "strata/models/deepseek41/kernels.hpp"
+#include "strata/models/deepseek41/indexer.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/artifact/gguf_split.hpp"
 #include <cstdlib>
 #include <fstream>
@@ -100,6 +103,25 @@ int main(int argc, char** argv) {
         d::scores_fast_set_enabled(true); d::expert_dequant_fast_set_enabled(true);
         d::expert_mixed_fast_set_enabled(iq);
         d::expert_mixed_short_set_enabled(iq);
+        // Optional STRATA_DS41_OPT_MASK selects decode paths bit by bit (0x8000 tensor-core routed MoE,
+        // 0x40000 tensor-core q_b; the other bits are bit-exact). Unset keeps the built-in defaults.
+        if (const char* mask_text = std::getenv("STRATA_DS41_OPT_MASK")) {
+            const unsigned m = unsigned(std::strtoul(mask_text, nullptr, 0));
+            d::expert_grouped_set_enabled(m & 1u); strata::kernels::native_output_a_q5_set_enabled(m & 2u);
+            d::pinned_logits_set_enabled(m & 4u); d::shared_early_all_set_enabled(m & 8u);
+            d::q5_rows8_set_enabled(m & 16u); d::expert_grouped_bf16_inputs_set_enabled(m & 32u);
+            d::rms_resident_set_enabled(m & 64u); d::hc_staged_set_enabled(m & 128u);
+            d::draft_q8_warp_set_enabled(m & 256u); d::index_select_topk_set_enabled(m & 512u);
+            strata::kernels::native_mmvq_two_warp_all_set_enabled(m & 1024u);
+            d::draft_dedup_set_enabled(m & 0x800u); d::draft_chain_set_enabled(m & 0x1000u);
+            d::draft_group_set_enabled(m & 0x2000u); d::projection_prefetch_set_enabled(m & 0x4000u);
+            d::expert_grouped_mma_set_enabled(m & 0x8000u); d::rope_fused_set_enabled(m & 0x10000u);
+            d::hc_split_fused_set_enabled(m & 0x20000u); strata::kernels::native_q5_mma_set_enabled(m & 0x40000u);
+            d::helper_affinity_set_enabled(m & 0x80000u); d::adaptive_rotation_all_set_enabled(m & 0x100000u);
+            d::adaptive_promote_set_enabled(m & 0x200000u); d::decode_lru_set_enabled(m & 0x400000u);
+            d::expert_grouped_mma_wide_set_enabled(m & 0x800000u); strata::kernels::native_q5_mma_long_set_enabled(m & 0x1000000u);
+            std::cerr << "DeepSeek decode-opt mask=0x" << std::hex << m << std::dec << '\n';
+        }
         // Match the established experiment's process-owned runtime lifetime.
         auto* runtime = new d::Runtime(model, o,
             argv[2], vision);

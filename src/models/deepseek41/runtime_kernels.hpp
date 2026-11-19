@@ -28,4 +28,13 @@ cudaError_t draft_penalty_counts_gpu(const int* history,int count,const int* inv
 cudaError_t draft_greedy_gpu(const float* head,const float* bias,const int* ids,const int* inverse,int vocab,
                             const int* history,int history_size,int step,int* chain,int* counts,
                             const kernels::SamplerParams& sampling,int* status,cudaStream_t stream);
+// Fused Markov row + Q8_0/BF16 markov_w2 + greedy step (same results as the three kernels); counter starts at 0.
+constexpr int kDraftChainBlocks=4096;
+cudaError_t draft_chain_gpu(const void* w1,int w1_type,const void* w2,int w2_type,const float* head,const int* ids,
+                           const int* input_inverse,const int* inverse,int vocab,const int* history,int history_size,
+                           int step,int* chain,int* counts,const kernels::SamplerParams& sampling,int* status,
+                           float* markov,float* bias,bool round,double* part_values,int* part_tokens,unsigned* counter,
+                           cudaStream_t stream);
+void draft_chain_set_enabled(bool enabled);
+bool draft_chain_enabled();
 } // namespace strata::models::deepseek41

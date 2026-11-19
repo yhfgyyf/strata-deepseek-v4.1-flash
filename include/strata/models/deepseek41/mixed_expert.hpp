@@ -40,6 +40,21 @@ cudaError_t expert_mixed_short_gpu(const VerifyExpertGroup* groups,int count,
     uint32_t gu_type,uint32_t down_type,size_t up_offset,size_t down_offset,
     const float* x,const int* token_rows,const float* routing,const int* slots,
     float* gate,float* up,float* activation,float* parts,int tokens,cudaStream_t stream);
+// Grouped resident-expert decode: one GU+SwiGLU and one Down launch per distinct row
+// count, bit-identical to expert_mixed_short_gpu for every supported format pair.
+void expert_grouped_set_enabled(bool enabled);
+// Drained control: BF16 copies of the (BF16-exact) GU input and routed activation.
+void expert_grouped_bf16_inputs_set_enabled(bool enabled);
+// Opt-in tensor-core grouped decode (same BF16 operands, FP32 MMA accumulation; not bit-identical to the FMA path).
+void expert_grouped_mma_set_enabled(bool enabled);
+// Opt-in: register-fed IQ2_XXS tensor-core decode (wide qs loads, computed sign byte); bit-identical.
+void expert_grouped_mma_wide_set_enabled(bool enabled);
+bool expert_grouped_mma_enabled();
+bool expert_grouped_enabled();
+bool expert_grouped_supported(uint32_t gu_type,uint32_t down_type);
+cudaError_t expert_grouped_gpu(const VerifyExpertGroup* groups,int count,uint32_t gu_type,uint32_t down_type,
+    size_t up_offset,size_t down_offset,const float* x,const int* token_rows,const float* routing,const int* slots,
+    float* activation,float* parts,int tokens,void* scratch,size_t scratch_bytes,cudaStream_t stream);
 // Adopted format/row pairs from the full-weight GU+activation comparison.
 inline bool expert_mixed_gu_activation_selected(uint32_t type,int tokens) {
     return (type==22&&tokens==1) || (type==17&&(tokens==1||tokens==3||tokens==8)) ||

@@ -26,6 +26,11 @@ cudaError_t index_scores_gpu(const float* query, const float* weights, const flo
                              int tokens, int key_rows, int64_t start_position, int ratio, cudaStream_t stream);
 // A null temporary pointer queries the CUB byte requirement, without launching work.
 cudaError_t sort_index_gpu(const float* scores, int tokens, int rows, IndexSortBuffers& buffers, cudaStream_t stream);
+// Exact fused replacement for sort_index_gpu + (compact_)index_topk_gpu (stable descending order).
+void index_select_topk_set_enabled(bool enabled);
+bool index_select_topk_enabled();
+cudaError_t index_select_topk_gpu(const float* scores,const int32_t* blocks,int64_t* out,int tokens,int width,int key_rows,
+                                  int64_t start,int ratio,cudaStream_t stream);
 cudaError_t index_topk_gpu(const IndexSortBuffers& sorted, int64_t* selected, int tokens, int rows,
                           int64_t start_position, int ratio, cudaStream_t stream);
 cudaError_t candidate_scores_gpu(const float* scores, float* blocks, int tokens, int key_rows,

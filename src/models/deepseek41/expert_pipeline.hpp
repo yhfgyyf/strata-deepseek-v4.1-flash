@@ -7,13 +7,19 @@ namespace strata::models::deepseek41 {
 class DecodeRawCache {
 public:
     DecodeRawCache(void* data,uint64_t stride,int slots,cudaStream_t stream);
+    // Decode-only slots (idle prefill workspace tails); reachable while decode_lru is enabled.
+    void add_slots(const std::vector<uint8_t*>& extra);
     const uint8_t* find(int key);
+    // Lookup without touching LRU age (adaptive migration promote).
+    const uint8_t* peek(int key)const;
     const uint8_t* retain(int key,const uint8_t* source,uint64_t bytes);
     void clear(cudaStream_t overwrite);
-    int slots()const{return keys_.size();}
+    int slots()const{return static_cast<int>(active());}
 private:
-    uint8_t* data_;uint64_t stride_,clock_=0;
-    cudaStream_t stream_;Event consumed_;
+    size_t active()const;
+    uint64_t stride_,clock_=0;
+    cudaStream_t stream_;Event consumed_;size_t base_;
+    std::vector<uint8_t*> slots_;
     std::vector<int> keys_;std::vector<uint64_t> ages_;
 };
 

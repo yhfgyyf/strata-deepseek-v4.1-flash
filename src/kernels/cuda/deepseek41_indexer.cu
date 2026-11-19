@@ -1,3 +1,4 @@
+#include <atomic>
 // DeepSeek-V4.1 index and candidate semantics follow the pinned official model (MIT).
 #include "strata/models/deepseek41/indexer.hpp"
 #include <cub/device/device_segmented_radix_sort.cuh>
@@ -118,6 +119,96 @@ __global__ void all_candidates(const float* scores,int* out,int blocks){
     }
 }
 int grid(int64_t n){return std::min<int64_t>((n+255)/256,65535);}
+// Exact replacement for (stable descending SegmentedRadixSort of 32-bit float keys) + topk_kernel:
+// the first min(512,rows) positions of that sort are {key > T} plus the lowest-index entries with
+// key == T, where T is the 512-th largest radix key; they are then mapped, filtered and bitonic
+// sorted exactly as topk_kernel does.
+__device__ __forceinline__ unsigned radix_key(float f) {
+    // CUB's float radix sort maps -0.0 to +0.0 (ProcessFloatMinusZero), so they tie.
+    unsigned u = __float_as_uint(f);
+    if (u == 0x80000000u) u = 0u;
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__global__ void __launch_bounds__(1024) select_topk_kernel(const float* scores, const int32_t* blocks, int64_t* out,
+                                                          int rows, int key_rows, int64_t start, int ratio) {
+    constexpr int K = 512, T = 1024;
+    const int token = blockIdx.x, tid = threadIdx.x;
+    const float* s = scores + int64_t(token) * rows;
+    __shared__ unsigned hist[256];
+    __shared__ unsigned s_prefix, s_want;
+    __shared__ int positions[K];
+    __shared__ int count;
+    __shared__ int scan[T];
+    if (tid == 0) count = 0;
+    unsigned prefix = 0, mask = 0, want = K;
+    const bool all = rows <= K;
+    if (!all) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            if (tid < 256) hist[tid] = 0;
+            __syncthreads();
+            for (int i = tid; i < rows; i += T) {
+                const unsigned k = radix_key(s[i]);
+                if ((k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255], 1u);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned acc = 0; int d = 255;
+                for (; d > 0; --d) { if (acc + hist[d] >= want) break; acc += hist[d]; }
+                s_want = want - acc; s_prefix = prefix | (unsigned(d) << shift);
+            }
+            __syncthreads();
+            want = s_want; prefix = s_prefix; mask |= 255u << shift;
+            __syncthreads();
+        }
+    }
+    // Rank equal keys by index: contiguous chunks per thread and a block exclusive scan.
+    const int chunk = (rows + T - 1) / T, b0 = min(rows, tid * chunk), b1 = min(rows, b0 + chunk);
+    int eq = 0;
+    if (!all) for (int i = b0; i < b1; ++i) eq += radix_key(s[i]) == prefix;
+    scan[tid] = eq;
+    __syncthreads();
+    for (int off = 1; off < T; off <<= 1) {
+        const int v = tid >= off ? scan[tid - off] : 0;
+        __syncthreads();
+        scan[tid] += v;
+        __syncthreads();
+    }
+    int rank = scan[tid] - eq;
+    for (int i = b0; i < b1; ++i) {
+        bool take;
+        if (all) take = true;
+        else {
+            const unsigned k = radix_key(s[i]);
+            take = k > prefix || (k == prefix && unsigned(rank++) < want);
+        }
+        if (take) positions[atomicAdd(&count, 1)] = i;
+    }
+    __syncthreads();
+    const int64_t visible = (start + token + 1) / ratio;
+    if (tid < K) {
+        int id = INT_MAX;
+        if (tid < count) {
+            const int column = positions[tid];
+            const int candidate = blocks ? blocks[int64_t(token) * 2048 + column / 8] * 8 + column % 8 : column;
+            if (s[column] > -INFINITY && candidate >= 0 && candidate < key_rows && candidate < visible) id = candidate;
+        }
+        positions[tid] = id;
+    }
+    __syncthreads();
+    for (int size = 2; size <= K; size <<= 1) for (int step = size >> 1; step; step >>= 1) {
+        if (tid < K) {
+            const int partner = tid ^ step;
+            if (partner > tid) {
+                const bool ascending = (tid & size) == 0;
+                const int a = positions[tid], b = positions[partner];
+                if ((a > b) == ascending) { positions[tid] = b; positions[partner] = a; }
+            }
+        }
+        __syncthreads();
+    }
+    if (tid < K) out[int64_t(token) * K + tid] = positions[tid] == INT_MAX ? -1 : positions[tid];
+}
+std::atomic<bool> select_topk_enabled{true};
 }
 cudaError_t index_scores_gpu(const float* q,const float* weights,const float* keys,const uint8_t* packed,const uint8_t* candidates,
                              float* scores,int tokens,int rows,int64_t start,int ratio,cudaStream_t stream){
@@ -135,6 +226,13 @@ cudaError_t sort_index_gpu(const float* scores,int tokens,int rows,IndexSortBuff
     }
     return cub::DeviceSegmentedRadixSort::SortPairsDescending(b.temporary,b.temporary_bytes,scores,b.sorted_scores,
         b.input_ids,b.sorted_ids,count,tokens,b.offsets,b.offsets?b.offsets+1:nullptr,0,32,stream);
+}
+void index_select_topk_set_enabled(bool value){select_topk_enabled.store(value);}
+bool index_select_topk_enabled(){return select_topk_enabled.load();}
+cudaError_t index_select_topk_gpu(const float* scores,const int32_t* blocks,int64_t* out,int tokens,int width,int key_rows,
+                                  int64_t start,int ratio,cudaStream_t stream){
+    if(!scores||!out||tokens<1||width<1||key_rows<1||start<0||(ratio!=1&&ratio!=2&&ratio!=4))return cudaErrorInvalidValue;
+    select_topk_kernel<<<tokens,1024,0,stream>>>(scores,blocks,out,width,key_rows,start,ratio);return cudaGetLastError();
 }
 cudaError_t index_topk_gpu(const IndexSortBuffers& b,int64_t* out,int tokens,int rows,int64_t start,int ratio,cudaStream_t stream){
     if(!b.sorted_scores||!b.sorted_ids||!out||tokens<1||rows<1||start<0||(ratio!=1&&ratio!=2))return cudaErrorInvalidValue;

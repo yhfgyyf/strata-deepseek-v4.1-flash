@@ -14,6 +14,7 @@
 namespace strata::models::deepseek41 {
 namespace {
 std::atomic<bool> route_group_enabled{true};
+std::atomic<bool> shared_early_all{true};
 // Each retained format/row bucket passed independent ABBA confirmation.
 bool shared_early_selected(int gu_type,int down_type,int tokens){
     unsigned mask=0;
@@ -28,6 +29,7 @@ bool shared_early_selected(int gu_type,int down_type,int tokens){
 }
 }
 void route_group_set_enabled(bool value){route_group_enabled.store(value);}
+void shared_early_all_set_enabled(bool value){shared_early_all.store(value);}
 bool Runtime::Impl::short_gpu_moe(int tokens,int phase) const {
     return phase==2&&tokens>=1&&tokens<=8&&options.slots==1&&options.arithmetic==Arithmetic::production&&
         (options.experts==ExpertMode::gpu||(options.experts==ExpertMode::hybrid&&options.pcie_frac==1));
@@ -65,8 +67,9 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     if(decode_raw_cache && !prefill && tokens>8)decode_raw_cache->clear(upload.value);
     const auto& f=experts->format(layer);
     const bool compact=compact_routes(tokens,phase);
+    // Submission order only: the shared expert and the routed experts write disjoint buffers.
     const bool early_shared=options.shared_early_submit&&short_gpu_moe(tokens,phase)&&options.decode_graph&&
-        shared_early_selected(f.gu_type,f.d_type,tokens);
+        (shared_early_all.load()||shared_early_selected(f.gu_type,f.d_type,tokens));
     auto shared=[&]{
         const auto& gate=tensor(layer,"ffn_gate_shexp");
         const auto& up=tensor(layer,"ffn_up_shexp");
@@ -263,8 +266,27 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         stats.shared_graph_captures+=shared_captures;stats.shared_graph_launches+=shared_launches;
     }
     if(moe_shared_host_ready)moe_shared_host_ready();
+    // Opt-in tensor-core decode: cold (streamed) experts use the same grouped MMA arithmetic as
+    // resident ones, so a token's result does not depend on residency.
+    const bool mma_decode=short_possible&&expert_grouped_enabled()&&expert_grouped_mma_enabled()&&
+        expert_grouped_supported(f.gu_type,f.d_type)&&options.arithmetic==Arithmetic::production;
+    bool metadata_on_device=!single||gpu_metadata;
+    auto upload_single_metadata=[&]{
+        if(metadata_on_device)return;
+        gpu_check(cudaMemcpyAsync(w.group_rows,w.host_group_rows,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
+        gpu_check(cudaMemcpyAsync(w.group_slots,w.host_group_slots,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
+        gpu_check(cudaMemcpyAsync(w.group_weights,w.host_group_weights,metadata_offset*sizeof(float),cudaMemcpyHostToDevice,stream.value));
+        metadata_on_device=true;
+    };
     auto compute=[&](const Group& g,const uint8_t* blob,const std::array<uint16_t*,3>* prepared=nullptr){
         const int nt=g.rows.size();
+        if(mma_decode&&!prepared&&nt<=8){
+            upload_single_metadata();
+            const VerifyExpertGroup one{blob,g.offset,nt};
+            gpu_check(expert_grouped_gpu(&one,1,f.gu_type,f.d_type,f.up_off,f.down_off,w.x,w.group_rows,w.group_weights,
+                w.group_slots,w.group_act,w.parts,tokens,w.group_gate,size_t(w.max_tokens)*2304*sizeof(float),stream.value));
+            stats.expert_gpu+=nt;return;
+        }
         if(!single)gpu_check(gather_rows_gpu(w.x,w.group_rows+g.offset,w.group_x,nt,5120,stream.value));
         const float* input=single?w.x:w.group_x;
         const float* routing=single?w.route_weights+g.slots[0]:w.group_weights+g.offset;
@@ -366,19 +388,23 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         ((f.d_type==10||f.d_type==11)&&kernels::cpu::deepseek41_down_fusion_enabled()||
          mixed_fast&&expert_mixed_type(f.d_type))&&w.max_tokens>=tokens*6);
     const bool short_uniform=std::all_of(resident.begin(),resident.end(),[&](const auto& item){return item.first->rows.size()==static_cast<size_t>(tokens);});
-    const bool short_batch=short_possible&&expert_mixed_short_selected(f.gu_type,f.d_type,tokens,resident.size(),short_uniform);
+    // The grouped kernels match the short path bit for bit and are faster at every
+    // measured group count, so they replace the per-bucket selection tables.
+    const bool grouped=short_possible&&expert_grouped_enabled()&&expert_grouped_supported(f.gu_type,f.d_type)&&
+        !resident.empty()&&resident.size()<=48;
+    const bool short_batch=grouped||(short_possible&&expert_mixed_short_selected(f.gu_type,f.d_type,tokens,resident.size(),short_uniform));
     if(short_batch){
-        if(single&&!gpu_metadata){
-            gpu_check(cudaMemcpyAsync(w.group_rows,w.host_group_rows,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
-            gpu_check(cudaMemcpyAsync(w.group_slots,w.host_group_slots,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
-            gpu_check(cudaMemcpyAsync(w.group_weights,w.host_group_weights,metadata_offset*sizeof(float),cudaMemcpyHostToDevice,stream.value));
-        }
+        upload_single_metadata();
         std::array<VerifyExpertGroup,48> batch{};int count=0;
         for(const auto& item:resident){const auto& g=*item.first;
             if(count==48||g.offset+g.rows.size()>static_cast<size_t>(w.max_tokens))throw std::logic_error("IQ short group workspace");
             batch[count++]={item.second,g.offset,static_cast<int>(g.rows.size())};
         }
-        gpu_check(expert_mixed_short_gpu(batch.data(),count,f.gu_type,f.d_type,f.up_off,f.down_off,
+        // Gate/Up scratch is unused by the fused grouped path; it holds the BF16 input copy.
+        if(grouped)gpu_check(expert_grouped_gpu(batch.data(),count,f.gu_type,f.d_type,f.up_off,f.down_off,
+            w.x,w.group_rows,w.group_weights,w.group_slots,w.group_act,w.parts,tokens,
+            w.group_gate,size_t(w.max_tokens)*2304*sizeof(float),stream.value));
+        else gpu_check(expert_mixed_short_gpu(batch.data(),count,f.gu_type,f.d_type,f.up_off,f.down_off,
             w.x,w.group_rows,w.group_weights,w.group_slots,w.group_gate,w.group_up,w.group_act,w.parts,tokens,stream.value));
         for(const auto& item:resident)stats.expert_gpu+=item.first->rows.size();
     }else if(grouped_verify&&!resident.empty()){

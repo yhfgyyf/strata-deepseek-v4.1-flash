@@ -112,6 +112,7 @@ struct DraftWork {
     float* lse;
     int *ids,*routes;
     int *greedy_ids,*penalty_counts;
+    double* chain_values;int* chain_tokens;unsigned* chain_counter;
     int64_t *slots,*writes;
     explicit DraftWork(core::DeviceArena& arena,int vocab=129280){WorkspaceLayout layout(&arena);init(layout,vocab);}
     explicit DraftWork(WorkspaceLayout& layout,int vocab=129280){init(layout,vocab);}
@@ -180,6 +181,7 @@ public:
     void save_learned_profile(const std::string& path,cudaStream_t stream);
     std::vector<ExpertKey> hot_pairs() const;
     uint64_t adaptive_staging_bytes()const;
+    void set_promote_source(class DecodeRawCache* cache);
     void release_mapped(int layer, int expert) const;
 private:
     friend struct PrefetchBlockBenchmark;
@@ -419,6 +421,9 @@ struct Session::Impl {
     std::vector<float> last_logits;
     bool greedy_capture=false;
     std::vector<int> last_greedy;
+    // Page-locked staging for verification logits (<=8 rows): DMA instead of a pageable copy.
+    struct PinnedFree { void operator()(float* p) const { if (p) cudaFreeHost(p); } };
+    std::unique_ptr<float, PinnedFree> pinned_logits;
     float *boundary_h = nullptr, *boundary_pre = nullptr;
     float *draft_hidden = nullptr, *snapshot_hidden = nullptr;
     int64_t draft_capture_position = 0;

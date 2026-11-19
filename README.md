@@ -9,6 +9,10 @@
 
 [English](README.en.md)
 
+## 更新日志
+
+- **2026-11-19**：单卡 RTX PRO 6000 decode 提速。routed MoE 与注意力 q_b 投影默认使用张量核（MATH500 准确率与逐位一致路径相同，均为 91.2%）；新增分组 routed MoE、草稿 MoE 去重与融合、RoPE／超连接边界融合；专家迁移改为零拷贝轮换并优先从显存缓存复制，decode 期间利用空闲 prefill 工作区扩大专家缓存，后台拷贝线程不再与请求线程共用 CPU。decode 峰值约 207 tokens/s。双 L20 配置不变。
+
 本项目面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 等 harness 环境的实际使用，目标是在保证模型一定推理质量的前提下，尽可能提高推理速度。
 
 在家用电脑运行 DeepSeek-V4.1-Flash：**Intel Core i7-14700KF、单张 RTX PRO 6000 Blackwell 96GB、192GB DDR5-4800**。
@@ -66,9 +70,9 @@
 
 **已测最大 prefill：6,261.998 tokens/s**，使用 GSQ-RCO-IQ2_XS、原格式 DSpark、32,768 输入、chunk 32768。这是无 profiler 的单次正式结果；同配置三次均值为 **6,245.142 tokens/s**。
 
-**已测最大 decode：114.472 tokens/s**，来自 GSQ-RCO-IQ2_XS、原格式 DSpark、524,288 输入、chunk 32768、固定完整 512 输出。该无 profiler 结果包含生成与最终自适应迁移收尾／同步；三次均值为 **112.323 tokens/s**。两个峰值分别从正式测量中选取。
+**已测最大 decode：约 207 tokens/s**，GSQ-RCO-IQ2_XS、原格式 DSpark、默认启动配置（chunk 8192），在 harness 实际使用中测得。LongSWE 16,180 输入、固定 512 输出：进程首个请求 decode 127.2 tokens/s，后续请求 162.2–163.1 tokens/s，prefill 4,481–5,077 tokens/s。
 
-GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和累计运行时。每档输入独立启动进程，1 次预热＋3 次正式测量；每次新建 session，不复用前缀，贪心解码忽略 EOS 以固定完整 512 输出。Maya 专家热度在同进程的四次请求间延续。
+下表为上一版本代码的测量。GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和累计运行时。每档输入独立启动进程，1 次预热＋3 次正式测量；每次新建 session，不复用前缀，贪心解码忽略 EOS 以固定完整 512 输出。Maya 专家热度在同进程的四次请求间延续。
 
 | 输入 tokens | 输出 tokens | Chunk | 启动常驻专家数 | Prefill tokens/s | Decode tokens/s |
 |---:|---:|---:|---:|---:|---:|
@@ -135,9 +139,9 @@ STRATA_PYTHON=.venv/bin/python ./start-l20-mask479.sh --config examples/local-l2
 | 原始 GSQ-RCO GGUF | 四个主分片、外置 IQ4_NL Engram、IQ2/IQ3 混合专家、Q5_K 投影及自动 GPU 专家预算。 |
 | 原始 Unsloth GGUF | 七分片读取、IQ3/Q2_K/Q6_K 混合专家格式、主模型与草稿共享词表张量、原 BF16 视觉文件。 |
 | DSpark | 最多 5-token 草稿、置信度自适应贪心验证、增量 KV、接受前缀提交、词表行选择。 |
-| SM120 算子 | 混合格式解量化、有界 grouped GEMM、IQ/MMVQ 短窗口验证、分组投影、边界融合、indexer 和 CAKE 注意力。 |
+| SM120 算子 | 张量核 routed MoE 与 q_b 投影、混合格式解量化、有界 grouped GEMM、IQ/MMVQ 短窗口验证、分组投影、边界融合、indexer 和 CAKE 注意力。 |
 | CUDA Graph | 已采用的 decode 输出/router 分段、共享专家提前提交与精简路由交接，保留动态路由与迁移边界。 |
-| 专家与 Engram | 格式分组内的 Maya 在线自适应、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
+| 专家与 Engram | 格式分组内的 Maya 在线自适应、零拷贝迁移轮换、decode 期专家缓存扩展、专家预取、SSD 行缓存、异步 I/O，以及 40 段 block-pinned / 100% 大页准入。 |
 | API 与图片 | DeepSeek 消息/tokenizer、thinking/工具编码、文本前缀自动检查点、取消后恢复、图片预处理及原生视觉编码器。 |
 | 安装与管理 | CLI 与浏览器共用配置、断点下载与摘要校验、本机构建、服务进程身份记录、健康检查、启停和日志。 |
 
