@@ -1,3 +1,4 @@
+#include <atomic>
 #include "strata/models/deepseek41/engram.hpp"
 #include "strata/models/deepseek41/prefill_chunk.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -5,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -16,23 +18,44 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <linux/aio_abi.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
 
 namespace strata::models::deepseek41 {
+std::atomic<bool> engram_direct_enabled{true};
+void engram_direct_set_enabled(bool value){engram_direct_enabled.store(value);}
 namespace {
 constexpr uint64_t page_bytes = 4096;
 #if defined(__linux__)
+// STRATA_DS41_ENGRAM_MIRRORS: colon-separated byte-identical copies of the Engram GGUF on other devices. Reads are
+// spread round-robin over the primary and the mirrors (each device keeps its sorted order), adding random-read IOPS.
+std::vector<std::string> engram_mirrors(){
+    std::vector<std::string> out;const char* v=std::getenv("STRATA_DS41_ENGRAM_MIRRORS");
+    for(std::string rest=v?v:"";!rest.empty();){const auto at=rest.find(':');out.push_back(rest.substr(0,at));
+        rest=at==std::string::npos?"":rest.substr(at+1);if(out.back().empty())out.pop_back();}
+    return out;
+}
 struct NativeAio {
-    int fd=-1;aio_context_t context=0;
+    static constexpr int per_device_depth=256;
+    std::vector<int> fds;std::vector<aio_context_t> contexts;
     explicit NativeAio(const std::string& path){
-        fd=::open(path.c_str(),O_RDONLY|O_DIRECT|O_CLOEXEC);
-        if(fd<0)throw std::runtime_error("Engram AIO direct open");
-        if(::syscall(SYS_io_setup,256,&context)<0){const int code=errno;::close(fd);fd=-1;throw std::runtime_error("Engram io_setup: "+std::string(std::strerror(code)));}
+        std::vector<std::string> paths{path};for(auto& m:engram_mirrors())paths.push_back(m);
+        off_t size=-1;
+        for(const auto& p:paths){
+            const int fd=::open(p.c_str(),O_RDONLY|O_DIRECT|O_CLOEXEC);
+            if(fd<0){close_all();throw std::runtime_error("Engram AIO direct open: "+p);}
+            fds.push_back(fd);const off_t n=::lseek(fd,0,SEEK_END);
+            if(size<0)size=n;else if(n!=size){close_all();throw std::runtime_error("Engram mirror size differs: "+p);}
+            aio_context_t context=0;
+            if(::syscall(SYS_io_setup,per_device_depth,&context)<0){const int code=errno;close_all();throw std::runtime_error("Engram io_setup: "+std::string(std::strerror(code)));}
+            contexts.push_back(context);
+        }
     }
-    void abort(){if(context){::syscall(SYS_io_destroy,context);context=0;}}
-    ~NativeAio(){abort();if(fd>=0)::close(fd);}
+    void close_all(){abort();for(int fd:fds)::close(fd);fds.clear();}
+    void abort(){for(auto& c:contexts)if(c){::syscall(SYS_io_destroy,c);c=0;}}
+    ~NativeAio(){close_all();}
 };
 #endif
 EngramHashSpec read_spec(const Model& m) {
@@ -51,7 +74,7 @@ EngramHashSpec read_spec(const Model& m) {
 }
 struct PageEntry {
     uint64_t key = UINT64_MAX, age = 0;
-    std::unique_ptr<std::array<uint8_t, page_bytes>> data;
+    uint8_t* data = nullptr;
 };
 class PageCache {
 public:
@@ -64,7 +87,7 @@ public:
         if (entries_.empty()) return nullptr;
         const size_t first = bucket(key);
         for (size_t i = first; i < first + 8; ++i) if (entries_[i].key == key) {
-            entries_[i].age = ++tick_; return entries_[i].data->data();
+            entries_[i].age = ++tick_; return entries_[i].data;
         }
         return nullptr;
     }
@@ -77,16 +100,35 @@ public:
             if (entries_[i].age < entries_[chosen].age) chosen = i;
         }
         auto& e = entries_[chosen];
-        if (!e.data) { e.data = std::make_unique<std::array<uint8_t, page_bytes>>(); ++allocated_; }
-        e.key = key; e.age = ++tick_; std::memcpy(e.data->data(), data, page_bytes);
+        if (!e.data) { e.data = slot(); ++allocated_; }
+        e.key = key; e.age = ++tick_; std::memcpy(e.data, data, page_bytes);
     }
+    ~PageCache() { for (void* c : chunks_) std::free(c); }
+    PageCache(const PageCache&) = delete;
+    PageCache& operator=(const PageCache&) = delete;
     uint64_t owned() const { return entries_.capacity() * sizeof(PageEntry) + allocated_ * (page_bytes + 32); }
 private:
     size_t bucket(uint64_t key) const {
         key ^= key >> 30; key *= 0xbf58476d1ce4e5b9ull; key ^= key >> 27;
         return (key % (entries_.size() / 8)) * 8;
     }
+    // Pages are carved from 2 MiB chunks (huge-page advised, not value-initialized): a cold first request inserts
+    // ~10^5 pages per table, and per-page zeroed allocations plus 4 KiB first-touch faults cost ~1.6 us each.
+    uint8_t* slot() {
+        constexpr size_t chunk = 2u << 20;
+        if (used_ == chunk / page_bytes || chunks_.empty()) {
+            void* c = std::aligned_alloc(chunk, chunk);
+            if (!c) throw std::bad_alloc();
+#if defined(__linux__)
+            ::madvise(c, chunk, MADV_HUGEPAGE);
+#endif
+            chunks_.push_back(c); used_ = 0;
+        }
+        return static_cast<uint8_t*>(chunks_.back()) + page_bytes * used_++;
+    }
     std::vector<PageEntry> entries_;
+    std::vector<void*> chunks_;
+    size_t used_ = 0;
     uint64_t tick_ = 0, allocated_ = 0;
 };
 }
@@ -191,6 +233,7 @@ struct EngramReader::Impl {
         { std::lock_guard<std::mutex> lock(mutex); stop = true; for (auto& w : queue) w.batch->cancel(); }
         queued.notify_all(); room.notify_all(); worker.join();
     }
+    struct Read {uint64_t first,index;uint32_t bytes;};
     bool complete_read(uint64_t first,uint32_t bytes,uint8_t* data,const strata::platform::Completion& c) const {
         const uint64_t offset=first*page_bytes;
         if(offset>=file.size())return false;
@@ -203,58 +246,31 @@ struct EngramReader::Impl {
     }
     void read_continuous(const std::vector<uint64_t>& missing,const std::vector<uint64_t>& pages,uint8_t* loaded,
                          const EngramBatch& batch,uint64_t& disk,uint64_t& reads) {
-        struct Read {uint64_t first,index;uint32_t bytes;};
         std::vector<Read> requests;
         for(size_t i=0;i<missing.size();){
             const uint64_t first=missing[i++];uint32_t count=1;
             while(i<missing.size() && count<16 && missing[i]==first+count){++i;++count;}
             requests.push_back({first,uint64_t(std::lower_bound(pages.begin(),pages.end(),first)-pages.begin()),count*uint32_t(page_bytes)});
         }
+#if defined(__linux__)
+        if(aio){read_aio(requests,loaded,batch,disk,reads);return;}
+#endif
         const size_t depth=std::min<size_t>(256,requests.size());
         std::vector<size_t> active(depth,SIZE_MAX);size_t cursor=0,inflight=0;std::string error;
-#if defined(__linux__)
-        std::vector<iocb> controls(depth);
-#endif
         struct Drain {
             Impl& owner;size_t& inflight;int exceptions=std::uncaught_exceptions();
-            ~Drain(){if(inflight && std::uncaught_exceptions()>exceptions){
-#if defined(__linux__)
-                if(owner.aio){owner.aio->abort();return;}
-#endif
-                owner.file.close();
-            }}
+            ~Drain(){if(inflight && std::uncaught_exceptions()>exceptions)owner.file.close();}
         } drain{*this,inflight};
         auto submit=[&](size_t slot){
             if(cursor==requests.size() || batch.cancelled.load() || !error.empty())return;
             const auto& r=requests[cursor];
-            bool accepted=false;
-#if defined(__linux__)
-            if(aio){
-                auto& cb=controls[slot];cb={};cb.aio_data=slot;cb.aio_lio_opcode=IOCB_CMD_PREAD;cb.aio_fildes=aio->fd;
-                cb.aio_buf=reinterpret_cast<uintptr_t>(loaded+r.index*page_bytes);cb.aio_nbytes=r.bytes;cb.aio_offset=r.first*page_bytes;
-                iocb* pointer=&cb;long result;
-                do{result=::syscall(SYS_io_submit,aio->context,1,&pointer);}while(result<0 && errno==EINTR);
-                accepted=result==1;if(!accepted)error="Engram io_submit failed: "+std::string(std::strerror(errno));
-            }else
-#endif
-            accepted=file.submit(r.first*page_bytes,loaded+r.index*page_bytes,r.bytes,slot,error);
-            if(accepted){
-                active[slot]=cursor++;++inflight;
-            }
+            if(file.submit(r.first*page_bytes,loaded+r.index*page_bytes,r.bytes,slot,error)){active[slot]=cursor++;++inflight;}
         };
         for(size_t slot=0;slot<depth;++slot)submit(slot);
         // Retire and replenish individual slots. Keep storage alive and drain
         // every accepted read even on cancellation or an I/O error.
         while(inflight){
             strata::platform::Completion complete[64];int count=0;
-#if defined(__linux__)
-            if(aio){
-                io_event events[64];long result;
-                do{result=::syscall(SYS_io_getevents,aio->context,1,64,events,nullptr);}while(result<0 && errno==EINTR);
-                if(result<0)throw std::runtime_error("Engram io_getevents failed");
-                count=result;for(int j=0;j<count;++j)complete[j]={events[j].data,events[j].res<0?0u:uint32_t(events[j].res),events[j].res>=0 && events[j].res2==0};
-            }else
-#endif
             while(!(count=file.wait(complete,64,-1))){}
             for(int j=0;j<count;++j){const auto& c=complete[j];
             if(c.tag>=depth || active[c.tag]==SIZE_MAX)throw std::runtime_error("Engram invalid rolling completion");
@@ -265,6 +281,71 @@ struct EngramReader::Impl {
         }
         if(!error.empty())throw std::runtime_error(error);
     }
+#if defined(__linux__)
+    // One rolling AIO loop per device (primary + mirrors), each on its own thread and context: a single submitting
+    // thread tops out near 440K IOPS, below two devices' combined random-read rate. Request i goes to device
+    // i % devices, so each device still sees ascending offsets. Small batches (decode) stay on the primary only.
+    struct DeviceRun {uint64_t disk=0,reads=0;std::string error;};
+    void aio_loop(size_t device,size_t devices,const std::vector<Read>& requests,uint8_t* loaded,const EngramBatch& batch,DeviceRun& out) {
+        const aio_context_t context=aio->contexts[device];const int fd=aio->fds[device];
+        if(!context){out.error="Engram AIO context aborted";return;}
+        const size_t total=(requests.size()+devices-1-device)/devices;
+        const size_t depth=std::min<size_t>(NativeAio::per_device_depth,total);
+        std::vector<iocb> controls(depth);std::vector<size_t> active(depth,SIZE_MAX);std::vector<iocb*> staged;staged.reserve(depth);
+        size_t cursor=0,inflight=0;
+        auto submit=[&](size_t slot){
+            if(cursor==total || batch.cancelled.load() || !out.error.empty())return;
+            const auto& r=requests[device+cursor*devices];
+            auto& cb=controls[slot];cb={};cb.aio_data=slot;cb.aio_lio_opcode=IOCB_CMD_PREAD;cb.aio_fildes=fd;
+            cb.aio_buf=reinterpret_cast<uintptr_t>(loaded+r.index*page_bytes);cb.aio_nbytes=r.bytes;cb.aio_offset=r.first*page_bytes;
+            staged.push_back(&cb);active[slot]=cursor++;++inflight;
+        };
+        auto flush=[&]{
+            size_t done=0;
+            while(done<staged.size()){
+                long result;
+                do{result=::syscall(SYS_io_submit,context,long(staged.size()-done),staged.data()+done);}while(result<0 && errno==EINTR);
+                if(result<=0){
+                    if(out.error.empty())out.error="Engram io_submit failed: "+std::string(std::strerror(result<0?errno:EAGAIN));
+                    for(size_t i=done;i<staged.size();++i){active[staged[i]->aio_data]=SIZE_MAX;--inflight;}
+                    break;
+                }
+                done+=size_t(result);
+            }
+            staged.clear();
+        };
+        for(size_t slot=0;slot<depth;++slot)submit(slot);
+        flush();
+        // Drain every accepted read even on cancellation or an I/O error: the buffers belong to the caller.
+        while(inflight){
+            io_event events[64];long result;
+            do{result=::syscall(SYS_io_getevents,context,1,64,events,nullptr);}while(result<0 && errno==EINTR);
+            if(result<0){
+                // io_destroy waits for the outstanding reads before the caller frees their buffers.
+                out.error="Engram io_getevents failed";::syscall(SYS_io_destroy,context);aio->contexts[device]=0;return;
+            }
+            for(long j=0;j<result;++j){
+                const auto& e=events[j];
+                if(e.data>=depth || active[e.data]==SIZE_MAX){if(out.error.empty())out.error="Engram invalid rolling completion";continue;}
+                const auto& r=requests[device+active[e.data]*devices];active[e.data]=SIZE_MAX;--inflight;
+                const strata::platform::Completion c{e.data,e.res<0?0u:uint32_t(e.res),e.res>=0 && e.res2==0};
+                if(!complete_read(r.first,r.bytes,loaded+r.index*page_bytes,c) && out.error.empty())out.error="Engram short/failed continuous read";
+                out.disk+=c.bytes;++out.reads;submit(e.data);
+            }
+            flush();
+        }
+    }
+    void read_aio(const std::vector<Read>& requests,uint8_t* loaded,const EngramBatch& batch,uint64_t& disk,uint64_t& reads) {
+        const size_t devices=requests.size()>=2*size_t(NativeAio::per_device_depth)?aio->fds.size():1;
+        std::vector<DeviceRun> runs(devices);std::vector<std::thread> helpers;
+        for(size_t d=1;d<devices;++d)helpers.emplace_back([&,d]{aio_loop(d,devices,requests,loaded,batch,runs[d]);});
+        aio_loop(0,devices,requests,loaded,batch,runs[0]);
+        for(auto& t:helpers)t.join();
+        std::string error;
+        for(const auto& r:runs){disk+=r.disk;reads+=r.reads;if(error.empty())error=r.error;}
+        if(!error.empty())throw std::runtime_error(error);
+    }
+#endif
     void read(Work& work) {
         auto& q = work.query;
         if (q.rows.size() != q.image.size() * 48) throw std::invalid_argument("Engram query shape");
@@ -288,24 +369,31 @@ struct EngramReader::Impl {
         std::unordered_map<uint64_t, std::array<uint8_t, page_bytes>> loaded;
         using Pages=std::unique_ptr<uint8_t,decltype(&strata::platform::DirectFile::free_aligned)>;
         Pages contiguous(nullptr,&strata::platform::DirectFile::free_aligned);
-        if(continuous_reads && !pages.empty()){
+        std::vector<uint64_t> missing;
+        uint64_t hits = 0, disk = 0, reads = 0;
+        std::vector<const uint8_t*> cached(pages.size());
+        for (size_t i=0;i<pages.size();++i) {
+            cached[i]=cache.get(pages[i]);
+            if(cached[i])++hits;else missing.push_back(pages[i]);
+        }
+        // Continuous reads insert missing pages only after the rows are gathered, and this reader is the cache's
+        // only writer, so cached pages are read in place; the slab receives only the pages read from disk.
+        const bool direct=continuous_reads&&engram_direct_enabled.load();
+        if(continuous_reads && (!direct || !missing.empty()) && !pages.empty()){
             // Read directly into the final aligned page slab: no per-page
             // allocation, value-initialization, hash insertion or staging copy.
             contiguous.reset(static_cast<uint8_t*>(strata::platform::DirectFile::alloc_aligned(pages.size()*page_bytes)));
             if(!contiguous)throw std::bad_alloc();
         }
+        if(!direct)for (size_t i=0;i<pages.size();++i)if(cached[i])
+            std::memcpy(continuous_reads?contiguous.get()+i*page_bytes:loaded[pages[i]].data(), cached[i], page_bytes);
         auto page_data=[&](uint64_t p)->const uint8_t*{
             if(!continuous_reads)return loaded.at(p).data();
             const auto at=std::lower_bound(pages.begin(),pages.end(),p);
             if(at==pages.end() || *at!=p)throw std::logic_error("Engram missing slab page");
+            if(const auto* hit=direct?cached[at-pages.begin()]:nullptr)return hit;
             return contiguous.get()+size_t(at-pages.begin())*page_bytes;
         };
-        std::vector<uint64_t> missing;
-        uint64_t hits = 0, disk = 0, reads = 0;
-        for (size_t i=0;i<pages.size();++i) {const uint64_t p=pages[i];
-            if (const auto* cached = cache.get(p)) { std::memcpy(continuous_reads?contiguous.get()+i*page_bytes:loaded[p].data(), cached, page_bytes); ++hits; }
-            else missing.push_back(p);
-        }
         struct Read { uint64_t first; uint32_t bytes; void* buffer; };
         size_t cursor = 0;
         if(continuous_reads)read_continuous(missing,pages,contiguous.get(),*work.batch,disk,reads);

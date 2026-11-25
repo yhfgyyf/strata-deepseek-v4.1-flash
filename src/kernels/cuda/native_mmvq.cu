@@ -168,6 +168,21 @@ __global__ void native_quantize_q8_1_kernel(const float* STRATA_PDL_RESTRICT x,
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
 }
 
+// round_bf16 of x in place, then native_quantize_q8_1 of the rounded values (one kernel for the two).
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_round_quantize_q8_1_kernel(float* __restrict__ x, Q81Block* __restrict__ y, int n_in) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_in) return;
+    const float xi = __bfloat162float(__float2bfloat16_rn(x[i]));
+    x[i] = xi;
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
+}
+
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
                                                    const float* __restrict__ up,
@@ -872,6 +887,25 @@ struct Q5KTraits {
         const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
         return q5_q8_dot_impl(r.vl, r.vh, u, sc, sc + 2, r.dm, d8);
     }
+    // apply() split in two: the activation part depends only on (column, k, iqs), so rows sharing them load it once.
+    struct X { int u[4]; float d8[2]; };
+    __device__ static X xload(const Q81Block* __restrict__ bq8, int iqs) {
+        X x;
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const Q81Block* bq8i = bq8 + bq8_offset + i;
+            x.d8[i] = __low2float(bq8i->ds);
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
+            x.u[2 * i] = q8[0];
+            x.u[2 * i + 1] = q8[4];
+        }
+        return x;
+    }
+    __device__ static float dot(const W& r, const X& x) {
+        const uint8_t* sc = reinterpret_cast<const uint8_t*>(r.aux);
+        return q5_q8_dot_impl(r.vl, r.vh, x.u, sc, sc + 2, r.dm, x.d8);
+    }
 };
 struct Q4KTraits {
     using Block = Q4KBlock;
@@ -1354,7 +1388,7 @@ template<typename F,int N,bool Pair=false>
 __launch_bounds__(128,STRATA_TWO_WARP_MINB)
 __global__ void native_mmvq_multi_two_warp_kernel(const typename F::Block* __restrict__ w,
     const Q81Block* __restrict__ x,float* __restrict__ y,int n_in,int n_out,
-    const typename F::Block* __restrict__ w2=nullptr,float* __restrict__ y2=nullptr) {
+    const typename F::Block* __restrict__ w2=nullptr,float* __restrict__ y2=nullptr,bool round=false) {
     const int lane=threadIdx.x,part=threadIdx.y&1,local_row=threadIdx.y>>1;
     int row=2*int(blockIdx.x)+local_row;
     if constexpr(Pair)if(row>=n_out){row-=n_out;w=w2;y=y2;}
@@ -1386,8 +1420,75 @@ __global__ void native_mmvq_multi_two_warp_kernel(const typename F::Block* __res
         float sum=values[t][0]+partial[local_row][0][t][lane];
         sum+=values[t][1];sum+=partial[local_row][1][t][lane];
         sum=warp_sum(sum);
-        if(lane==0)y[size_t(t)*n_out+row]=sum;
+        // round: the BF16 boundary the caller would apply next (round_bf16_strided), in the store.
+        if(lane==0)y[size_t(t)*n_out+row]=round?__bfloat162float(__float2bfloat16_rn(sum)):sum;
     }
+}
+
+// Q5_K two-warp layout with R rows per warp (exact): every row keeps the two-warp kernel's accumulation order and
+// reduction, but the activation words of each (column, k) are loaded once for the warp's R rows (the two-warp
+// kernel re-reads them per row from L1: LSU-bound at 66% on output_b).
+template<int N,int R>
+__launch_bounds__(128,4)
+__global__ void q5_rows_kernel(const Q5KBlock* __restrict__ w,const Q81Block* __restrict__ x,float* __restrict__ y,
+                               int n_in,int n_out,bool round) {
+    using F=Q5KTraits;
+    const int lane=threadIdx.x,part=threadIdx.y&1,local=threadIdx.y>>1;
+    const int row0=(2*int(blockIdx.x)+local)*R;
+    const int blocks=n_in/F::DIV,stride=n_in/Q8K;
+    float values[R][N][2]{};
+    if(row0<n_out)for(int base=0;base<blocks;base+=F::BPI) {
+        #pragma unroll
+        for(int v=0;v<2;++v) {
+            const int tid=lane+32*(part+2*v),k=base+tid/F::T,qs=F::kqs(tid);
+            if(k<blocks) {
+                F::W weight[R];
+                #pragma unroll
+                for(int r=0;r<R;++r)weight[r]=F::load(w+size_t(min(row0+r,n_out-1))*blocks+k,qs);
+                #pragma unroll
+                for(int t=0;t<N;++t) {
+                    const auto xx=F::xload(x+size_t(t)*stride+k*F::KBY,qs);
+                    #pragma unroll
+                    for(int r=0;r<R;++r)values[r][t][v]+=F::dot(weight[r],xx);
+                }
+            }
+        }
+    }
+    __shared__ float partial[2][R][2][N][32];
+    if(part) {
+        #pragma unroll
+        for(int r=0;r<R;++r)
+        #pragma unroll
+        for(int t=0;t<N;++t){partial[local][r][0][t][lane]=values[r][t][0];partial[local][r][1][t][lane]=values[r][t][1];}
+    }
+    __syncthreads();
+    if(part||row0>=n_out)return;
+    #pragma unroll
+    for(int r=0;r<R;++r)
+    #pragma unroll
+    for(int t=0;t<N;++t) {
+        float sum=values[r][t][0]+partial[local][r][0][t][lane];
+        sum+=values[r][t][1];sum+=partial[local][r][1][t][lane];
+        sum=warp_sum(sum);
+        if(lane==0&&row0+r<n_out)y[size_t(t)*n_out+row0+r]=round?__bfloat162float(__float2bfloat16_rn(sum)):sum;
+    }
+}
+// Rows per warp for the Q5_K two-warp path by column count (8192x5120 micro, us: N=2 22.4 -> 20.4, N=5 26.3 -> 24.5,
+// N=6 27.7 -> 25.9, N=8 37.5 -> 33.2 with R=4; N=7 is slower with R=2). STRATA_Q5_ROWS=0/2/4 forces one value.
+int q5_rows_per_warp(int n) {
+    static const int forced = [] { const char* v = std::getenv("STRATA_Q5_ROWS"); return v ? std::atoi(v) : -1; }();
+    if (forced == 0 || forced == 2 || forced == 4) return forced;
+    return n == 8 ? 4 : (n == 2 || n == 5 || n == 6) ? 2 : 0;
+}
+std::atomic<bool> g_q5_rows{true};
+template<int N>
+bool q5_rows_launch(const void* weights,const void* x_q8_1,float* y,int n_in,int n_out,bool round,cudaStream_t s) {
+    const int r=q5_rows_per_warp(N);
+    if(!r||!g_q5_rows.load())return false;
+    const auto* w=static_cast<const Q5KBlock*>(weights);const auto* x=static_cast<const Q81Block*>(x_q8_1);
+    if(r==4)q5_rows_kernel<N,4><<<unsigned((n_out+7)/8),dim3(32,4),0,s>>>(w,x,y,n_in,n_out,round);
+    else q5_rows_kernel<N,2><<<unsigned((n_out+3)/4),dim3(32,4),0,s>>>(w,x,y,n_in,n_out,round);
+    return true;
 }
 
 // Derived from native_mmvq_multi_kernel: same exact arithmetic; eight output-A groups.
@@ -1516,6 +1617,10 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     constexpr int type=std::is_same_v<F,SmallTraits<Q80Block,8>>?8:std::is_same_v<F,Q5KTraits>?13:std::is_same_v<F,Q6KTraits>?14:-1;
     if constexpr(type==8||type==13||type==14)if(g_multi_warp&&native_mmvq_multi_warp_selected(type,n_in,n_out,NCOLS,false)) {
         if constexpr(std::is_same_v<F,Q6KTraits>)q6_row_warp(weights,x_q8_1,y,n_in,n_out,NCOLS,s);
+        else if constexpr(std::is_same_v<F,Q5KTraits>){
+            if(!q5_rows_launch<NCOLS>(weights,x_q8_1,y,n_in,n_out,false,s))
+                native_mmvq_multi_two_warp_kernel<F,NCOLS><<<unsigned((n_out+1)/2),dim3(32,4),0,s>>>(w,x,y,n_in,n_out);
+        }
         else native_mmvq_multi_two_warp_kernel<F,NCOLS><<<unsigned((n_out+1)/2),dim3(32,4),0,s>>>(w,x,y,n_in,n_out);
         return;
     }
@@ -2402,7 +2507,8 @@ __device__ __forceinline__ void q5_scale_min(const uint8_t* q, int j, int& sc, i
 }
 template<int KW>
 __global__ void __launch_bounds__(KW * 32) q5k_mma_kernel(const Q5KBlock* __restrict__ w, const Q81Block* __restrict__ x,
-                                                       float* __restrict__ y, int n_in, int n_out, int ncols, int xs, int ldy) {
+                                                       float* __restrict__ y, int n_in, int n_out, int ncols, int xs, int ldy,
+                                                       bool round = false) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, c = lane & 3;
     const int row0 = blockIdx.x * 16, nb = n_in / QK;
     // blockIdx.y selects a row group with its own input slice (grouped output-A); 0 otherwise.
@@ -2471,7 +2577,8 @@ __global__ void __launch_bounds__(KW * 32) q5k_mma_kernel(const Q5KBlock* __rest
 #pragma unroll
         for (int l = 0; l < KW - 1; ++l) res[e] += part[l][e][lane];
         const int row = row0 + g + (e >= 2 ? 8 : 0), n = (e & 1) ? n1 : n0;
-        if (row < n_out && n < ncols) y[size_t(n) * ldy + row] = res[e];
+        // round: the caller's next BF16 boundary (round_bf16_strided), applied in the store.
+        if (row < n_out && n < ncols) y[size_t(n) * ldy + row] = round ? __bfloat162float(__float2bfloat16_rn(res[e])) : res[e];
     }
 }
 }  // namespace
@@ -2484,19 +2591,29 @@ int q5_mma_kw(int n_in) {
     if (!g_q5_mma_long.load()) return 4;
     return n_in / QK <= 8 ? 8 : 16;
 }
-void q5_mma_launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, int xs, int ldy, int groups, cudaStream_t s) {
+void q5_mma_launch(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, int xs, int ldy, int groups, cudaStream_t s,
+                   bool round = false) {
     const dim3 grid(unsigned((n_out + 15) / 16), unsigned(groups));
     const auto* wb = static_cast<const Q5KBlock*>(w);
     const auto* xb = static_cast<const Q81Block*>(x);
     const int kw = q5_mma_kw(n_in);
-    if (kw == 16) q5k_mma_kernel<16><<<grid, 512, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy);
-    else if (kw == 8) q5k_mma_kernel<8><<<grid, 256, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy);
-    else q5k_mma_kernel<4><<<grid, 128, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy);
+    if (kw == 16) q5k_mma_kernel<16><<<grid, 512, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy, round);
+    else if (kw == 8) q5k_mma_kernel<8><<<grid, 256, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy, round);
+    else q5k_mma_kernel<4><<<grid, 128, 0, s>>>(wb, xb, y, n_in, n_out, ncols, xs, ldy, round);
 }
 // Chosen by matrix shape only (never by column count): short-K matrices (<= 8 superblocks, i.e. the
 // 1280-wide q_b) gain 30-40% on DRAM-resident weights; longer K is equal or slower than dp4a.
-// g_q5_mma_long: also 2304- and 5120-wide inputs (shared expert, lm_head); 4096/8192 stay on dp4a.
-bool q5_mma_shape(int n_in) { return g_q5_mma.load() && (n_in / QK <= 8 || (g_q5_mma_long.load() && (n_in == 2304 || n_in == 5120))); }
+// g_q5_mma_long: also the 2304-wide shared-expert down (KW=16, -2.4 us/layer at N=6) and q_b with KW=8 (-2.3 us);
+// 5120 (shared gate/up) stays on dp4a: its one-launch pair (15.2 us) beats two MMA launches (19.9) and an MMA pair (16.5).
+// 4096/8192 stay on dp4a.
+std::atomic<bool> g_q5_pair{true};
+std::atomic<bool> g_round_fused{true};
+std::atomic<bool> g_round2{true};
+void native_mmvq_q5_pair_set_enabled(bool value) { g_q5_pair.store(value); }
+bool q5_mma_shape(int n_in) {
+    static const bool all = [] { const char* v = std::getenv("STRATA_Q5_MMA_ALL"); return v && v[0] == '1'; }();
+    return g_q5_mma.load() && (n_in / QK <= 8 || (g_q5_mma_long.load() && (all || n_in == 2304)));
+}
 void native_q5_mma_long_set_enabled(bool value) { g_q5_mma_long.store(value); }
 void native_q5_mma_set_enabled(bool value) { g_q5_mma.store(value); }
 bool native_q5_mma_enabled() { return g_q5_mma.load(); }
@@ -2576,6 +2693,17 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
                static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_check();
+}
+void native_round_quantize_q8_1(float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(x);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_round_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        x, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
@@ -2906,8 +3034,78 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
 }
 
+
+// native_mmvq followed by the BF16 rounding of its output, in one launch, where native_mmvq would run the two-warp
+// kernel (2..8 columns); false (nothing launched) otherwise.
+bool native_mmvq_try_rounded(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                             void* stream) {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (!g_round_fused.load() || !g_multi_exact || !g_multi_warp || ncols < 2 || ncols > 8 || n_in <= 0 || n_out <= 0 || !stream) return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (ggml_type == 13) {
+        if (n_in % QK == 0 && q5_mma_shape(n_in)) {
+            if (!g_round2.load()) return false;
+            q5_mma_launch(weights, x_q8_1, y, n_in, n_out, ncols, n_in / Q8K, n_out, 1, s, true);
+            launch_check();
+            return true;
+        }
+        if (n_in % QK || !native_mmvq_multi_warp_selected(13, n_in, n_out, ncols, false)) return false;
+        const auto* w = static_cast<const Q5KBlock*>(weights);
+        switch (ncols) {
+#define R(N) case N: if (!q5_rows_launch<N>(weights, x_q8_1, y, n_in, n_out, true, s)) native_mmvq_multi_two_warp_kernel<Q5KTraits, N><<<unsigned((n_out + 1) / 2), dim3(32, 4), 0, s>>>(w, x, y, n_in, n_out, nullptr, nullptr, true); break;
+            R(2) R(3) R(4) R(5) R(6) R(7) R(8)
+#undef R
+        }
+        launch_check();
+        return true;
+    }
+    if (ggml_type == 8) {
+        using F = SmallTraits<Q80Block, 8>;
+        if (n_in % 32 || n_in / F::DIV < F::BPI || q8_packed_registry().count(weights) ||
+            !native_mmvq_multi_warp_selected(8, n_in, n_out, ncols, false))
+            return false;
+        const auto* w = static_cast<const Q80Block*>(weights);
+        switch (ncols) {
+#define R(N) case N: native_mmvq_multi_two_warp_kernel<F, N><<<unsigned((n_out + 1) / 2), dim3(32, 4), 0, s>>>(w, x, y, n_in, n_out, nullptr, nullptr, true); break;
+            R(2) R(3) R(4) R(5) R(6) R(7) R(8)
+#undef R
+        }
+        launch_check();
+        return true;
+    }
+    return false;
+#endif
+}
+void native_mmvq_round_fused_set_enabled(bool value) { g_round_fused.store(value); }
+void native_mmvq_round2_set_enabled(bool value) { g_round2.store(value); }
+bool native_mmvq_round2_enabled() { return g_round2.load(); }
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
-                      int n_in, int n_out, int ncols, void* stream) {
+                      int n_in, int n_out, int ncols, void* stream, bool round) {
+#if !defined(__HIPCC__)
+    // Q5_K: both calls would run native_mmvq_multi_two_warp_kernel<Q5KTraits, ncols>; the Pair variant runs the
+    // same per-row work for both matrices in one grid.
+    if (ggml_type == 13) {
+        if (!g_q5_pair.load() || !g_multi_exact || !g_multi_warp || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 ||
+            n_in % QK != 0 || q5_mma_shape(n_in) || !native_mmvq_multi_warp_selected(13, n_in, n_out, ncols, false) ||
+            !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+            return false;
+        const auto* a = static_cast<const Q5KBlock*>(w1);
+        const auto* b = static_cast<const Q5KBlock*>(w2);
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        const auto s = static_cast<cudaStream_t>(stream);
+        switch (ncols) {
+#define P(N) case N: native_mmvq_multi_two_warp_kernel<Q5KTraits, N, true><<<unsigned(n_out), dim3(32, 4), 0, s>>>(a, x, y1, n_in, n_out, b, y2, round); break;
+            P(2) P(3) P(4) P(5) P(6) P(7) P(8)
+#undef P
+        }
+        launch_check();
+        return true;
+    }
+#endif
+    if (round) return false;
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||

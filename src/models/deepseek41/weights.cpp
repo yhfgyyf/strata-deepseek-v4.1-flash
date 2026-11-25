@@ -317,6 +317,10 @@ const uint8_t* GgufExperts::gpu(int layer,int expert,cudaStream_t stream,Executi
     if(slot>=0)return cache_.device_slot(slot);
     return phase_?phase_->gpu({layer,expert},stream,stats,phase):nullptr;
 }
+bool GgufExperts::gpu_resident(int layer,int expert)const{
+    if(adaptive_&&!adaptive_->resident(layer,expert))return false;
+    return cache_.slot_of(layer,expert)>=0;
+}
 uint64_t GgufExperts::ram_bytes()const{return ram_bytes_+backup_bytes();}
 uint64_t GgufExperts::gpu_bytes()const{return cache_.bytes()+(phase_?phase_->gpu_bytes():0);}
 uint64_t GgufExperts::backup_bytes()const{return phase_?phase_->backup_bytes():0;}

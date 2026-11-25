@@ -14,6 +14,12 @@ namespace {
 std::atomic<bool> hc_overlap_enabled{true};
 std::atomic<bool> output_a_batch_enabled{true};
 std::atomic<bool> pinned_logits_enabled{true};
+std::atomic<bool> x_q8_keep{true};
+// Prefill q: the q_b GEMM leaves its BF16 round to the shared-shape fused rope (same values).
+bool defer_q_round(bool production,int count){
+    return production&&count>=128&&rope_shared_fused_enabled_value();
+}
+std::atomic<bool> rms_q8_fused{true};
 CacheLayout contiguous(uint8_t* data,int64_t rows,int row_bytes,int page_size) {
     return {data,((rows+page_size-1)/page_size)*page_size*row_bytes,int64_t(page_size)*row_bytes,row_bytes,page_size};
 }
@@ -30,6 +36,8 @@ void store_window(uint8_t* destination,const uint8_t* source,int begin,int rows,
 }
 }
 void output_a_batch_set_enabled(bool value){output_a_batch_enabled.store(value);}
+void x_q8_keep_set_enabled(bool value){x_q8_keep.store(value);}
+void rms_q8_fused_set_enabled(bool value){rms_q8_fused.store(value);}
 void pinned_logits_set_enabled(bool value){pinned_logits_enabled.store(value);}
 void hc_overlap_set_enabled(bool value){hc_overlap_enabled.store(value);}
 void Session::Impl::dump(const std::string& name,const float* data,const std::vector<int64_t>& shape) {
@@ -160,14 +168,35 @@ void Session::Impl::attention_input(int layer,int count,const std::function<void
     mixes("attn",work.attn_pre);fork.produced();
     gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.pre,work.x,5120,count,stream));
     dump("hc_attn_pre-"+std::to_string(layer),work.x,{count,5120});
-    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),work.x,5120,count,g.norm_eps,stream));
+    // Short verify batches: the RMS kernels also write the Q8_1 blocks of their outputs (x for attn_q_a and attn_kv,
+    // qr for attn_q_b), replacing three quantization kernels with none (bitwise the same blocks).
+    runtime.q8_note(0,nullptr,0);runtime.q8_note(1,nullptr,0);  // kept Q8_1 inputs are valid only within this layer
+    const bool keep_q8=x_q8_keep.load()&&runtime.options.arithmetic==Arithmetic::production&&runtime.options.dense_q8_1&&
+        runtime.options.dense_q8_batch&&count>=2&&count<=8&&work.dense_input_q8_x;
+    const bool fused_x=keep_q8&&rms_q8_fused.load()&&rms_bf16_q8_gpu(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),
+        work.x,work.dense_input_q8_x,5120,count,g.norm_eps,stream)==cudaSuccess;
+    if(fused_x)runtime.q8_note(0,work.x,count);
+    else gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"attn_norm").data),work.x,5120,count,g.norm_eps,stream));
     dump("attn_norm-"+std::to_string(layer),work.x,{count,5120});
     if(before_q)before_q();
-    runtime.matmul(runtime.tensor(layer,"attn_q_a"),work.x,work.qr,count,work);
-    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),work.qr,1280,count,g.norm_eps,stream));
+    // x's Q8_1 is kept for attn_kv (attention(), same x): one quantization for both projections.
+    runtime.matmul(runtime.tensor(layer,"attn_q_a"),work.x,work.qr,count,work,0,0,0,0,true,false,keep_q8?(fused_x?2:1):0);
+    const bool fused_r=keep_q8&&rms_q8_fused.load()&&rms_bf16_q8_gpu(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),
+        work.qr,work.dense_input_q8_r,1280,count,g.norm_eps,stream)==cudaSuccess;
+    if(fused_r)runtime.q8_note(1,work.qr,count);
+    else gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.qr,static_cast<const float*>(runtime.tensor(layer,"attn_q_a_norm").data),work.qr,1280,count,g.norm_eps,stream));
     dump("qr-"+std::to_string(layer),work.qr,{count,1280});
-    runtime.matmul(runtime.tensor(layer,"attn_q_b"),work.qr,work.q,count,work);
+    // Prefill chunks: q_b's BF16 round is applied by the fused rope kernel instead (round -> rotate -> round).
+    runtime.matmul(runtime.tensor(layer,"attn_q_b"),work.qr,work.q,count,work,0,0,0,0,!defer_q_round(runtime.options.arithmetic==Arithmetic::production,count),false,fused_r?3:0);
     fork.join();
+    if(count<=8)runtime.spec_predict(layer,count,work,work.h,work.attn_pre,work.image);
+    if(route_predict_on()&&count<=8&&runtime.options.arithmetic==Arithmetic::production){
+        // mHC estimate of this layer's FFN input: its attention-side mixing applied to h before this attention.
+        static float* xs=[]{float* p=nullptr;gpu_check(cudaMalloc(&p,8*5120*sizeof(float)));return p;}();
+        gpu_check(hc_pre_bf16_gpu(work.h,work.attn_pre,xs,5120,count,stream));
+        gpu_check(rms_bf16_gpu(xs,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),xs,5120,count,g.norm_eps,stream));
+        runtime.route_predict(2,layer,xs,count,work);
+    }
 }
 void Session::Impl::attention_output(int layer,int count,bool with_routes) {
     const auto& g=runtime.model.geometry();const auto stream=runtime.stream.value;
@@ -175,10 +204,17 @@ void Session::Impl::attention_output(int layer,int count,bool with_routes) {
     const bool grouped=output_a_batch_enabled.load()&&wo.packed_bf16&&wo.cols==4096&&wo.rows==8192&&
         runtime.options.arithmetic==Arithmetic::production&&runtime.options.dense_q8_1&&runtime.options.dense_q8_batch&&
         kernels::native_deepseek_output_a_batch(wo.type,wo.data,work.q,work.dense_weight,work.o_low,count,stream);
-    if(grouped)gpu_check(round_bf16_gpu(work.o_low,int64_t(count)*8192,stream));
+    // Grouped output A: its BF16 rounding and output B's Q8_1 input in one kernel (kept slot 1, bitwise the same).
+    const bool round_q8=grouped&&x_q8_keep.load()&&rms_q8_fused.load()&&work.dense_input_q8_r&&runtime.options.dense_q8_1&&
+        runtime.options.dense_q8_batch&&count>=2&&count<=8&&runtime.tensor(layer,"attn_output_b").packed_bf16;
+    if(round_q8){
+        // dense_input_q8_r holds 8 x 5120/32 blocks; output B's input is 8192 wide, so it uses dense_input_q8 itself.
+        kernels::native_round_quantize_q8_1(work.o_low,work.dense_input_q8,8192,count,stream);
+    }
+    else if(grouped)gpu_check(round_bf16_gpu(work.o_low,int64_t(count)*8192,stream));
     else for(int group=0;group<8;++group)runtime.matmul(wo,work.q+group*4096,work.o_low+group*1024,count,work,
         1024,32768,8192,int64_t(group)*1024*4096);
-    runtime.matmul(runtime.tensor(layer,"attn_output_b"),work.o_low,work.branch,count,work);
+    runtime.matmul(runtime.tensor(layer,"attn_output_b"),work.o_low,work.branch,count,work,0,0,0,0,true,round_q8);
     dump("attn_out-"+std::to_string(layer),work.branch,{count,5120});
     auto mixes=[&](const char* stage,float* pre){
         gpu_check(hc_project_split_gpu(work.h,static_cast<const float*>(runtime.tensor(layer,std::string("hc_")+stage+"_fn").data),work.mixes,
@@ -191,7 +227,13 @@ void Session::Impl::attention_output(int layer,int count,bool with_routes) {
     mixes("ffn",work.pre);
     gpu_check((runtime.options.arithmetic==Arithmetic::production?hc_pre_bf16_gpu:hc_pre_gpu)(work.h,work.attn_pre,work.x,5120,count,stream));
     dump("hc_ffn_pre-"+std::to_string(layer),work.x,{count,5120});
-    gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,5120,count,g.norm_eps,stream));
+    // The shared expert's Q8_1 input from the same kernel (kept slot 0; moe() reuses it for gate/up).
+    const bool fused_ffn=x_q8_keep.load()&&rms_q8_fused.load()&&runtime.options.arithmetic==Arithmetic::production&&
+        runtime.options.dense_q8_1&&runtime.options.dense_q8_batch&&count>=2&&count<=8&&work.dense_input_q8_x&&
+        rms_bf16_q8_gpu(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,work.dense_input_q8_x,5120,count,
+            g.norm_eps,stream)==cudaSuccess;
+    runtime.q8_note(0,fused_ffn?work.x:nullptr,fused_ffn?count:0);
+    if(!fused_ffn)gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.x,static_cast<const float*>(runtime.tensor(layer,"ffn_norm").data),work.x,5120,count,g.norm_eps,stream));
     dump("ffn_norm-"+std::to_string(layer),work.x,{count,5120});
     if(with_routes)runtime.route(layer,count,work,2);
 }
@@ -204,18 +246,22 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
     const int previous=swa.count,total=previous+count;
     // Production glue fusion: rotate+round+BF16 copy in one kernel (same values, see rope_round_gpu).
     const bool production=runtime.options.arithmetic==Arithmetic::production;
-    auto fused_rope=[&](float* x,const uint16_t* in,uint16_t* out,int heads,int dim,bool inverse){
+    auto fused_rope=[&](float* x,const uint16_t* in,uint16_t* out,int heads,int dim,bool inverse,bool pre_round=false,bool keep_float=true){
         if(!production)return false;
-        const auto rc=rope_round_gpu(x,in,out,heads,dim,count,start,g,own.compression!=0,inverse,stream);
+        const auto rc=rope_round_gpu(x,in,out,heads,dim,count,start,g,own.compression!=0,inverse,stream,pre_round,keep_float);
         if(rc==cudaErrorNotSupported)return false;
         gpu_check(rc);return true;
     };
-    const bool q_fused=fused_rope(work.q,nullptr,work.q_bf,64,512,false);
+    const bool q_deferred=defer_q_round(production,count);
+    // Production attention reads only q_bf; the FP32 q is next written by the de-rope (kept for captures).
+    const bool q_fused=fused_rope(work.q,nullptr,work.q_bf,64,512,false,q_deferred,capture.enabled()||!q_deferred);
+    if(q_deferred&&!q_fused)runtime.round(work.q,int64_t(count)*32768);
     // De-rope reads the BF16 attention output directly when the same fused kernel applies.
     const bool derope_fused=q_fused;
     if(!q_fused){gpu_check(rotate_gpu(work.q,64,512,count,start,g,own.compression!=0,false,stream));runtime.round(work.q,int64_t(count)*32768);}
     dump("q-"+std::to_string(layer),work.q,{count,64,512});
-    runtime.matmul(runtime.tensor(layer,"attn_kv"),work.x,work.kv,count,work);
+    runtime.matmul(runtime.tensor(layer,"attn_kv"),work.x,work.kv,count,work,0,0,0,0,true,false,
+        x_q8_keep.load()&&runtime.q8_source[0]==work.x&&runtime.q8_tokens[0]==count?2:0);
     gpu_check((runtime.options.arithmetic==Arithmetic::production?rms_bf16_gpu:rms_gpu)(work.kv,static_cast<const float*>(runtime.tensor(layer,"attn_kv_a_norm").data),work.kv,512,count,g.norm_eps,stream));
     const bool kv_fused=fused_rope(work.kv,nullptr,work.kv_bf,1,512,false);
     if(!kv_fused){gpu_check(rotate_gpu(work.kv,1,512,count,start,g,own.compression!=0,false,stream));runtime.round(work.kv,int64_t(count)*512);}
@@ -226,12 +272,12 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
         gpu_check(cudaMemcpyAsync(work.temp_swa_float+int64_t(previous)*512,work.kv,int64_t(count)*512*4,cudaMemcpyDeviceToDevice,stream));
     }else {
         copy_window(work.temp_swa,swa.packed,ring_begin,previous,528,stream);
-        std::vector<int64_t> slots(count);std::iota(slots.begin(),slots.end(),previous);
-        gpu_check(cudaMemcpyAsync(work.write_slots,slots.data(),count*8,cudaMemcpyHostToDevice,stream));
+        // The window-slot kernel also writes the pack targets previous..previous+count-1 (no host vector + H2D).
+        gpu_check(window_slots_gpu(work.swa_slots,count,previous,stream,work.write_slots));
         if(!kv_fused)gpu_check(float_to_bf16_gpu(work.kv,work.kv_bf,int64_t(count)*512,stream));
         gpu_check(pack_swa_gpu(work.kv_bf,work.write_slots,count,512,contiguous(work.temp_swa,work.max_tokens+128,528,32),stream));
     }
-    gpu_check(window_slots_gpu(work.swa_slots,count,previous,stream));
+    if(runtime.options.arithmetic==Arithmetic::f32)gpu_check(window_slots_gpu(work.swa_slots,count,previous,stream));
     GlobalCache* compressed=nullptr;int rows=0;
     if(own.compression) {
         if(own.owns_global())compression(layer,count,start,false);
@@ -240,7 +286,8 @@ void Session::Impl::attention(int layer,int count,int64_t start) {
         if(own.computes_index()) {
             if(rows) {
                 runtime.matmul(runtime.tensor(layer,"indexer.attn_q_b"),work.qr,work.index_q,count,work);
-                gpu_check(rotate_gpu(work.index_q,32,128,count,start,g,true,false,stream));runtime.round(work.index_q,int64_t(count)*4096);
+                if(!(production&&rope_round_gpu(work.index_q,nullptr,nullptr,32,128,count,start,g,true,false,stream)==cudaSuccess)){
+                    gpu_check(rotate_gpu(work.index_q,32,128,count,start,g,true,false,stream));runtime.round(work.index_q,int64_t(count)*4096);}
                 if(runtime.options.arithmetic==Arithmetic::production)gpu_check(fake_quant_index_gpu(work.index_q,count*32,stream));
                 runtime.matmul(runtime.tensor(layer,"indexer.proj"),work.x,work.index_w,count,work);
                 if(layer>20 && candidate_epoch!=batch_epoch)throw std::runtime_error("DeepSeek candidate query epoch");

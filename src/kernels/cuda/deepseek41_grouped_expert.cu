@@ -473,6 +473,483 @@ __global__ void __launch_bounds__(128) mma_down_kernel(Work w, size_t down_offse
         if (n < g.tokens) parts[int64_t(slots[g.offset + n]) * 5120 + row + (e >= 2 ? 8 : 0)] = bf16r(acc[0][e]);
     }
 }
+// ---- Warp-specialized persistent decode MoE (bit-identical products to mma_gu_kernel / mma_down_kernel).
+// A work item is one m16 tile of one expert: gu = 8 features (tile rows 0-7 their gate rows, 8-15 their up rows),
+// down = 16 output rows. The tile's rows are contiguous, 16-byte aligned spans, so one producer thread streams them
+// into a shared-memory ring with cp.async.bulk + mbarrier while groups of four consumer warps compute one item each.
+// The four warps of a group take superblocks w, w+4, ... and reduce in warp order as mma_rows / mma_reduce do; every
+// output element is the same chain of m16n8k16 products in the same K order. Decode reads each lane's 16 superblock
+// bytes once, hoists the per-sub-block levels and takes the sign masks from a shared table (same BF16 bits).
+std::atomic<bool> grouped_ws{true};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define WS_ASM(...) do {} while (0)
+#else
+#define WS_ASM(...) asm volatile(__VA_ARGS__)
+#endif
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mbar_init(uint64_t* b, int count) {
+    WS_ASM("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(b)), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect(uint64_t* b, uint32_t bytes) {
+    WS_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_u32(b)), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(uint64_t* b) {
+    WS_ASM("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(smem_u32(b)) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t parity) {
+    WS_ASM("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}"
+           ::"r"(smem_u32(b)), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_load(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+    WS_ASM("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+           ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+}
+__device__ __forceinline__ uint32_t lds16(const uint8_t* p) { return *reinterpret_cast<const uint16_t*>(p); }
+__device__ __forceinline__ uint32_t lds32u(const uint8_t* p) {   // 2-byte aligned
+    return (reinterpret_cast<uintptr_t>(p) & 3) ? (lds16(p) | (lds16(p + 2) << 16)) : *reinterpret_cast<const uint32_t*>(p);
+}
+// One lane's view of a superblock: sub-blocks 2c and 2c+1.
+template<int Type> struct WsLane { uint32_t q[4]; uint32_t s[2]; float d; };
+template<int Type>
+__device__ __forceinline__ void ws_fetch(const uint8_t* blk, int c, WsLane<Type>& r) {
+    r.d = __half2float(*reinterpret_cast<const __half*>(blk));
+    if constexpr (Type == 16 || Type == 17) {
+        load16(blk + 2 + 16 * c, r.q);
+        if constexpr (Type == 17) r.s[0] = lds16(blk + 66 + 2 * c);
+    } else if constexpr (Type == 22) {
+        r.q[0] = lds32u(blk + 2 + 8 * c); r.q[1] = lds32u(blk + 6 + 8 * c);       // grid low bytes, ib 2c / 2c+1
+        r.q[2] = lds32u(blk + 34 + 8 * c); r.q[3] = lds32u(blk + 38 + 8 * c);     // signs
+        r.s[0] = lds16(blk + 66 + 2 * c);                                         // qh[2c], qh[2c+1]
+        r.s[1] = lds16(blk + 74 + 2 * c);                                         // scales[2c], scales[2c+1]
+    }
+}
+__device__ __forceinline__ void ws_levels(float d, uint32_t& a, uint32_t& b) {
+    const __nv_bfloat162 l01 = __floats2bfloat162_rn(d * 8.f, d * 25.f);
+    const __nv_bfloat162 l2 = __floats2bfloat162_rn(d * 43.f, 0.f);
+    a = *reinterpret_cast<const uint32_t*>(&l01); b = *reinterpret_cast<const uint32_t*>(&l2);
+}
+// lut[e] in registers: sign bit 2p -> bit 15 and 2p + 1 -> bit 31 of pair p. s * (2^(15-2p) + 2^(30-2p)) places the
+// two shifted copies without overlap, so for s < 1024 bits 15 and 31 hold exactly bits 2p and 2p + 1.
+__device__ __forceinline__ uint4 ws_mask(uint32_t s) {
+    constexpr uint32_t M = 0x80008000u;
+    return make_uint4((s * 0x40008000u) & M, (s * 0x10002000u) & M, (s * 0x04000800u) & M, (s * 0x01000200u) & M);
+}
+// ksign(v) for v < 128 up to bits 8-9, which ws_mask ignores.
+__device__ __forceinline__ uint32_t ws_ksign(uint32_t v) { return v | (uint32_t(__popc(v)) << 7); }
+__device__ __forceinline__ void ws_perm(uint32_t a, uint32_t b, uint64_t sel, const uint4 m, uint32_t (&out)[4]) {
+    const uint32_t lo = uint32_t(sel), hi = uint32_t(sel >> 32);
+    out[0] = __byte_perm(a, b, lo) ^ m.x;
+    out[1] = __byte_perm(a, b, lo >> 16) ^ m.y;
+    out[2] = __byte_perm(a, b, hi) ^ m.z;
+    out[3] = __byte_perm(a, b, hi >> 16) ^ m.w;
+}
+// The four BF16 pairs of decode8_pairs<Type>(blk, 2c + i, il) for il = 0..3 (one sub-block, 32 weights).
+// sel: the type's selector table in shared memory; lut: sign XOR masks, entries 0..127 for 7-bit signs with
+// llama.cpp's parity bit folded in (ksign), 128..383 for raw 8-bit signs.
+template<int Type>
+__device__ __forceinline__ void ws_sub(const WsLane<Type>& r, int i, const uint64_t* sel, const uint4* lut, uint32_t (&out)[4][4]) {
+    if constexpr (Type == 16) {
+        const uint32_t aux = r.q[2 * i + 1], grid = r.q[2 * i];
+        uint32_t a, b; ws_levels(r.d * (0.5f + (aux >> 28)) * 0.25f, a, b);
+#pragma unroll
+        for (int il = 0; il < 4; ++il)
+            ws_perm(a, b, sel[__byte_perm(grid, 0, 0x4440 + il)], ws_mask(ws_ksign((aux >> (7 * il)) & 127)), out[il]);
+    } else if constexpr (Type == 17) {
+        const uint32_t sc = (r.s[0] >> (8 * i)) & 255;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint32_t a, b; ws_levels(r.d * (0.5f + ((sc >> (4 * h)) & 15)) * 0.25f, a, b);
+            const uint32_t word = r.q[2 * i + h];
+            ws_perm(a, b, sel[word & 511], ws_mask(ws_ksign((word >> 9) & 127)), out[2 * h]);
+            ws_perm(a, b, sel[(word >> 16) & 511], ws_mask(ws_ksign(word >> 25)), out[2 * h + 1]);
+        }
+    } else {
+        static_assert(Type == 22);
+        const uint32_t sc = (r.s[1] >> (8 * i)) & 255, qh = (r.s[0] >> (8 * i)) & 255;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint32_t a, b; ws_levels(r.d * (0.5f + ((sc >> (4 * h)) & 15)) * 0.25f, a, b);
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const int il = 2 * h + k;
+                const uint32_t q = __byte_perm(r.q[i], 0, 0x4440 + il) | ((qh << (8 - 2 * il)) & 0x300);
+                ws_perm(a, b, sel[q], ws_mask(__byte_perm(r.q[2 + i], 0, 0x4440 + il)), out[il]);
+            }
+        }
+    }
+}
+// One tile (rows ra = gid, rb = gid + 8) over superblocks first, first+4, ...: mma_rows' product sequence.
+template<int Type, int Blocks, bool CG = false>
+__device__ __forceinline__ void ws_rows(const uint8_t* ra, const uint8_t* rb, const uint16_t* xr, bool valid, int c, int first,
+                                        const uint64_t* sel, const uint4* lut, float (&acc)[4]) {
+#pragma unroll 1
+    for (int sb = first; sb < Blocks; sb += 4) {
+        uint4 xb[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint4* xp = reinterpret_cast<const uint4*>(xr + sb * 256 + 8 * k);
+            xb[k] = valid ? (CG ? __ldcg(xp) : *xp) : make_uint4(0, 0, 0, 0);
+        }
+        const uint8_t* ba = ra + sb * Fmt<Type>::bytes;
+        const uint8_t* bb = rb + sb * Fmt<Type>::bytes;
+        if constexpr (Type == 18) {
+#pragma unroll
+            for (int g8 = 0; g8 < 8; ++g8) {
+                uint32_t wa[4], wb[4];
+                decode8_pairs<Type>(ba, 2 * c + g8 / 4, g8 % 4, wa);
+                decode8_pairs<Type>(bb, 2 * c + g8 / 4, g8 % 4, wb);
+                const uint32_t xw[4] = {xb[g8].x, xb[g8].y, xb[g8].z, xb[g8].w};
+#pragma unroll
+                for (int q = 0; q < 2; ++q) mma16816(acc, wa[2 * q], wb[2 * q], wa[2 * q + 1], wb[2 * q + 1], xw[2 * q], xw[2 * q + 1]);
+            }
+        } else {
+            WsLane<Type> la, lb;
+            ws_fetch<Type>(ba, c, la);
+            ws_fetch<Type>(bb, c, lb);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                uint32_t wa[4][4], wb[4][4];
+                ws_sub<Type>(la, i, sel, lut, wa);
+                ws_sub<Type>(lb, i, sel, lut, wb);
+#pragma unroll
+                for (int il = 0; il < 4; ++il) {
+                    const uint4 xv = xb[4 * i + il];
+                    const uint32_t xw[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        mma16816(acc, wa[il][2 * q], wb[il][2 * q], wa[il][2 * q + 1], wb[il][2 * q + 1], xw[2 * q], xw[2 * q + 1]);
+                }
+            }
+        }
+    }
+}
+__device__ __forceinline__ void ws_reduce(float (&acc)[4], float* part, int wg, int bar) {
+    const int lane = threadIdx.x & 31;
+    if (wg) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) part[((wg - 1) * 4 + e) * 32 + lane] = acc[e];
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+    if (!wg) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[e] = ((acc[e] + part[(0 * 4 + e) * 32 + lane]) + part[(1 * 4 + e) * 32 + lane]) + part[(2 * 4 + e) * 32 + lane];
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+}
+struct WsWork { Desc g[kMaxGroups]; int count; };
+template<int Type, bool GU, int T = 1> __host__ __device__ constexpr int ws_slot() { return 16 * T * (GU ? 20 : 9) * Fmt<Type>::bytes; }
+template<int Type> __host__ __device__ constexpr int ws_selectors() { return Type == 16 ? 256 : Type == 17 ? 512 : Type == 22 ? 1024 : 0; }
+template<int Type, bool GU, int NS, int G, int T = 1>
+__host__ __device__ constexpr size_t ws_smem() {
+    return size_t(NS) * ws_slot<Type, GU, T>() + 384 * 16 + ws_selectors<Type>() * 8 + size_t(NS) * T * 4 * 4 * 32 * 4 + 2 * NS * 8 + NS * 8;
+}
+template<int Type, bool GU, int NS, int G, int T = 1>
+__global__ void __launch_bounds__(32 * (4 * G + 1), 1) ws_kernel(WsWork w, size_t up_offset, size_t offset, const uint16_t* x,
+                                                                 const int* token_rows, const float* routing, const int* slots,
+                                                                 uint16_t* activation, float* parts) {
+    static_assert(!GU || T == 1, "gu items are one tile");
+    constexpr int BLOCKS = GU ? 20 : 9, RB = BLOCKS * Fmt<Type>::bytes, SLOT = ws_slot<Type, GU, T>();
+    constexpr int PER = GU ? 2304 / 8 : 5120 / (16 * T);
+    static_assert(SLOT % 16 == 0 && (8 * RB) % 16 == 0, "bulk copy granularity");
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint8_t* ring = smem;
+    uint4* lut = reinterpret_cast<uint4*>(smem + NS * SLOT);
+    uint64_t* sel = reinterpret_cast<uint64_t*>(lut + 384);
+    float* part = reinterpret_cast<float*>(sel + ws_selectors<Type>());           // [NS][T][4 roles][4][32]
+    uint64_t* full = reinterpret_cast<uint64_t*>(part + NS * T * 4 * 4 * 32);
+    uint64_t* empty = full + NS;
+    unsigned* done = reinterpret_cast<unsigned*>(empty + NS);
+    // seq[slot]: the CTA-local item whose load is armed in the slot's current mbarrier phase. A consumer waits for it
+    // before the parity wait, so it never tests a phase two ahead (which parity cannot distinguish).
+    volatile int* seq = reinterpret_cast<volatile int*>(done + NS);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int items = w.count * PER;
+    const int mine = items > int(blockIdx.x) ? (items - 1 - int(blockIdx.x)) / int(gridDim.x) + 1 : 0;
+    for (int e = threadIdx.x; e < 384; e += blockDim.x) {
+        const uint32_t s = e < 128 ? ksign(uint32_t(e)) : uint32_t(e - 128);
+        uint32_t m[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) m[p] = (((s >> (2 * p)) & 1u) << 15) | (((s >> (2 * p + 1)) & 1u) << 31);
+        lut[e] = make_uint4(m[0], m[1], m[2], m[3]);
+    }
+    if constexpr (ws_selectors<Type>() > 0) {
+        const uint64_t* table = Type == 16 ? iq2_levels::iq2xxs_selectors : Type == 17 ? iq2_levels::iq2xs_selectors : iq2_levels::iq2s_selectors;
+        for (int e = threadIdx.x; e < ws_selectors<Type>(); e += blockDim.x) sel[e] = table[e];
+    }
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < NS; ++s) { mbar_init(full + s, 1); mbar_init(empty + s, 4); done[s] = 0; seq[s] = -1; }
+        WS_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    if (warp == 4 * G) {
+        if (lane == 0) {
+            for (int j = 0; j < mine; ++j) {
+                const int slot = j % NS, use = j / NS;
+                if (use) mbar_wait(empty + slot, (use - 1) & 1);
+                const int item = int(blockIdx.x) + j * int(gridDim.x);
+                const Desc g = w.g[item / PER];
+                uint8_t* dst = ring + slot * SLOT;
+                mbar_expect(full + slot, SLOT);
+                seq[slot] = j;
+                if constexpr (GU) {
+                    const size_t f0 = size_t(item % PER) * 8 * RB;
+                    bulk_load(dst, g.packed + f0, 8 * RB, full + slot);
+                    bulk_load(dst + 8 * RB, g.packed + up_offset + f0, 8 * RB, full + slot);
+                } else {
+                    bulk_load(dst, g.packed + offset + size_t(item % PER) * SLOT, SLOT, full + slot);
+                }
+            }
+        }
+        return;
+    }
+    const int group = warp >> 2, wg = warp & 3, gid = lane >> 2, c = lane & 3;
+    for (int j = group, t = 0; j < mine; j += G, ++t) {
+        const int item = int(blockIdx.x) + j * int(gridDim.x);
+        const Desc g = w.g[item / PER];
+        const bool valid = gid < g.tokens;
+        const int slot = j % NS, role = (wg + t) & 3;
+        while (seq[slot] != j) __nanosleep(32);
+        mbar_wait(full + slot, (j / NS) & 1);
+        const uint16_t* xr = GU ? x + (valid ? int64_t(token_rows[g.offset + gid]) * 5120 : 0) + 64 * c
+                                : x + int64_t(g.offset + (valid ? gid : 0)) * 2304 + 64 * c;
+        float acc[T][4] = {};
+#pragma unroll
+        for (int tt = 0; tt < T; ++tt) {
+            const uint8_t* ra = ring + slot * SLOT + (16 * tt + gid) * RB;
+            ws_rows<Type, BLOCKS>(ra, ra + 8 * RB, xr, valid, c, role, sel, lut, acc[tt]);
+        }
+        // Role r's partial is warp r's partial of mma_rows; the last of the four reduces in role order.
+        float* sp = part + slot * T * 4 * 4 * 32;
+#pragma unroll
+        for (int tt = 0; tt < T; ++tt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sp[((tt * 4 + role) * 4 + e) * 32 + lane] = acc[tt][e];
+        __threadfence_block();
+        __syncwarp();
+        unsigned arrived = 0;
+        if (lane == 0) arrived = atomicAdd(done + slot, 1u);
+        arrived = __shfl_sync(0xffffffff, arrived, 0);
+        if (arrived == 3) {
+            __threadfence_block();
+#pragma unroll
+            for (int tt = 0; tt < T; ++tt) {
+                const float* q = sp + tt * 4 * 4 * 32;
+                float r[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    r[e] = ((q[(0 * 4 + e) * 32 + lane] + q[(1 * 4 + e) * 32 + lane]) + q[(2 * 4 + e) * 32 + lane]) + q[(3 * 4 + e) * 32 + lane];
+                if constexpr (GU) {
+                    const int feature = (item % PER) * 8 + gid;
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const int n = 2 * c + e;
+                        if (n >= g.tokens) continue;
+                        const float v = fminf(bf16r(r[e]), 10.f);
+                        const float u = fminf(fmaxf(bf16r(r[e + 2]), -10.f), 10.f);
+                        const float sig = v >= 0 ? 1.f / (1.f + expf(-v)) : expf(v) / (1.f + expf(v));
+                        const int slotr = g.offset + n;
+                        const float a = bf16r(v * sig * u * routing[slotr]);
+                        activation[int64_t(slotr) * 2304 + feature] = uint16_t(__float_as_uint(a) >> 16);
+                    }
+                } else {
+                    const int row = (item % PER) * 16 * T + 16 * tt + gid;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const int n = 2 * c + (e & 1);
+                        if (n < g.tokens) parts[int64_t(slots[g.offset + n]) * 5120 + row + (e >= 2 ? 8 : 0)] = bf16r(r[e]);
+                    }
+                }
+            }
+            if (lane == 0) done[slot] = 0;
+            __syncwarp();
+        }
+        if (lane == 0) mbar_arrive(empty + slot);
+    }
+}
+template<int Type, bool GU, int NS, int G, int T = 1>
+void ws_launch(const WsWork& w, size_t up_offset, size_t offset, const uint16_t* x, const int* token_rows, const float* routing,
+               const int* slots, uint16_t* activation, float* parts, cudaStream_t stream) {
+    static_assert(ws_smem<Type, GU, NS, G, T>() <= 101376, "shared memory");
+    static int sms = [] { int d = 0, v = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, d); return v; }();
+    static bool configured = [] {
+        return cudaFuncSetAttribute(ws_kernel<Type, GU, NS, G, T>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(ws_smem<Type, GU, NS, G, T>())) == cudaSuccess;
+    }();
+    (void)configured;
+    const int items = w.count * (GU ? 2304 / 8 : 5120 / (16 * T));
+    ws_kernel<Type, GU, NS, G, T><<<std::min(items, sms), 32 * (4 * G + 1), ws_smem<Type, GU, NS, G, T>(), stream>>>(
+        w, up_offset, offset, x, token_rows, routing, slots, activation, parts);
+}
+
+// ---- gu and down in one persistent kernel: items [0, count*288) are gu tiles, then count*320 down tiles. The producer
+// streams down weights as soon as slots free (they do not depend on gu); a down tile's consumers wait until all 288 gu
+// tiles of its expert have published (a monotonic per-launch target), then read H through L2.
+__device__ unsigned long long ws_ready[kMaxGroups];
+__device__ __forceinline__ const uint64_t* ws_global_selectors(int type) {
+    return type == 16 ? iq2_levels::iq2xxs_selectors : type == 17 ? iq2_levels::iq2xs_selectors : iq2_levels::iq2s_selectors;
+}
+template<int GT, int DT> __host__ __device__ constexpr bool wsf_shared_down() { return DT == GT && ws_selectors<GT>() > 0 && GT != 22; }
+template<int GT, int DT, int NS, int G>
+__host__ __device__ constexpr size_t wsf_smem() {
+    return size_t(NS) * ws_slot<GT, true>() + 384 * 16 + (GT == 22 ? 0 : ws_selectors<GT>() * 8) + size_t(NS) * 4 * 4 * 32 * 4 +
+           2 * NS * 8 + NS * 4;
+}
+template<int GT, int DT, int NS, int G>
+__global__ void __launch_bounds__(32 * (4 * G + 1), 1) wsf_kernel(WsWork w, size_t up_offset, size_t down_offset, const uint16_t* x,
+                                                                  const int* token_rows, const float* routing, const int* slots,
+                                                                  uint16_t* activation, float* parts, unsigned long long target) {
+    constexpr int RBG = 20 * Fmt<GT>::bytes, RBD = 9 * Fmt<DT>::bytes, SLOT = ws_slot<GT, true>(), SLOTD = ws_slot<DT, false>();
+    static_assert(SLOT >= SLOTD && SLOT % 16 == 0 && SLOTD % 16 == 0 && (8 * RBG) % 16 == 0, "slot layout");
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint8_t* ring = smem;
+    uint4* lut = reinterpret_cast<uint4*>(smem + NS * SLOT);
+    uint64_t* sel = reinterpret_cast<uint64_t*>(lut + 384);
+    float* part = reinterpret_cast<float*>(sel + (GT == 22 ? 0 : ws_selectors<GT>()));
+    uint64_t* full = reinterpret_cast<uint64_t*>(part + NS * 4 * 4 * 32);
+    uint64_t* empty = full + NS;
+    unsigned* done = reinterpret_cast<unsigned*>(empty + NS);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int ngu = w.count * 288, items = ngu + w.count * 320;
+    const int mine = items > int(blockIdx.x) ? (items - 1 - int(blockIdx.x)) / int(gridDim.x) + 1 : 0;
+    for (int e = threadIdx.x; e < 384; e += blockDim.x) {
+        const uint32_t s = e < 128 ? ksign(uint32_t(e)) : uint32_t(e - 128);
+        uint32_t m[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) m[p] = (((s >> (2 * p)) & 1u) << 15) | (((s >> (2 * p + 1)) & 1u) << 31);
+        lut[e] = make_uint4(m[0], m[1], m[2], m[3]);
+    }
+    if constexpr (GT != 22) {
+        const uint64_t* table = ws_global_selectors(GT);
+        for (int e = threadIdx.x; e < ws_selectors<GT>(); e += blockDim.x) sel[e] = table[e];
+    }
+    if (threadIdx.x == 0) {
+        for (int s = 0; s < NS; ++s) { mbar_init(full + s, 1); mbar_init(empty + s, 4); done[s] = 0; }
+        WS_ASM("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+    if (warp == 4 * G) {
+        if (lane == 0) {
+            for (int j = 0; j < mine; ++j) {
+                const int slot = j % NS, use = j / NS;
+                if (use) mbar_wait(empty + slot, (use - 1) & 1);
+                const int item = int(blockIdx.x) + j * int(gridDim.x);
+                uint8_t* dst = ring + slot * SLOT;
+                if (item < ngu) {
+                    const Desc g = w.g[item / 288];
+                    const size_t f0 = size_t(item % 288) * 8 * RBG;
+                    mbar_expect(full + slot, SLOT);
+                    bulk_load(dst, g.packed + f0, 8 * RBG, full + slot);
+                    bulk_load(dst + 8 * RBG, g.packed + up_offset + f0, 8 * RBG, full + slot);
+                } else {
+                    const int d = item - ngu;
+                    const Desc g = w.g[d / 320];
+                    mbar_expect(full + slot, SLOTD);
+                    bulk_load(dst, g.packed + down_offset + size_t(d % 320) * SLOTD, SLOTD, full + slot);
+                }
+            }
+        }
+        return;
+    }
+    const uint64_t* gsel = GT == 22 ? ws_global_selectors(22) : sel;
+    const uint64_t* dsel = wsf_shared_down<GT, DT>() ? sel : ws_global_selectors(DT);
+    const int group = warp >> 2, wg = warp & 3, gid = lane >> 2, c = lane & 3;
+    for (int j = group, t = 0; j < mine; j += G, ++t) {
+        const int item = int(blockIdx.x) + j * int(gridDim.x);
+        const bool gu = item < ngu;
+        const int gi = gu ? item / 288 : (item - ngu) / 320, tile = gu ? item % 288 : (item - ngu) % 320;
+        const Desc g = w.g[gi];
+        const bool valid = gid < g.tokens;
+        const int slot = j % NS, role = (wg + t) & 3;
+        mbar_wait(full + slot, (j / NS) & 1);
+        float acc[4] = {};
+        if (gu) {
+            const uint8_t* ra = ring + slot * SLOT + gid * RBG;
+            const uint16_t* xr = x + (valid ? int64_t(token_rows[g.offset + gid]) * 5120 : 0) + 64 * c;
+            ws_rows<GT, 20>(ra, ra + 8 * RBG, xr, valid, c, role, gsel, lut, acc);
+        } else {
+            if (lane == 0) {
+                const volatile unsigned long long* r = ws_ready + gi;
+                while (*r < target) __nanosleep(64);
+            }
+            __syncwarp();
+            __threadfence();
+            const uint8_t* ra = ring + slot * SLOT + gid * RBD;
+            const uint16_t* xr = activation + int64_t(g.offset + (valid ? gid : 0)) * 2304 + 64 * c;
+            if constexpr (DT == 18) ws_rows<18, 9, true>(ra, ra + 8 * RBD, xr, valid, c, role, nullptr, lut, acc);
+            else ws_rows<DT, 9, true>(ra, ra + 8 * RBD, xr, valid, c, role, dsel, lut, acc);
+        }
+        float* sp = part + slot * 4 * 4 * 32;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) sp[(role * 4 + e) * 32 + lane] = acc[e];
+        __threadfence_block();
+        __syncwarp();
+        unsigned arrived = 0;
+        if (lane == 0) arrived = atomicAdd(done + slot, 1u);
+        arrived = __shfl_sync(0xffffffff, arrived, 0);
+        if (arrived == 3) {
+            __threadfence_block();
+            float r[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                r[e] = ((sp[(0 * 4 + e) * 32 + lane] + sp[(1 * 4 + e) * 32 + lane]) + sp[(2 * 4 + e) * 32 + lane]) + sp[(3 * 4 + e) * 32 + lane];
+            if (gu) {
+                const int feature = tile * 8 + gid;
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int n = 2 * c + e;
+                    if (n >= g.tokens) continue;
+                    const float v = fminf(bf16r(r[e]), 10.f);
+                    const float u = fminf(fmaxf(bf16r(r[e + 2]), -10.f), 10.f);
+                    const float sig = v >= 0 ? 1.f / (1.f + expf(-v)) : expf(v) / (1.f + expf(v));
+                    const int slotr = g.offset + n;
+                    const float a = bf16r(v * sig * u * routing[slotr]);
+                    activation[int64_t(slotr) * 2304 + feature] = uint16_t(__float_as_uint(a) >> 16);
+                }
+                __threadfence();
+                __syncwarp();
+                if (lane == 0) atomicAdd(ws_ready + gi, 1ull);
+            } else {
+                const int row = tile * 16 + gid;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int n = 2 * c + (e & 1);
+                    if (n < g.tokens) parts[int64_t(slots[g.offset + n]) * 5120 + row + (e >= 2 ? 8 : 0)] = bf16r(r[e]);
+                }
+            }
+            if (lane == 0) done[slot] = 0;
+            __syncwarp();
+        }
+        if (lane == 0) mbar_arrive(empty + slot);
+    }
+}
+std::atomic<bool> grouped_ws_fused{false};
+template<int GT, int DT, int NS, int G>
+void wsf_launch(const WsWork& w, size_t up_offset, size_t down_offset, const uint16_t* x, const int* token_rows, const float* routing,
+                const int* slots, uint16_t* activation, float* parts, cudaStream_t stream) {
+    static_assert(wsf_smem<GT, DT, NS, G>() <= 101376, "shared memory");
+    static int sms = [] { int d = 0, v = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, d); return v; }();
+    static bool configured = [] {
+        return cudaFuncSetAttribute(wsf_kernel<GT, DT, NS, G>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(wsf_smem<GT, DT, NS, G>())) == cudaSuccess;
+    }();
+    (void)configured;
+    static unsigned long long epoch[16] = {};
+    int dev = 0; cudaGetDevice(&dev);
+    const unsigned long long target = ++epoch[dev & 15] * 288ull;
+    const int items = w.count * (288 + 320);
+    wsf_kernel<GT, DT, NS, G><<<std::min(items, sms), 32 * (4 * G + 1), wsf_smem<GT, DT, NS, G>(), stream>>>(
+        w, up_offset, down_offset, x, token_rows, routing, slots, activation, parts, target);
+}
+template<int GT, int NS, int G>
+bool wsf_dispatch(uint32_t down_type, const WsWork& w, size_t up_offset, size_t down_offset, const uint16_t* x, const int* token_rows,
+                  const float* routing, const int* slots, uint16_t* activation, float* parts, cudaStream_t stream) {
+    switch (down_type) {
+        case 16: wsf_launch<GT, 16, NS, G>(w, up_offset, down_offset, x, token_rows, routing, slots, activation, parts, stream); return true;
+        case 17: wsf_launch<GT, 17, NS, G>(w, up_offset, down_offset, x, token_rows, routing, slots, activation, parts, stream); return true;
+        case 18: wsf_launch<GT, 18, NS, G>(w, up_offset, down_offset, x, token_rows, routing, slots, activation, parts, stream); return true;
+        case 22: wsf_launch<GT, 22, NS, G>(w, up_offset, down_offset, x, token_rows, routing, slots, activation, parts, stream); return true;
+    }
+    return false;
+}
 template<int Type, bool B>
 void launch_gu(int n, const Work& w, size_t up_offset, const void* x, const int* token_rows, const float* routing,
                void* activation, cudaStream_t stream) {
@@ -499,6 +976,8 @@ void expert_grouped_set_enabled(bool value) { grouped_enabled.store(value); }
 void expert_grouped_bf16_inputs_set_enabled(bool value) { grouped_bf16_inputs.store(value); }
 void expert_grouped_mma_set_enabled(bool value) { grouped_mma.store(value); }
 void expert_grouped_mma_wide_set_enabled(bool value) { grouped_mma_wide.store(value); }
+void expert_grouped_ws_set_enabled(bool value) { grouped_ws.store(value); }
+void expert_grouped_ws_fused_set_enabled(bool value) { grouped_ws_fused.store(value); }
 bool expert_grouped_mma_enabled() { return grouped_mma.load(); }
 bool expert_grouped_enabled() { return grouped_enabled.load(); }
 bool expert_grouped_supported(uint32_t gu, uint32_t down) {
@@ -543,6 +1022,40 @@ cudaError_t expert_grouped_gpu(const VerifyExpertGroup* groups, int count, uint3
         const bool wd = grouped_mma_wide.load();
         to_bf16_kernel4<<<(tokens * 5120 / 4 + 255) / 256, 256, 0, stream>>>(x, static_cast<uint16_t*>(scratch), tokens * 5120);
         auto* act = reinterpret_cast<uint16_t*>(activation);
+        static const bool ws_device = [] { int d = 0, v = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, d); return v >= 9; }();
+        if (ws_device && grouped_ws.load() && !wd && (up_offset & 15) == 0 && (down_offset & 15) == 0) {
+            bool aligned = true;
+            for (int i = 0; i < count; ++i) aligned &= (reinterpret_cast<uintptr_t>(groups[i].packed) & 15) == 0;
+            if (aligned) {
+                WsWork ws;
+                ws.count = count;
+                for (int i = 0; i < count; ++i) ws.g[i] = mg.g[i];
+                const auto* xs = static_cast<const uint16_t*>(scratch);
+                cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+                if (grouped_ws_fused.load() && cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+                    capture == cudaStreamCaptureStatusNone) {
+                    bool launched = false;
+                    switch (gu_type) {
+                        case 16: launched = wsf_dispatch<16, 4, 3>(down_type, ws, up_offset, down_offset, xs, token_rows, routing, slots, act, parts, stream); break;
+                        case 17: launched = wsf_dispatch<17, 3, 2>(down_type, ws, up_offset, down_offset, xs, token_rows, routing, slots, act, parts, stream); break;
+                        case 22: launched = wsf_dispatch<22, 3, 2>(down_type, ws, up_offset, down_offset, xs, token_rows, routing, slots, act, parts, stream); break;
+                    }
+                    if (launched) return cudaGetLastError();
+                }
+                switch (gu_type) {
+                    case 16: ws_launch<16, true, 4, 3>(ws, up_offset, 0, xs, token_rows, routing, slots, act, parts, stream); break;
+                    case 17: ws_launch<17, true, 3, 2>(ws, up_offset, 0, xs, token_rows, routing, slots, act, parts, stream); break;
+                    case 22: ws_launch<22, true, 3, 2>(ws, up_offset, 0, xs, token_rows, routing, slots, act, parts, stream); break;
+                }
+                switch (down_type) {
+                    case 16: ws_launch<16, false, 8, 4, 1>(ws, 0, down_offset, act, token_rows, routing, slots, act, parts, stream); break;
+                    case 17: ws_launch<17, false, 7, 4, 1>(ws, 0, down_offset, act, token_rows, routing, slots, act, parts, stream); break;
+                    case 18: ws_launch<18, false, 5, 4, 1>(ws, 0, down_offset, act, token_rows, routing, slots, act, parts, stream); break;
+                    case 22: ws_launch<22, false, 6, 4, 1>(ws, 0, down_offset, act, token_rows, routing, slots, act, parts, stream); break;
+                }
+                return cudaGetLastError();
+            }
+        }
         switch (gu_type) {
 #define G(T) case T: if (T == 16 && wd) mma_gu_kernel<T, true><<<mg.first[count], 128, 0, stream>>>(mg, up_offset, static_cast<const uint16_t*>(scratch), token_rows, routing, act); \
                      else mma_gu_kernel<T, false><<<mg.first[count], 128, 0, stream>>>(mg, up_offset, static_cast<const uint16_t*>(scratch), token_rows, routing, act); break;

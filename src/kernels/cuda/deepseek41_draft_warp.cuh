@@ -64,14 +64,20 @@ __global__ void __launch_bounds__(128) draft_down_warp(const uint8_t* experts,ui
 namespace draft_dedup {
 using draft_warp::bf16;using draft_warp::sigmoid;using draft_warp::weight_pair;
 constexpr int kMaxJobs=7;
+// E2M1 magnitude m in {0,1,2,3,4,6,8,12} times 2^(scale-128): for m != 0 the product's bits are bits(m) + (scale-128) << 23
+// (exact, normal range for 2 <= scale < 253), so the value is built from a table of bits(m) without a conversion or
+// multiply; m == 0 gives +-0 as before.
 __device__ __forceinline__ float2 mx_pair(const uint8_t* p,int64_t i){
     p+=(i/32)*17;const int shift=(i%32)/16*4,offset=1+i%16;const uint32_t scale=p[0];
     const uint32_t q0=(p[offset]>>shift)&15,q1=(p[offset+1]>>shift)&15;
     if(scale<2||scale>=253)return weight_pair(p-(i/32)*17,false,i);
-    const float s=__uint_as_float((scale-1)<<23);
-    const float a=__uint_as_float(__float_as_uint(float((0xC8643210u>>((q0&7)*4))&15)*s)|((q0&8)<<28));
-    const float b=__uint_as_float(__float_as_uint(float((0xC8643210u>>((q1&7)*4))&15)*s)|((q1&8)<<28));
-    return make_float2(a,b);
+    const uint32_t eb=(scale-128u)<<23;
+    // bits(m) for m = 0..7 -> {0,1,2,3,4,6,8,12}: top halves 0x0000 0x3F80 0x4000 0x4040 0x4080 0x40C0 0x4100 0x4140
+    constexpr uint64_t T=0x4140410040C04080ull,U=0x404040003F800000ull;   // m 4..7 in T, 0..3 in U (16 bits each)
+    const uint32_t m0=q0&7u,m1=q1&7u;
+    const uint32_t h0=uint32_t(((m0<4?U:T)>>(16*(m0&3)))&0xffffu),h1=uint32_t(((m1<4?U:T)>>(16*(m1&3)))&0xffffu);
+    const uint32_t a=(m0?(h0<<16)+eb:0u)|((q0&8u)<<28),b=(m1?(h1<<16)+eb:0u)|((q1&8u)<<28);
+    return make_float2(__uint_as_float(a),__uint_as_float(b));
 }
 __device__ __forceinline__ float2 any_pair(const uint8_t* p,bool shared,int64_t i){
     if(shared){const uint32_t bits=*reinterpret_cast<const uint32_t*>(p+2*i);return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bits));}
@@ -107,13 +113,21 @@ __device__ void gu_rows(const uint8_t* gate,const uint8_t* up,bool shared,int64_
     float g[N]{},u[N]{};const float* xs[N];
     #pragma unroll
     for(int n=0;n<N;++n)xs[n]=x+int64_t(j.token(first+n))*5120;
-    #pragma unroll 4
-    for(int col=lane*2;col<5120;col+=64){
-        const float2 gv=any_pair(gate,shared,base+col),uv=any_pair(up,shared,base+col);
+    // Weights of 8 iterations are loaded before their products (more loads in flight); products and order unchanged.
+    constexpr int U=8;
+    #pragma unroll 1
+    for(int col0=lane*2;col0<5120;col0+=64*U){
+        float2 gv[U],uv[U];
         #pragma unroll
-        for(int n=0;n<N;++n){
-            const float2 v=*reinterpret_cast<const float2*>(xs[n]+col);
-            g[n]=fmaf(gv.x,v.x,g[n]);g[n]=fmaf(gv.y,v.y,g[n]);u[n]=fmaf(uv.x,v.x,u[n]);u[n]=fmaf(uv.y,v.y,u[n]);
+        for(int k=0;k<U;++k){gv[k]=any_pair(gate,shared,base+col0+64*k);uv[k]=any_pair(up,shared,base+col0+64*k);}
+        #pragma unroll
+        for(int k=0;k<U;++k){
+            const int col=col0+64*k;
+            #pragma unroll
+            for(int n=0;n<N;++n){
+                const float2 v=*reinterpret_cast<const float2*>(xs[n]+col);
+                g[n]=fmaf(gv[k].x,v.x,g[n]);g[n]=fmaf(gv[k].y,v.y,g[n]);u[n]=fmaf(uv[k].x,v.x,u[n]);u[n]=fmaf(uv[k].y,v.y,u[n]);
+            }
         }
     }
     #pragma unroll
@@ -129,12 +143,19 @@ __device__ void down_rows(const uint8_t* w,bool shared,int64_t base,const float*
     float y[N]{};const float* as[N];
     #pragma unroll
     for(int n=0;n<N;++n)as[n]=act+int64_t(j.job(first+n))*2304;
-    #pragma unroll 4
-    for(int col=lane*2;col<2304;col+=64){
-        const float2 q=any_pair(w,shared,base+col);
+    constexpr int U=6;
+    #pragma unroll 1
+    for(int col0=lane*2;col0<2304;col0+=64*U){
+        float2 q[U];
         #pragma unroll
-        for(int n=0;n<N;++n){const float2 v=*reinterpret_cast<const float2*>(as[n]+col);
-            y[n]=fmaf(q.x,v.x,y[n]);y[n]=fmaf(q.y,v.y,y[n]);}
+        for(int k=0;k<U;++k)q[k]=any_pair(w,shared,base+col0+64*k);
+        #pragma unroll
+        for(int k=0;k<U;++k){
+            const int col=col0+64*k;
+            #pragma unroll
+            for(int n=0;n<N;++n){const float2 v=*reinterpret_cast<const float2*>(as[n]+col);
+                y[n]=fmaf(q[k].x,v.x,y[n]);y[n]=fmaf(q[k].y,v.y,y[n]);}
+        }
     }
     #pragma unroll
     for(int n=0;n<N;++n)for(int delta=16;delta;delta>>=1)y[n]+=__shfl_down_sync(0xffffffff,y[n],delta);
@@ -146,6 +167,7 @@ __device__ void down_rows(const uint8_t* w,bool shared,int64_t base,const float*
 #define DRAFT_DEDUP_DISPATCH(F,...) do{for(int first=0;first<j.count();first+=kMaxJobs){switch(min(kMaxJobs,j.count()-first)){ \
     case 1:F<1>(__VA_ARGS__);break;case 2:F<2>(__VA_ARGS__);break;case 3:F<3>(__VA_ARGS__);break;case 4:F<4>(__VA_ARGS__);break; \
     case 5:F<5>(__VA_ARGS__);break;case 6:F<6>(__VA_ARGS__);break;default:F<7>(__VA_ARGS__);break;}}}while(0)
+template<bool Stage>
 __global__ void __launch_bounds__(128,8) gu(const uint8_t* experts,uint64_t projection,const uint8_t* sg,const uint8_t* su,
     const float* x,const int* ids,const int* desc,float* activation,int tokens){
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*4+warp;
@@ -156,14 +178,28 @@ __global__ void __launch_bounds__(128,8) gu(const uint8_t* experts,uint64_t proj
         return;
     }
     const uint8_t* gate=experts+uint64_t(j.expert())*3*projection+uint64_t(row)*2720;
-    DRAFT_DEDUP_DISPATCH(gu_rows,gate,gate+projection,false,0,x,j,first,row,lane,activation);
+    if constexpr(!Stage){DRAFT_DEDUP_DISPATCH(gu_rows,gate,gate+projection,false,0,x,j,first,row,lane,activation);return;}
+    // The warp's two MXFP4 rows into shared memory with 16-byte loads; the products read the same bytes from there.
+    __shared__ __align__(16) uint8_t rows_smem[4][2][2720];
+    {const uint4* gs=reinterpret_cast<const uint4*>(gate);const uint4* us=reinterpret_cast<const uint4*>(gate+projection);
+     uint4* gd=reinterpret_cast<uint4*>(rows_smem[warp][0]);uint4* ud=reinterpret_cast<uint4*>(rows_smem[warp][1]);
+     for(int i=lane;i<2720/16;i+=32){gd[i]=__ldg(gs+i);ud[i]=__ldg(us+i);}
+     __syncwarp();}
+    DRAFT_DEDUP_DISPATCH(gu_rows,rows_smem[warp][0],rows_smem[warp][1],false,0,x,j,first,row,lane,activation);
 }
+template<bool Stage>
 __global__ void __launch_bounds__(128,8) down(const uint8_t* experts,uint64_t projection,const uint8_t* sd,const int* ids,
     const float* act,const int* desc,float* parts,int tokens){
     const int lane=threadIdx.x&31,warp=threadIdx.x>>5,row=blockIdx.x*4+warp;
     const Jobs j{desc+blockIdx.y*kDesc};if(j.expert()==-2)return;
     if(j.expert()<0){DRAFT_DEDUP_DISPATCH(down_rows,sd,true,int64_t(row)*2304,act,j,first,row,lane,parts);return;}
-    DRAFT_DEDUP_DISPATCH(down_rows,experts+(uint64_t(j.expert())*3+2)*projection+uint64_t(row)*1224,false,0,act,j,first,row,lane,parts);
+    if constexpr(!Stage){DRAFT_DEDUP_DISPATCH(down_rows,experts+(uint64_t(j.expert())*3+2)*projection+uint64_t(row)*1224,false,0,act,j,first,row,lane,parts);return;}
+    __shared__ __align__(16) uint8_t rows_smem[4][1224];
+    {const uint2* src=reinterpret_cast<const uint2*>(experts+(uint64_t(j.expert())*3+2)*projection+uint64_t(row)*1224);
+     uint2* dst=reinterpret_cast<uint2*>(rows_smem[warp]);
+     for(int i=lane;i<1224/8;i+=32)dst[i]=__ldg(src+i);
+     __syncwarp();}
+    DRAFT_DEDUP_DISPATCH(down_rows,rows_smem[warp],false,0,act,j,first,row,lane,parts);
 }
 #undef DRAFT_DEDUP_DISPATCH
 __global__ void combine(const float* parts,const int* ids,float* out,int tokens){

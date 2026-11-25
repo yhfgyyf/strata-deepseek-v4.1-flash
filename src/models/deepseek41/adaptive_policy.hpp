@@ -28,7 +28,10 @@ inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
     if(heat.size()!=keys||slots.size()!=keys||offsets.size()!=keys||(recent&&recent->size()!=keys))
         throw std::invalid_argument("adaptive selection table sizes");
     struct Ranked { double value;ExpertKey key; };
-    std::array<std::vector<Ranked>,40> candidates,victims;
+    // Reused per thread: building ~15K ranked entries in fresh vectors each verify window costs as much as ranking.
+    thread_local std::array<std::vector<Ranked>,40> candidates,victims;
+    for(auto& v:candidates)v.clear();
+    for(auto& v:victims)v.clear();
     for(int l=0;l<40;++l)for(int e=0;e<384;++e){
         const int k=l*384+e,g=grouped?(layout_groups?layout_groups->at(l):adaptive_group(l)):l;
         if(g<0||g>=40)throw std::invalid_argument("adaptive format group ID");
@@ -37,11 +40,24 @@ inline std::vector<AdaptiveExchange> choose_adaptive_exchanges(
         else if((recent?recent->at(k)!=0:heat[k]>=2.0)&&offsets[k]!=no_ram)candidates[g].push_back({heat[k],{l,e}});
     }
     std::vector<AdaptiveExchange> choices;
+    const auto hotter=[](const Ranked& a,const Ranked& b){return a.value!=b.value?a.value>b.value:a.key<b.key;};
+    const auto colder=[](const Ranked& a,const Ranked& b){return a.value!=b.value?a.value<b.value:a.key<b.key;};
     for(int g=0;g<40;++g){
         auto& in=candidates[g];auto& out=victims[g];
-        std::sort(in.begin(),in.end(),[](auto a,auto b){return a.value!=b.value?a.value>b.value:a.key<b.key;});
-        std::sort(out.begin(),out.end(),[](auto a,auto b){return a.value!=b.value?a.value<b.value:a.key<b.key;});
-        for(size_t i=0;i<std::min(in.size(),out.size());++i){
+        // Pair gains in[i]-out[i] are non-increasing in i and at most `capacity` exchanges are kept, so only the
+        // leading ranks matter: sort a prefix of `capacity` pairs, extended while the last kept gain ties the next
+        // (the final order breaks gain ties by key, which can promote a later pair of equal gain). Same selection
+        // as sorting both lists completely, without ranking all ~7.4K resident experts every verify window.
+        const size_t n=std::min(in.size(),out.size());
+        size_t k=std::min<size_t>(n,std::max<uint64_t>(capacity,1));
+        for(;;){
+            const size_t ki=std::min(in.size(),k+1),ko=std::min(out.size(),k+1);
+            std::partial_sort(in.begin(),in.begin()+ki,in.end(),hotter);
+            std::partial_sort(out.begin(),out.begin()+ko,out.end(),colder);
+            if(k>=n || in[k-1].value-out[k-1].value!=in[k].value-out[k].value)break;
+            k=std::min(n,2*k);
+        }
+        for(size_t i=0;i<k;++i){
             if(recent?in[i].value<=out[i].value*1.25+1.0:in[i].value<out[i].value+1.5)break;
             const auto a=in[i].key,b=out[i].key;
             if(!sizes[a.first]||sizes[a.first]!=sizes[b.first]||offsets[adaptive_index(b)]!=no_ram)

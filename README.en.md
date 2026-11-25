@@ -11,6 +11,7 @@
 
 ## Changelog
 
+- **2026-11-25**: Faster single RTX PRO 6000 prefill and decode. The prefill routed MoE uses a fused BF16 tensor-core kernel that dequantizes weights in shared memory exactly as the BF16 cuBLAS path does and differs from it only in accumulation order (LongSWE prefill-logit KL against the cuBLAS path drops from 5.6e-2 with the int8 fused kernel to 2.6e-3); Q5_K tensor cores are on by default for the shared-expert down projection and q_b; RMSNorm + Q8_1 quantization and RoPE + BF16 rounding are fused; route ids return on a side stream; Engram reads can spread over mirror copies on several drives, and cuBLAS is warmed up at startup. LongSWE, 16,180 input tokens: prefill 7,430–7,999 tokens/s, later-request decode about 197 tokens/s on average (peak 244). The dual L20 profile is unchanged.
 - **2026-11-19**: Faster single RTX PRO 6000 decode. Routed MoE and the attention q_b projection use tensor cores by default (MATH500 accuracy matches the bit-exact path at 91.2%); grouped routed MoE, de-duplicated and fused draft MoE, and fused RoPE / hyper-connection boundaries; expert migrations rotate without host copies and copy from GPU-resident blobs when available, decode uses the idle prefill workspace as extra expert cache, and background copy threads no longer share the request CPU. Decode peak about 207 tokens/s. The dual L20 profile is unchanged.
 
 The goal is practical use in agent harnesses such as [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): make inference as fast as possible while maintaining a useful level of model reasoning quality.
@@ -68,9 +69,9 @@ Sizes are decimal GB of the main GGUF files and Engram file, excluding DSpark an
 
 ## Throughput
 
-**Maximum measured prefill: 6,261.998 tokens/s**, at 32,768 input tokens, chunk 32768, with GSQ-RCO-IQ2_XS and original DSpark. This is one formal, profiler-free run; the corresponding three-run mean is **6,245.142 tokens/s**.
+**Maximum measured prefill: 7,999 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark, LongSWE 16,180 input tokens and the default chunk 8192 (2026-11-25 code, no profiler). The previous version reached 6,261.998 tokens/s at 32,768 input tokens and chunk 32768 (three-run mean 6,245.142).
 
-**Maximum measured decode: about 207 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark and the default starter configuration (chunk 8192), measured in real harness use. LongSWE, 16,180 input and exactly 512 output tokens: the first request in a process decodes at 127.2 tokens/s, later requests at 162.2–163.1 tokens/s, with prefill at 4,481–5,077 tokens/s.
+**Maximum measured decode: 244 tokens/s**, with GSQ-RCO-IQ2_XS, original DSpark and the default starter configuration (chunk 8192). LongSWE, 16,180 input and exactly 512 output tokens, with inputs taken from four start offsets of the token stream (0/3000/6000/9000) in one process: prefill 7,430–7,999 tokens/s (6,420 tokens/s for the first request of the process, measured with an Engram file mirror on a second NVMe drive via `STRATA_DS41_ENGRAM_MIRRORS`); later requests of the same prompt decode at 160–244 tokens/s (mean 196.8), the first decode of a new prompt at 119–165 tokens/s (mean 136.5). Decode speed depends on the generated text, which determines how many cold experts are uploaded from host memory; later requests of one window measured 114–160 tokens/s with the same configuration in different processes.
 
 The table below was measured with the previous code version. The GSQ-RCO-IQ2_XS measurements keep the same machine, original DSpark, 1M context capacity and cumulative runtime. Each input length uses a fresh process, one warmup and three formal runs, a new session per request and no prefix reuse. Greedy decoding ignores EOS to produce exactly 512 output tokens. Maya expert heat carries across the four requests within each process.
 

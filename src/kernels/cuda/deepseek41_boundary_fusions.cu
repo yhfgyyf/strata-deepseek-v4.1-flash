@@ -1,4 +1,5 @@
 // Validated 2026-10-21 operator candidates; preserve the existing BF16 boundaries.
+#include "strata/kernels/q8_1_finite.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cuda_bf16.h>
@@ -154,6 +155,65 @@ __global__ void __launch_bounds__(256) rms_resident_kernel(const float* x, const
 #pragma unroll
     for (int i = 0; i < P; ++i) o[i * 256] = __bfloat162float(__float2bfloat16_rn(v[i] * inv * wv[i]));
 }
+// rms_resident_kernel plus the Q8_1 quantization of its output: warp w at step i holds elements w*32 + 256 i .. +31,
+// one Q8_1 block. native_quantize_q8_1 is compiled with --use_fast_math (this file is not), so its block expression is
+// spelled out here in the same PTX: ftz abs/max/add butterflies, div.approx.ftz for d and x/d, roundf as
+// cvt.rzi(add.rz.ftz(v, copysign(0.5, v))). Bitwise the same blocks (checked against the two-kernel sequence).
+__device__ __forceinline__ float fm_add(float a, float b) { float r; asm("add.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fm_max(float a, float b) { float r; asm("max.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fm_abs(float a) { float r; asm("abs.ftz.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
+__device__ __forceinline__ float fm_div(float a, float b) { float r; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fm_round(float v) {
+    float t, r; const float half = copysignf(0.5f, v);
+    asm("add.rz.ftz.f32 %0, %1, %2;" : "=f"(t) : "f"(v), "f"(half));
+    asm("cvt.rzi.f32.f32 %0, %1;" : "=f"(r) : "f"(t));
+    return r;
+}
+__device__ __forceinline__ void q8_block_store(float xi, int lane, uint8_t* block) {
+    float amax = fm_abs(xi), sum = xi;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) amax = fm_max(amax, __shfl_xor_sync(0xffffffff, amax, offset, 32));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum = fm_add(sum, __shfl_xor_sync(0xffffffff, sum, offset, 32));
+    float d = fm_div(amax, 127.0f);
+    d = fm_abs(d) > strata::kernels::kHalfMax ? copysignf(strata::kernels::kHalfMax, d) : d;
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = fm_round(fm_div(xi, d));
+        q = int8_t(r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    block[4 + lane] = uint8_t(q);
+    if (lane == 0) *reinterpret_cast<half2*>(block) = strata::kernels::q8_1_ds(d, sum);
+}
+template<int W>
+__global__ void __launch_bounds__(256) rms_resident_q8_kernel(const float* x, const float* __restrict__ weight, float* out,
+                                                              uint8_t* q8, float eps) {
+    constexpr int P = W / 256;
+    const int token = blockIdx.x;
+    const float* xr = x + int64_t(token) * W + threadIdx.x;
+    float v[P], wv[P];
+#pragma unroll
+    for (int i = 0; i < P; ++i) v[i] = xr[i * 256];
+#pragma unroll
+    for (int i = 0; i < P; ++i) wv[i] = weight ? __ldg(weight + threadIdx.x + i * 256) : 1.f;
+    float square = 0;
+#pragma unroll
+    for (int i = 0; i < P; ++i) square += v[i] * v[i];
+    square = sum_block(square);
+    __shared__ float inverse;
+    if (threadIdx.x == 0) inverse = rsqrtf(square / W + eps);
+    __syncthreads();
+    const float inv = inverse;
+    float* o = out + int64_t(token) * W + threadIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    uint8_t* row = q8 + int64_t(token) * (W / 32) * 36;
+#pragma unroll
+    for (int i = 0; i < P; ++i) {
+        const float xi = __bfloat162float(__float2bfloat16_rn(v[i] * inv * wv[i]));
+        o[i * 256] = xi;
+        q8_block_store(xi, lane, row + (warp + 8 * i) * 36);
+    }
+}
 std::atomic<bool> rms_resident_enabled{true};
 } // namespace boundary_detail
 using namespace boundary_detail;
@@ -169,6 +229,14 @@ cudaError_t rms_bf16_gpu(const float* x, const float* w, float* out, int width, 
         }
     }
     rms_fused_kernel<<<tokens,256,0,s>>>(x,w,out,width,eps); return cudaGetLastError();
+}
+cudaError_t rms_bf16_q8_gpu(const float* x, const float* w, float* out, void* q8, int width, int tokens, float eps, cudaStream_t s) {
+    if (width < 1 || tokens < 1 || eps <= 0 || !q8 || !rms_resident_enabled.load()) return cudaErrorNotSupported;
+    switch (width) {
+        case 5120: rms_resident_q8_kernel<5120><<<tokens,256,0,s>>>(x,w,out,static_cast<uint8_t*>(q8),eps); return cudaGetLastError();
+        case 1280: rms_resident_q8_kernel<1280><<<tokens,256,0,s>>>(x,w,out,static_cast<uint8_t*>(q8),eps); return cudaGetLastError();
+        default: return cudaErrorNotSupported;
+    }
 }
 cudaError_t hc_pre_bf16_gpu(const float* x, const float* pre, float* out, int hidden, int tokens, cudaStream_t s) {
     if (hidden < 1 || tokens < 1) return cudaErrorInvalidValue;

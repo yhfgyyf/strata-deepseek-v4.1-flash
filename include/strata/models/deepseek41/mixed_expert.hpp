@@ -49,6 +49,10 @@ void expert_grouped_bf16_inputs_set_enabled(bool enabled);
 void expert_grouped_mma_set_enabled(bool enabled);
 // Opt-in: register-fed IQ2_XXS tensor-core decode (wide qs loads, computed sign byte); bit-identical.
 void expert_grouped_mma_wide_set_enabled(bool enabled);
+// Warp-specialized persistent decode MoE (bulk-copied weight rows, bit-identical to the MMA kernels).
+void expert_grouped_ws_set_enabled(bool enabled);
+// gu and down of the warp-specialized path in one persistent kernel (same products).
+void expert_grouped_ws_fused_set_enabled(bool enabled);
 bool expert_grouped_mma_enabled();
 bool expert_grouped_enabled();
 bool expert_grouped_supported(uint32_t gu_type,uint32_t down_type);

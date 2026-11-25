@@ -18,7 +18,8 @@ cudaError_t pool_groups_gpu(const float* kv, const float* gate, const float* pre
 cudaError_t rotate_strided_gpu(float* x, int heads, int head_dim, int tokens, int64_t start_position,
                               int position_step, const Geometry& g, bool compressed, bool inverse,
                               cudaStream_t stream);
-cudaError_t window_slots_gpu(int64_t* slots, int tokens, int previous, cudaStream_t stream);
+// writes (optional): also stores the new rows' window slots previous..previous+tokens-1 (the SWA pack targets).
+cudaError_t window_slots_gpu(int64_t* slots, int tokens, int previous, cudaStream_t stream, int64_t* writes = nullptr);
 cudaError_t to_bf16_strided_gpu(const float* input,uint16_t* output,int tokens,int cols,int64_t stride,
                                cudaStream_t stream);
 cudaError_t round_bf16_strided_gpu(float* values,int tokens,int cols,int64_t stride,cudaStream_t stream);

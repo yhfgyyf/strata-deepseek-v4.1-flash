@@ -32,6 +32,7 @@ struct DeviceScope {
     explicit DeviceScope(int device) { gpu_check(cudaGetDevice(&previous));gpu_check(cudaSetDevice(device)); }
     ~DeviceScope(){cudaSetDevice(previous);}
 };
+bool route_predict_on();
 void add_execution_stats(ExecutionStats& destination,const ExecutionStats& source);
 bool pipeline_p2p_enabled(); // Process-level opt-in; pinned-host remains the default.
 // Source work must be ready; callers drain the destination stream before reuse.
@@ -68,6 +69,22 @@ struct Event {
     Event() { gpu_check(cudaEventCreateWithFlags(&value,cudaEventDisableTiming)); }
     ~Event() { if (value) cudaEventDestroy(value); }
     Event(const Event&) = delete;
+};
+// Speculative cold-expert uploads (STRATA_DS41_SPEC_PREFETCH=1, decode only; results unchanged): the mHC estimate of a
+// layer's FFN input at its attention input picks likely experts; confident non-resident ones go to a private buffer.
+struct SpecPrefetch {
+    double threshold = 0.5, ema = 0;
+    int rank = 2, per_layer = 3, nslots = 12;
+    bool failed = false;
+    uint8_t* base = nullptr; uint64_t stride = 0, clock = 0;
+    std::vector<int> key; std::vector<uint64_t> age; std::vector<bool> used_valid;
+    std::vector<std::unique_ptr<Event>> copied, used;
+    Stream stream;
+    float *dx = nullptr, *dlogits = nullptr, *dweights = nullptr; int *dids = nullptr, *hids = nullptr;
+    Event ready; int pred_layer = -1, pred_tokens = 0;
+    std::vector<int> pending;
+    uint64_t predictions = 0, issued = 0, hits = 0, cold = 0, layers = 0, active_layers = 0;
+    bool active() const { return ema > threshold; }
 };
 struct Matrix {
     void* data = nullptr;
@@ -155,6 +172,7 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     const uint8_t* pinned_blob(int layer,int expert);
+    bool gpu_resident(int layer,int expert)const;
     uint64_t pinned_bytes()const{return ram_.pinned()?ram_bytes_:0;}
     const HostMemoryInfo& host_memory_info()const{return ram_.memory_info();}
     bool transient(int64_t layer, int64_t expert) const override;
@@ -268,6 +286,8 @@ struct Workspace {
     uint16_t* engram_input = nullptr; // Dedicated auxiliary-stream scratch, charged to the work arena.
     uint16_t* dense_weight = nullptr;
     uint8_t* dense_input_q8 = nullptr;
+    uint8_t* dense_input_q8_x = nullptr;
+    uint8_t* dense_input_q8_r = nullptr;
     std::array<uint16_t*,3> expert_ahead{};
     uint16_t *q_bf = nullptr, *kv_bf = nullptr, *out_bf = nullptr, *partial_out = nullptr;
     float* lse = nullptr;
@@ -361,6 +381,11 @@ struct Runtime::Impl {
     std::unique_ptr<Pinned> host_ring;
     std::unique_ptr<ExpertPipeline> expert_pipeline;
     std::unique_ptr<DecodeRawCache> decode_raw_cache;
+    std::unique_ptr<SpecPrefetch> spec;
+    SpecPrefetch* spec_state();
+    void spec_predict(int layer,int tokens,Workspace& w,const float* h,const float* attn_pre,const uint8_t* image);
+    void spec_issue(int layer,int tokens);
+    const uint8_t* spec_find(int key);
     uint64_t expert_generation = 0;
     // Test-only observation at shared completion / host-plan handoff; normally empty.
     std::function<void()> moe_shared_host_ready;
@@ -373,6 +398,9 @@ struct Runtime::Impl {
     std::array<bool,2> ring_used{};
     std::array<Event,2> expert_ready,expert_used;
     Event expert_begin,route_ready;
+    // Decode route-id D2H on its own stream (STRATA_DS41_ROUTE_SIDE, default on): on the main stream the small copy
+    // stalls the following shared-expert graph ~10 us per layer. route_side_pending: route_ready is recorded there.
+    Stream route_stream;Event route_done;bool route_side_pending=false;
     uint64_t ring_slot_bytes = 0;
     int ring_slots = 0;
     std::mutex execution_mutex;
@@ -382,7 +410,13 @@ struct Runtime::Impl {
          std::shared_ptr<EngramReader> shared_engram = {});
     ~Impl();
     void matmul(const Matrix& weight,const float* x,float* out,int tokens,Workspace& work,
-                int rows = 0,int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true,bool prepared_q8_input = false);
+                int rows = 0,int64_t ldx = 0,int64_t ldy = 0,uint64_t weight_offset = 0,bool round_output = true,bool prepared_q8_input = false,
+                int x_q8 = 0);
+    // x_q8 (2-8 column Q8_1 path): 1 = quantize x into kept slot 0 (Workspace::dense_input_q8_x), 2 = reuse slot 0,
+    // 3 = reuse slot 1 (Workspace::dense_input_q8_r). A reuse requires the same x and token count as the slot's
+    // producer (a 1, or q8_note after a fused producer kernel); the caller guarantees x is unchanged in between.
+    std::array<const float*,2> q8_source{};std::array<int,2> q8_tokens{};
+    void q8_note(int slot,const float* x,int tokens){q8_source.at(slot)=x;q8_tokens.at(slot)=tokens;}
     void round(float* x,uint64_t n);
     const Matrix& tensor(int layer,const std::string& suffix) const {
         const auto name=model.ple_engram()&&suffix=="engram_wkv"?"engram_kv":suffix;
@@ -392,6 +426,7 @@ struct Runtime::Impl {
     bool short_gpu_moe(int tokens,int phase) const;
     bool compact_routes(int tokens,int phase) const;
     void route(int layer,int tokens,Workspace& work,int phase);
+    void route_predict(int kind,int layer,const float* x,int tokens,Workspace& work);
     void decode_segment(int part,int layer,int tokens,Workspace& work,bool eligible,const std::function<void()>& body);
     void begin_expert_prefetch(int first,int last,ExecutionStats& stats);
     void prune_expert_prefetch(int layer,const std::array<bool,384>& selected,ExecutionStats& stats);

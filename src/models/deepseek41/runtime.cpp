@@ -97,6 +97,8 @@ void Workspace::extras(WorkspaceLayout& memory,const RuntimeOptions& options) {
     if(options.dense_q8){
         dense_weight=memory.alloc<uint16_t>(8192ull*5120);
         dense_input_q8=memory.alloc<uint8_t>(8ull*8192/32*36);
+        dense_input_q8_x=memory.alloc<uint8_t>(8ull*5120/32*36);
+        dense_input_q8_r=memory.alloc<uint8_t>(8ull*5120/32*36);
     }
     if(options.engram_pipeline)engram_input=memory.alloc<uint16_t>(uint64_t(max_tokens)*6144);
     if(options.expert_pipeline)for(auto& bf:expert_ahead)bf=memory.alloc<uint16_t>(5120*2304);
@@ -232,6 +234,37 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
         decode_raw_cache->add_slots(extra);
         std::cerr<<"DeepSeek decode LRU slots base="<<ring_slots-8<<" workspace_tail="<<extra.size()<<'\n';
     }
+    // cuBLAS loads each GEMM kernel's module and sets its attributes on first use: ~0.2 s inside the process's first
+    // prefill. Launch the prefill GEMM shapes once here on scratch (the workspace holds no live data before the first
+    // request; the decode raw cache is still empty). STRATA_DS41_GEMM_WARM=0 disables.
+    if(work->max_tokens>=1024 && !(std::getenv("STRATA_DS41_GEMM_WARM") && std::getenv("STRATA_DS41_GEMM_WARM")[0]=='0')){
+        const auto start=std::chrono::steady_clock::now();
+        struct Shape {int n,k,ldy;bool bf_out;};
+        const Shape shapes[]={{5120,2304,5120,false},{5120,2304,5120,true},{1024,4096,8192,false},{512,5120,512,false},
+            {5120,15360,5120,false},{2304,5120,2304,false},{5120,8192,5120,false},{32768,1280,32768,false},{1280,5120,1280,false},
+            {4096,1280,4096,false},{32,5120,32,false},{128,512,128,false},{25600,6144,25600,false}};
+        const int counts[]={9,10,12,16,20,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,4096,6144,8192};
+        const float alpha=1,beta=0;
+        auto* scratch=reinterpret_cast<uint16_t*>(work->q);  // weights (garbage), aliasing the output: results are discarded
+        for(const auto& sh:shapes)for(int t:counts){
+            if(t>work->max_tokens || uint64_t(t)*sh.ldy>uint64_t(work->max_tokens)*32768 || sh.k>work->max_bf_input_cols)continue;
+            cublasStatus_t status;
+            if(sh.bf_out){
+                if(t<256 || sh.k+sh.n>work->max_bf_input_cols)continue;
+                status=cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,sh.n,t,sh.k,&alpha,scratch,CUDA_R_16BF,sh.k,work->bf_input,CUDA_R_16BF,sh.k,
+                    &beta,work->bf_input+int64_t(t)*sh.k,CUDA_R_16BF,sh.n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            }else status=cublasGemmEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,sh.n,t,sh.k,&alpha,scratch,CUDA_R_16BF,sh.k,work->bf_input,CUDA_R_16BF,sh.k,
+                    &beta,work->q,CUDA_R_32F,sh.ldy,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT);
+            if(status!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("DeepSeek GEMM warm-up status="+std::to_string(status));
+        }
+        for(int n:{384,512})for(int t:counts){
+            if(t>work->max_tokens)continue;
+            const auto status=cublasSgemm(blas,CUBLAS_OP_T,CUBLAS_OP_N,n,t,5120,&alpha,work->q,5120,work->o_low,5120,&beta,work->index_q,n);
+            if(status!=CUBLAS_STATUS_SUCCESS)throw std::runtime_error("DeepSeek SGEMM warm-up status="+std::to_string(status));
+        }
+        gpu_check(cudaStreamSynchronize(stream.value));
+        std::cerr<<"DeepSeek GEMM warm-up "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<" ms\n";
+    }
     if(const char* mode=std::getenv("STRATA_DS41_DECODE_SEGMENTS")){
         if(mode[0]<'0'||mode[0]>'3'||mode[1])throw std::invalid_argument("decode segment mask must be 0..3");
         decode_segment_mask=static_cast<unsigned>(mode[0]-'0');
@@ -294,8 +327,8 @@ void matrix_product(const Matrix& m,const float* x,float* out,int tokens,cublasH
     }
 }
 void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,Workspace& w,
-                          int rows,int64_t ldx,int64_t ldy,uint64_t weight_offset,bool round_output,bool prepared_q8_input) {
-    if(prepared_q8_input&&(!m.packed_bf16||m.type!=13||m.rows!=2304||m.cols!=5120||rows||weight_offset||
+                          int rows,int64_t ldx,int64_t ldy,uint64_t weight_offset,bool round_output,bool prepared_q8_input,int x_q8) {
+    if(prepared_q8_input&&(!m.packed_bf16||m.type!=13||m.cols>8192||rows||weight_offset||
        !options.dense_q8_1||tokens<1||tokens>8||(tokens>1&&!options.dense_q8_batch)||(ldx&&ldx!=m.cols)))
         throw std::invalid_argument("DeepSeek prepared shared Q8 input contract");
     if(tokens>w.max_tokens)throw std::invalid_argument("DeepSeek matrix exceeds workspace token capacity");
@@ -308,15 +341,26 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
             throw std::invalid_argument("DeepSeek packed projection view");
         const auto* packed=static_cast<const uint8_t*>(m.data)+weight_offset/block*block_bytes;
         if(tokens<=8) {
+            bool rounded=false;
             if(options.dense_q8_1&&options.dense_q8_batch&&tokens>1){
                 // Existing exact multi-column kernel shares each loaded weight across rows.
-                if(!prepared_q8_input){
-                    if(ldx==k)kernels::native_quantize_q8_1(x,w.dense_input_q8,k,tokens,stream.value);
+                uint8_t* q8=w.dense_input_q8;
+                const bool keep=x_q8&&w.dense_input_q8_x&&ldx==k&&k<=5120&&!prepared_q8_input;
+                const int slot=x_q8==3?1:0;
+                const bool reuse=keep&&x_q8>=2;
+                if(keep){
+                    q8=slot?w.dense_input_q8_r:w.dense_input_q8_x;
+                    if(reuse&&(q8_source[slot]!=x||q8_tokens[slot]!=tokens))throw std::logic_error("DeepSeek kept Q8 input mismatch");
+                }
+                if(!prepared_q8_input&&!reuse){
+                    if(ldx==k)kernels::native_quantize_q8_1(x,q8,k,tokens,stream.value);
                     else for(int t=0;t<tokens;++t)kernels::native_quantize_q8_1(x+int64_t(t)*ldx,
-                        w.dense_input_q8+int64_t(t)*k/32*36,k,1,stream.value);
+                        q8+int64_t(t)*k/32*36,k,1,stream.value);
+                    if(keep)q8_note(0,x,tokens);
                 }
                 float* result=ldy==n?out:reinterpret_cast<float*>(w.dense_weight);
-                kernels::native_mmvq(m.type,packed,w.dense_input_q8,result,k,n,tokens,stream.value);
+                rounded=round_output&&ldy==n&&kernels::native_mmvq_try_rounded(m.type,packed,q8,out,k,n,tokens,stream.value);
+                if(!rounded)kernels::native_mmvq(m.type,packed,q8,result,k,n,tokens,stream.value);
                 if(ldy!=n)gpu_check(cudaMemcpy2DAsync(out,ldy*4,result,n*4,n*4,tokens,cudaMemcpyDeviceToDevice,stream.value));
             }else for(int t=0;t<tokens;++t) {
                 if(options.dense_q8_1){
@@ -324,7 +368,7 @@ void Runtime::Impl::matmul(const Matrix& m,const float* x,float* out,int tokens,
                     kernels::native_mmvq(m.type,packed,w.dense_input_q8,out+int64_t(t)*ldy,k,n,1,stream.value);
                 }else gpu_check(packed_bf16_gemv_gpu(packed,m.type,x+int64_t(t)*ldx,out+int64_t(t)*ldy,n,k,1,stream.value));
             }
-            if(round_output)gpu_check(round_bf16_strided_gpu(out,tokens,n,ldy,stream.value));
+            if(round_output&&!rounded)gpu_check(round_bf16_strided_gpu(out,tokens,n,ldy,stream.value));
         }else {
             if(uint64_t(n)*k>8192ull*5120)throw std::invalid_argument("packed projection scratch bound");
             prefill::LedgerScope expand_trace(options.trace,"ds41.dense.expand");

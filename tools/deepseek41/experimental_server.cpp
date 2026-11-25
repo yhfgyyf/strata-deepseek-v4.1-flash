@@ -1,7 +1,9 @@
+#include "strata/models/deepseek41/fused_moe.hpp"
 #include "adaptive_test_access.hpp"
 #include "strata/kernels/cpu/deepseek41_down.hpp"
 #include "strata/models/deepseek41/mixed_expert.hpp"
 #include "strata/models/deepseek41/kernels.hpp"
+#include "strata/models/deepseek41/runtime.hpp"
 #include "strata/models/deepseek41/indexer.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/artifact/gguf_split.hpp"
@@ -104,7 +106,10 @@ int main(int argc, char** argv) {
         d::expert_mixed_fast_set_enabled(iq);
         d::expert_mixed_short_set_enabled(iq);
         // Optional STRATA_DS41_OPT_MASK selects decode paths bit by bit (0x8000 tensor-core routed MoE,
-        // 0x40000 tensor-core q_b; the other bits are bit-exact). Unset keeps the built-in defaults.
+        // 0x40000 tensor-core q_b, 0x1000000 Q5_K tensor cores for the shared-expert down projection and q_b,
+        // 0x20000000 fused tensor-core prefill MoE; the other bits are bit-exact). STRATA_DS41_OPT_MASK2 selects the
+        // second set (0x400 BF16 fused prefill MoE instead of int8, 0x800 int8 fused kernel v2, byte-identical).
+        // Unset keeps the built-in defaults.
         if (const char* mask_text = std::getenv("STRATA_DS41_OPT_MASK")) {
             const unsigned m = unsigned(std::strtoul(mask_text, nullptr, 0));
             d::expert_grouped_set_enabled(m & 1u); strata::kernels::native_output_a_q5_set_enabled(m & 2u);
@@ -120,6 +125,18 @@ int main(int argc, char** argv) {
             d::helper_affinity_set_enabled(m & 0x80000u); d::adaptive_rotation_all_set_enabled(m & 0x100000u);
             d::adaptive_promote_set_enabled(m & 0x200000u); d::decode_lru_set_enabled(m & 0x400000u);
             d::expert_grouped_mma_wide_set_enabled(m & 0x800000u); strata::kernels::native_q5_mma_long_set_enabled(m & 0x1000000u);
+            d::hc_project_tile_set_enabled(m & 0x2000000u); d::hc_lane_set_enabled(m & 0x10000000u);
+            d::fused_moe_set_enabled(m & 0x20000000u); d::fused_moe_set_cold_first(m & 0x40000000u); d::engram_direct_set_enabled(m & 0x80000000u);
+            if (m & 0x4000000u) o.moe_input_reuse = true;
+            if (const char* m2 = std::getenv("STRATA_DS41_OPT_MASK2")) {
+                const unsigned v2 = unsigned(std::strtoul(m2, nullptr, 0));
+                d::expert_grouped_ws_set_enabled(v2 & 1u); strata::kernels::native_mmvq_q5_pair_set_enabled(v2 & 2u); d::draft_stage_set_enabled(v2 & 4u); strata::kernels::native_mmvq_round_fused_set_enabled(v2 & 8u);
+                d::spec_prefetch_set_enabled(v2 & 16u); d::route_side_set_enabled(v2 & 32u); strata::kernels::native_mmvq_round2_set_enabled(v2 & 64u);
+                d::x_q8_keep_set_enabled(v2 & 128u); d::rms_q8_fused_set_enabled(v2 & 256u); d::rope_shared_fused_set_enabled(v2 & 512u);
+                d::fused_moe_set_bf16(v2 & 1024u); d::fused_moe_set_int8_v2(v2 & 2048u);
+                std::cerr << "DeepSeek decode-opt mask2=0x" << std::hex << v2 << std::dec << '\n';
+            }
+            if (m & 0x8000000u) o.shared_q8_reuse = true;
             std::cerr << "DeepSeek decode-opt mask=0x" << std::hex << m << std::dec << '\n';
         }
         // Match the established experiment's process-owned runtime lifetime.

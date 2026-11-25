@@ -25,6 +25,13 @@ void helper_affinity_set_enabled(bool enabled);
 void adaptive_rotation_all_set_enabled(bool enabled);
 void adaptive_promote_set_enabled(bool enabled);
 void decode_lru_set_enabled(bool enabled);
+// Engram rows gathered straight from cached pages (bit-identical bytes).
+void engram_direct_set_enabled(bool enabled);
+// Speculative cold-expert uploads in decode (also needs STRATA_DS41_SPEC_PREFETCH=1; results unchanged).
+void spec_prefetch_set_enabled(bool enabled);
+void route_side_set_enabled(bool enabled);
+void x_q8_keep_set_enabled(bool enabled);
+void rms_q8_fused_set_enabled(bool enabled);
 enum class Arithmetic { f32, production };
 enum class ExpertMode { hybrid, gpu, cpu };
 struct RuntimeOptions {

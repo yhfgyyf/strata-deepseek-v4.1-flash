@@ -1293,7 +1293,7 @@ if(STRATA_NATIVE_EXPERTS)
       src/kernels/cuda/deepseek41_bounded_moe.cu
         src/kernels/cuda/deepseek41_boundary_fusions.cu
       src/kernels/cuda/deepseek41_mixed_expert.cu
-      src/kernels/cuda/deepseek41_grouped_expert.cu
+      src/kernels/cuda/deepseek41_grouped_expert.cu src/kernels/cuda/deepseek41_fused_moe.cu
       src/kernels/cuda/deepseek41_confidence.cu
       src/kernels/cuda/deepseek41_format_down.cu
       src/kernels/cuda/deepseek41_attention.cu src/kernels/cuda/deepseek41_cache.cu
