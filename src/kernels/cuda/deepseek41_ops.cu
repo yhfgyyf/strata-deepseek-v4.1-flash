@@ -17,6 +17,7 @@ namespace strata::models::deepseek41 {
 namespace {
 std::atomic<bool> hc_vector_enabled{true};
 std::atomic<bool> hc_reuse_enabled{false};
+std::atomic<bool> hc_tile_enabled{true};
 // Stable expert order, then original token/slot order; at most48 selected slots.
 __global__ void route_group_short_kernel(const int* ids,const float* weights,int* rows,int* slots,float* grouped,int count) {
     __shared__ int selected[48];
@@ -803,6 +804,62 @@ __global__ void hc_project_reuse_kernel(const float* x,const float* fn,float* mi
     }
 }
 
+// Prefill hc_project, bit-exact with hc_project_vector_kernel: four 64-thread groups own six rows
+// each; a block covers TT tokens so x streams from DRAM once and each fn element feeds TT tokens.
+// Every (token,row) keeps its 256 virtual-lane chains and the virtual-256 reduction tree.
+__device__ __forceinline__ float hc_sum_group64(float (&v)[4],float* partial,int lane,int barrier) {
+    #pragma unroll
+    for(int delta=4;delta;delta>>=1) {
+        #pragma unroll
+        for(int j=0;j<4;++j)v[j]+=__shfl_down_sync(0xffffffff,v[j],delta,8);
+    }
+    const float even=v[0]+v[2],odd=v[1]+v[3];
+    if((lane&7)==0)partial[lane>>3]=even+odd;
+    asm volatile("bar.sync %0, 64;"::"r"(barrier));
+    float sum=lane<8?partial[lane]:0.f;
+    if(lane<32)for(int delta=16;delta;delta>>=1)
+        sum+=__shfl_down_sync(0xffffffff,sum,delta);
+    asm volatile("bar.sync %0, 64;"::"r"(barrier));
+    return sum;
+}
+template<int TT>
+__global__ void __launch_bounds__(256) hc_project_tile_kernel(const float* x,const float* fn,float* mixes,int hidden,float eps,int tokens) {
+    const int group=threadIdx.x>>6,lane=threadIdx.x&63,width=hidden*4,first=group*6,t0=blockIdx.x*TT;
+    __shared__ float partial[4][8];
+    const float* xs[TT];
+    #pragma unroll
+    for(int i=0;i<TT;++i)xs[i]=x+int64_t(min(t0+i,tokens-1))*width;
+    const float* fs=fn+int64_t(first)*width;
+    float square[TT][4]{},dot[TT][6][4]{};
+    for(int col=lane*4;col<width;col+=256) {
+        float values[TT][4];
+        #pragma unroll
+        for(int i=0;i<TT;++i){const float4 v=__ldg(reinterpret_cast<const float4*>(xs[i]+col));values[i][0]=v.x;values[i][1]=v.y;values[i][2]=v.z;values[i][3]=v.w;}
+        #pragma unroll
+        for(int r=0;r<6;++r){
+            const float4 w=__ldg(reinterpret_cast<const float4*>(fs+int64_t(r)*width+col));
+            const float weights[4]={w.x,w.y,w.z,w.w};
+            #pragma unroll
+            for(int i=0;i<TT;++i)
+                #pragma unroll
+                for(int j=0;j<4;++j)dot[i][r][j]+=values[i][j]*weights[j];
+        }
+        #pragma unroll
+        for(int i=0;i<TT;++i)
+            #pragma unroll
+            for(int j=0;j<4;++j)square[i][j]+=values[i][j]*values[i][j];
+    }
+    #pragma unroll
+    for(int i=0;i<TT;++i){
+        const float sum=hc_sum_group64(square[i],partial[group],lane,1+group);
+        const float inverse=rsqrtf(sum/width+eps);
+        #pragma unroll
+        for(int r=0;r<6;++r){
+            const float product=hc_sum_group64(dot[i][r],partial[group],lane,1+group);
+            if(!lane&&t0+i<tokens)mixes[(t0+i)*24+first+r]=product*inverse;
+        }
+    }
+}
 // Same reduction as hc_sum_virtual256, synchronizing only the two compute warps.
 __device__ float hc_sum_virtual256_64(float (&v)[4]) {
     __shared__ float partial[8];
@@ -905,6 +962,67 @@ __global__ void __launch_bounds__(256) hc_staged_kernel(const float* x,const flo
             hc_split_token(mixes,split.scale,split.base,split.pre,split.post,split.comb,token,tid,split.eps,split.iterations);
         }
     }
+}
+// Decode hc_project + hc_split, bit-exact with hc_staged_kernel<8,true>. Each (token,row) is a fixed tree
+// over 256 independent 80-step chains (virtual lane L = 4t+j owns cols L+256s). Block (row, part) owns
+// chains [64 part, 64 part + 64) of every token, so each fn element is read once for all tokens; a warp
+// holds one 8-thread group of the tree and runs its first stage. The last block finishes the 8-partial
+// stage of every (token,row), then the split.
+std::atomic<bool> hc_lane_enabled{true};
+__device__ unsigned hc_lane_counters[2];
+__device__ float hc_lane_partials[2][8*25*8];
+__global__ void __launch_bounds__(512) hc_lane_split_kernel(const float* x,const float* fn,float* mixes,int hidden,float eps,
+                                                            int tokens,HcSplitArgs split) {
+    constexpr int C=64;
+    const int row=blockIdx.x,part=blockIdx.y,width=hidden*4;
+    const int token=threadIdx.x/C,L=part*C+threadIdx.x%C;
+    float* partials=hc_lane_partials[split.slot];
+    const float* xs=x+int64_t(token)*width+L;
+    const float* fs=fn+int64_t(row)*width+L;
+    float sq=0.f,dt=0.f;
+    #pragma unroll
+    for(int s=0;s<80;++s){
+        const float v=__ldg(xs+256*s),w=__ldg(fs+256*s);
+        sq+=v*v; dt+=v*w;
+    }
+    auto first_stage=[](float v){
+        v+=__shfl_down_sync(0xffffffff,v,16);
+        v+=__shfl_down_sync(0xffffffff,v,8);
+        v+=__shfl_down_sync(0xffffffff,v,4);
+        const float even=__shfl_sync(0xffffffff,v,0)+__shfl_sync(0xffffffff,v,2);
+        const float odd=__shfl_sync(0xffffffff,v,1)+__shfl_sync(0xffffffff,v,3);
+        return even+odd;
+    };
+    const float pd=first_stage(dt),ps=first_stage(sq);
+    if((threadIdx.x&31)==0){
+        __stcg(partials+(token*25+row)*8+(L>>5),pd);
+        if(row==0)__stcg(partials+(token*25+24)*8+(L>>5),ps);
+    }
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if(threadIdx.x==0)last=atomicAdd(&hc_lane_counters[split.slot],1u)==gridDim.x*gridDim.y-1;
+    __syncthreads();
+    if(!last)return;
+    __threadfence();
+    // hc_sum_virtual256's last stage: lanes 8..31 contribute zeros at deltas 16 and 8.
+    auto tree=[](const float* p){
+        float q[8];
+        #pragma unroll
+        for(int i=0;i<8;++i){q[i]=__ldcg(p+i);q[i]+=0.f;q[i]+=0.f;}
+        return ((q[0]+q[4])+(q[2]+q[6]))+((q[1]+q[5])+(q[3]+q[7]));
+    };
+    for(int item=threadIdx.x;item<tokens*24;item+=blockDim.x){
+        const int t=item/24,r=item%24;
+        const float inverse=rsqrtf(tree(partials+(t*25+24)*8)/width+eps);
+        __stcg(mixes+t*24+r,tree(partials+(t*25+r)*8)*inverse);
+    }
+    __threadfence();
+    __syncthreads();
+    const int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    if(warp<tokens&&lane<16)
+        hc_split_token(mixes,split.scale,split.base,split.pre,split.post,split.comb,warp,lane,split.eps,split.iterations);
+    if(threadIdx.x==0)hc_lane_counters[split.slot]=0;
 }
 std::atomic<bool> hc_staged_enabled{true};
 std::atomic<bool> hc_split_fused_enabled{true};
@@ -1133,6 +1251,8 @@ __global__ void __launch_bounds__(128) dp_bf16_warp(const uint8_t* __restrict__ 
 }
 std::atomic<bool> draft_q8_warp_enabled{true};
 std::atomic<bool> draft_dedup_enabled{true};
+std::atomic<bool> draft_stage_enabled{true};
+void draft_stage_set_enabled(bool value){draft_stage_enabled.store(value);}
 std::atomic<bool> draft_group_enabled{true};
 // Large Q8_0 draft matrices only: small ones keep more CTAs with the block-per-row kernel.
 template<int NT>
@@ -1222,10 +1342,17 @@ cudaError_t draft_fused_moe_gpu(const void* experts,uint32_t expert_type,uint64_
         int* desc=reinterpret_cast<int*>(parts+int64_t(7)*4*5120);
         draft_dedup::plan<<<1,32,0,stream>>>(ids,routing,tokens,desc);
         auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        draft_dedup::gu<<<dim3(576,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_gate),
-            static_cast<const uint8_t*>(shared_up),x,ids,desc,scratch,tokens);
-        error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        draft_dedup::down<<<dim3(1280,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_down),ids,scratch,desc,parts,tokens);
+        if(draft_stage_enabled.load()){
+            draft_dedup::gu<true><<<dim3(576,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_gate),
+                static_cast<const uint8_t*>(shared_up),x,ids,desc,scratch,tokens);
+            error=cudaGetLastError();if(error!=cudaSuccess)return error;
+            draft_dedup::down<true><<<dim3(1280,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_down),ids,scratch,desc,parts,tokens);
+        }else{
+            draft_dedup::gu<false><<<dim3(576,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_gate),
+                static_cast<const uint8_t*>(shared_up),x,ids,desc,scratch,tokens);
+            error=cudaGetLastError();if(error!=cudaSuccess)return error;
+            draft_dedup::down<false><<<dim3(1280,tokens*3+1),128,0,stream>>>(e,projection,static_cast<const uint8_t*>(shared_down),ids,scratch,desc,parts,tokens);
+        }
         error=cudaGetLastError();if(error!=cudaSuccess)return error;
         draft_dedup::combine<<<(tokens*5120+255)/256,256,0,stream>>>(parts,ids,out,tokens);
         return cudaGetLastError();
@@ -1417,6 +1544,8 @@ cudaError_t route_handoff_short_gpu(const int* ids,const float* weights,int* row
 }
 void hc_project_vector_set_enabled(bool value){hc_vector_enabled.store(value);}
 void hc_project_reuse_set_enabled(bool value){hc_reuse_enabled.store(value);}
+void hc_project_tile_set_enabled(bool value){hc_tile_enabled.store(value);}
+void hc_lane_set_enabled(bool value){hc_lane_enabled.store(value);}
 void q5_rows8_set_enabled(bool value){q5_rows8_enabled.store(value);}
 void hc_staged_set_enabled(bool value){hc_staged_enabled.store(value);}
 void draft_q8_warp_set_enabled(bool value){draft_q8_warp_enabled.store(value);}
@@ -1429,7 +1558,9 @@ cudaError_t hc_project_gpu(const float* x, const float* fn, float* mixes, int hi
     if(hc_vector_enabled.load()&&hc_staged_enabled.load()&&hidden==5120&&tokens<=8&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0)
         hc_staged_kernel<8><<<dim3(24,tokens),256,2*2*8*256*4,s>>>(x,fn,mixes,hidden,eps);
     else if(hc_vector_enabled.load()&&hidden==5120&&tokens<=8192&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
-        if(hc_reuse_enabled.load()&&tokens>=128)
+        if(hc_tile_enabled.load()&&tokens>=128)
+            hc_project_tile_kernel<4><<<(tokens+3)/4,256,0,s>>>(x,fn,mixes,hidden,eps,tokens);
+        else if(hc_reuse_enabled.load()&&tokens>=128)
             hc_project_reuse_kernel<<<dim3(6,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
         else hc_project_vector_kernel<<<dim3(24,tokens),64,0,s>>>(x,fn,mixes,hidden,eps);
     }
@@ -1441,7 +1572,10 @@ cudaError_t hc_project_split_gpu(const float* x, const float* fn, float* mixes, 
                                  int iterations, int slot, cudaStream_t s) {
     if(hc_split_fused_enabled.load()&&hc_vector_enabled.load()&&hc_staged_enabled.load()&&hidden==5120&&tokens>=1&&tokens<=8&&
        norm_eps>0&&hc_eps>0&&iterations>=1&&(slot==0||slot==1)&&((reinterpret_cast<uintptr_t>(x)|reinterpret_cast<uintptr_t>(fn))&15)==0){
-        hc_staged_kernel<8,true><<<dim3(24,tokens),256,2*2*8*256*4,s>>>(x,fn,mixes,hidden,norm_eps,
+        if(hc_lane_enabled.load())
+            hc_lane_split_kernel<<<dim3(24,4),tokens*64,0,s>>>(x,fn,mixes,hidden,norm_eps,tokens,
+                HcSplitArgs{scale,base,pre,post,comb,hc_eps,iterations,slot});
+        else hc_staged_kernel<8,true><<<dim3(24,tokens),256,2*2*8*256*4,s>>>(x,fn,mixes,hidden,norm_eps,
             HcSplitArgs{scale,base,pre,post,comb,hc_eps,iterations,slot});
         return cudaGetLastError();
     }
@@ -1469,7 +1603,7 @@ cudaError_t hc_post_gpu(const float* x, const float* branch, const float* post, 
 // rotary_detail::rotate_shared (Shared=true), whichever rotate_gpu selects for the shape.
 template<bool Shared>
 __global__ void rope_round_kernel(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int head_dim, int64_t start,
-                                  RotaryFrequencies f, bool inverse, int64_t pairs) {
+                                  RotaryFrequencies f, bool inverse, int64_t pairs, bool pre_round, bool keep_float) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < pairs; i += int64_t(gridDim.x) * blockDim.x) {
         const int64_t e = 2 * i;
         const int col = int(e % head_dim);
@@ -1477,6 +1611,7 @@ __global__ void rope_round_kernel(float* x, const uint16_t* in_bf, uint16_t* out
         float a, b;
         if (in_bf) { a = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e]); b = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e + 1]); }
         else { a = x[e]; b = x[e + 1]; }
+        if (pre_round) { a = __bfloat162float(__float2bfloat16_rn(a)); b = __bfloat162float(__float2bfloat16_rn(b)); }
         if (col >= head_dim - 64) {
             const int pair = (col - (head_dim - 64)) / 2;
             float sn, cs;
@@ -1491,20 +1626,58 @@ __global__ void rope_round_kernel(float* x, const uint16_t* in_bf, uint16_t* out
             a = p0; b = p1;
         }
         const __nv_bfloat16 ra = __float2bfloat16_rn(a), rb = __float2bfloat16_rn(b);
-        x[e] = __bfloat162float(ra); x[e + 1] = __bfloat162float(rb);
+        if (keep_float) { x[e] = __bfloat162float(ra); x[e + 1] = __bfloat162float(rb); }
+        if (out_bf) { reinterpret_cast<__nv_bfloat16*>(out_bf)[e] = ra; reinterpret_cast<__nv_bfloat16*>(out_bf)[e + 1] = rb; }
+    }
+}
+// rotary_detail::rotate_shared (same per-token sine/cosine table and rotation code) followed by the BF16 round of every
+// element of the token and the optional BF16 copy: the prefill shapes' rotate + round (+ convert) in one pass.
+__global__ void rope_round_shared_kernel(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int dim, int64_t start,
+                                         RotaryFrequencies f, bool inverse, bool pre_round, bool keep_float) {
+    __shared__ float sine[32], cosine[32];
+    const int token = blockIdx.x;
+    if (threadIdx.x < 32) {
+        const float angle = float(start + int64_t(token)) * f.value[threadIdx.x];
+        float s, c; sincosf(angle, &s, &c);
+        sine[threadIdx.x] = inverse ? -s : s; cosine[threadIdx.x] = c;
+    }
+    __syncthreads();
+    const int64_t base = int64_t(token) * heads * dim;
+    for (int i = threadIdx.x; i < heads * dim / 2; i += blockDim.x) {
+        const int head = i / (dim / 2), pr = i % (dim / 2), col = 2 * pr;
+        const int64_t e = base + int64_t(head) * dim + col;
+        float a, b;
+        if (in_bf) { a = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e]); b = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(in_bf)[e + 1]); }
+        else { a = x[e]; b = x[e + 1]; }
+        if (pre_round) { a = __bfloat162float(__float2bfloat16_rn(a)); b = __bfloat162float(__float2bfloat16_rn(b)); }
+        if (col >= dim - 64) {
+            const int d = (col - (dim - 64)) / 2;
+            const float s = sine[d], c = cosine[d];
+            const float p0 = a * c - b * s, p1 = a * s + b * c;
+            a = p0; b = p1;
+        }
+        const __nv_bfloat16 ra = __float2bfloat16_rn(a), rb = __float2bfloat16_rn(b);
+        if (keep_float) { x[e] = __bfloat162float(ra); x[e + 1] = __bfloat162float(rb); }
         if (out_bf) { reinterpret_cast<__nv_bfloat16*>(out_bf)[e] = ra; reinterpret_cast<__nv_bfloat16*>(out_bf)[e + 1] = rb; }
     }
 }
 std::atomic<bool> rope_fused_enabled{true};
+std::atomic<bool> rope_shared_fused_enabled{true};
+void rope_shared_fused_set_enabled(bool value) { rope_shared_fused_enabled.store(value); }
+bool rope_shared_fused_enabled_value() { return rope_shared_fused_enabled.load() && rope_fused_enabled.load(); }
 cudaError_t rope_round_gpu(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int head_dim, int tokens, int64_t start,
-                           const Geometry& g, bool compressed, bool inverse, cudaStream_t s) {
+                           const Geometry& g, bool compressed, bool inverse, cudaStream_t s, bool pre_round, bool keep_float) {
+    if (!keep_float && !out_bf) return cudaErrorInvalidValue;
     if (!rope_fused_enabled.load()) return cudaErrorNotSupported;
     if (heads < 1 || g.rope_dim != 64 || head_dim < g.rope_dim || head_dim % 2 || tokens < 1 || start < 0) return cudaErrorInvalidValue;
     // rotate_shared's FMA contraction is not reproduced; those shapes keep the separate kernels.
-    if (rotary_detail::shared_shape(heads, head_dim, tokens)) return cudaErrorNotSupported;
+    // rotate_shared shapes (prefill q/kv/index-q, decode kv): rope_round_shared_kernel reproduces rotate_shared bitwise.
+    const bool shared = rotary_detail::shared_shape(heads, head_dim, tokens);
+    if (shared && !rope_shared_fused_enabled.load()) return cudaErrorNotSupported;
     const auto frequencies = rotary_frequencies(g, compressed);
     const int64_t pairs = int64_t(tokens) * heads * head_dim / 2;
-    rope_round_kernel<false><<<grid(pairs), 256, 0, s>>>(x, in_bf, out_bf, heads, head_dim, start, frequencies, inverse, pairs);
+    if (shared) rope_round_shared_kernel<<<tokens, 256, 0, s>>>(x, in_bf, out_bf, heads, head_dim, start, frequencies, inverse, pre_round, keep_float);
+    else rope_round_kernel<false><<<grid(pairs), 256, 0, s>>>(x, in_bf, out_bf, heads, head_dim, start, frequencies, inverse, pairs, pre_round, keep_float);
     return cudaGetLastError();
 }
 void rope_fused_set_enabled(bool value) { rope_fused_enabled.store(value); }

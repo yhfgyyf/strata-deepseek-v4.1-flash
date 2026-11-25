@@ -72,6 +72,10 @@ cudaError_t route_parallel_gpu(const float* logits, const float* bias, const flo
 // Change only while the runtime is drained; exact HC vector candidate.
 void hc_project_vector_set_enabled(bool enabled);
 void hc_project_reuse_set_enabled(bool enabled);
+void hc_project_tile_set_enabled(bool enabled);
+void hc_lane_set_enabled(bool enabled);
+// Draft MoE routed rows staged in shared memory with vector loads (same products).
+void draft_stage_set_enabled(bool enabled);
 // Drained control: Q5_K projections with eight lanes per row (same per-element order and tree).
 void q5_rows8_set_enabled(bool enabled);
 // Drained control: register-resident RMS rows for widths 5120/1280/512 (same order and tree).
@@ -90,8 +94,13 @@ void draft_chain_set_enabled(bool enabled);
 void projection_prefetch_set_enabled(bool enabled);
 // Production glue: optional BF16 input -> rotate_gpu math -> BF16 round (in place) -> optional BF16 copy.
 // cudaErrorNotSupported when disabled (drained control).
+void rope_shared_fused_set_enabled(bool enabled);
+// pre_round: x is first rounded to BF16 (the producer's deferred round): round -> rotate -> round in one pass.
+// keep_float = false: only the BF16 copy is written (x is input only; requires out_bf).
 cudaError_t rope_round_gpu(float* x, const uint16_t* in_bf, uint16_t* out_bf, int heads, int head_dim, int tokens, int64_t start,
-                           const Geometry& g, bool compressed, bool inverse, cudaStream_t s);
+                           const Geometry& g, bool compressed, bool inverse, cudaStream_t s, bool pre_round = false,
+                           bool keep_float = true);
+bool rope_shared_fused_enabled_value();
 void rope_fused_set_enabled(bool enabled);
 bool rope_fused_enabled_value();
 bool draft_group_enabled_value();
@@ -120,6 +129,10 @@ cudaError_t engram_gate_gpu(float* residual, const float* kv, const float* q_wei
                            const float* k_weight, const uint8_t* image, int tokens, int hidden,
                            cudaStream_t stream);
 // Same FP32 arithmetic, with the existing terminal BF16 rounding fused.
+// rms_bf16_gpu plus the Q8_1 blocks of its output (bitwise native_quantize_q8_1 of out); widths 5120 and 1280.
+// cudaErrorNotSupported (nothing launched) otherwise.
+cudaError_t rms_bf16_q8_gpu(const float* x, const float* weight, float* out, void* q8, int width, int tokens, float eps,
+                            cudaStream_t stream);
 cudaError_t rms_bf16_gpu(const float* x, const float* weight, float* out, int width, int tokens,
                     float eps, cudaStream_t stream);
 cudaError_t hc_pre_bf16_gpu(const float* residual, const float* pre, float* out, int hidden, int tokens, cudaStream_t stream);

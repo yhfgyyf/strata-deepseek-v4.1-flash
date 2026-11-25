@@ -216,10 +216,11 @@ __global__ void rotate_kernel(float* x, int heads, int dim, int tokens, int64_t 
         const float a = p[0], b = p[1]; p[0] = a * cosine - b * sine; p[1] = a * sine + b * cosine;
     }
 }
-__global__ void slots_kernel(int64_t* slots, int tokens, int previous) {
+__global__ void slots_kernel(int64_t* slots, int tokens, int previous, int64_t* writes) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tokens * 128; i += gridDim.x * blockDim.x) {
         const int t = i / 128, k = i % 128, end = previous + t + 1, begin = max(0,end - 128);
         slots[i] = begin + k < end ? begin + k : -1;
+        if (writes && k == 0) writes[t] = previous + t;
     }
 }
 __global__ void bf_strided_kernel(const float* x,__nv_bfloat16* out,int cols,int64_t stride,int64_t n) {
@@ -294,9 +295,9 @@ cudaError_t rotate_strided_gpu(float* x,int heads,int dim,int tokens,int64_t sta
         return rotary_detail::launch(x,heads,dim,tokens,start,step,rotary_frequencies(g,compressed),inverse,s);
     rotate_kernel<<<grid(int64_t(tokens)*heads*32),256,0,s>>>(x,heads,dim,tokens,start,step,rotary_frequencies(g,compressed),inverse); return cudaGetLastError();
 }
-cudaError_t window_slots_gpu(int64_t* slots,int tokens,int previous,cudaStream_t s) {
+cudaError_t window_slots_gpu(int64_t* slots,int tokens,int previous,cudaStream_t s,int64_t* writes) {
     if (tokens < 1 || previous < 0 || previous > 128) return cudaErrorInvalidValue;
-    slots_kernel<<<grid(int64_t(tokens)*128),256,0,s>>>(slots,tokens,previous); return cudaGetLastError();
+    slots_kernel<<<grid(int64_t(tokens)*128),256,0,s>>>(slots,tokens,previous,writes); return cudaGetLastError();
 }
 cudaError_t to_bf16_strided_gpu(const float* x,uint16_t* out,int tokens,int cols,int64_t stride,cudaStream_t s) {
     if (tokens < 1 || cols < 1 || stride < cols) return cudaErrorInvalidValue;

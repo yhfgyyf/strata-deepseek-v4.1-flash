@@ -41,6 +41,8 @@ bool native_mmvq_multi_warp_selected(int type,int n_in,int n_out,int tokens,bool
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
 // not reconstruct that sum from the quantized integers.
+/// round_bf16 of x in place and native_quantize_q8_1 of the result, in one kernel (bitwise the two calls).
+void native_round_quantize_q8_1(float* x, void* x_q8_1, int n_in, int ncols, void* stream);
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
 
@@ -168,8 +170,18 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                  int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
+/// Q5_K pairs (same per-row work as two native_mmvq calls) on/off.
+void native_mmvq_q5_pair_set_enabled(bool enabled);
+/// native_mmvq and the BF16 rounding of its output in one launch where the two-warp kernel runs (false: not launched).
+bool native_mmvq_try_rounded(int ggml_type, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                             void* stream);
+void native_mmvq_round_fused_set_enabled(bool enabled);
+/// Round fusion for Q5_K tensor-core shapes (try_rounded) and the rounded Q5_K gate/up pair; exact (same BF16 rounding).
+void native_mmvq_round2_set_enabled(bool enabled);
+bool native_mmvq_round2_enabled();
+/// round: also apply the BF16 rounding of both outputs in the store (Q5_K pairs only; Q8_0 returns false when set).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
-                      int n_in, int n_out, int ncols, void* stream);
+                      int n_in, int n_out, int ncols, void* stream, bool round = false);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]

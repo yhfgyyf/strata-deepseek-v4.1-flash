@@ -11,6 +11,7 @@
 
 ## 更新日志
 
+- **2026-11-25**：单卡 RTX PRO 6000 prefill／decode 提速。prefill routed MoE 改为 BF16 张量核融合 kernel：权重在共享内存中按 BF16 cuBLAS 路径完全相同的方式反量化，与该路径只差累加顺序（LongSWE prefill logits 与 cuBLAS 路径的 KL 从 int8 融合 kernel 的 5.6e-2 降到 2.6e-3）；Q5_K 共享专家 down 投影与 q_b 默认使用张量核；RMSNorm＋Q8_1 量化、RoPE＋BF16 舍入融合；route id 回传改到旁路 stream；Engram 支持多盘镜像并行读取，cuBLAS 在启动时预热。LongSWE 16,180 输入：prefill 7,430–7,999 tokens/s，decode 后续请求均值约 197 tokens/s（峰值 244）。双 L20 配置不变。
 - **2026-11-19**：单卡 RTX PRO 6000 decode 提速。routed MoE 与注意力 q_b 投影默认使用张量核（MATH500 准确率与逐位一致路径相同，均为 91.2%）；新增分组 routed MoE、草稿 MoE 去重与融合、RoPE／超连接边界融合；专家迁移改为零拷贝轮换并优先从显存缓存复制，decode 期间利用空闲 prefill 工作区扩大专家缓存，后台拷贝线程不再与请求线程共用 CPU。decode 峰值约 207 tokens/s。双 L20 配置不变。
 
 本项目面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 等 harness 环境的实际使用，目标是在保证模型一定推理质量的前提下，尽可能提高推理速度。
@@ -68,9 +69,9 @@
 
 ## 吞吐
 
-**已测最大 prefill：6,261.998 tokens/s**，使用 GSQ-RCO-IQ2_XS、原格式 DSpark、32,768 输入、chunk 32768。这是无 profiler 的单次正式结果；同配置三次均值为 **6,245.142 tokens/s**。
+**已测最大 prefill：7,999 tokens/s**，使用 GSQ-RCO-IQ2_XS、原格式 DSpark、LongSWE 16,180 输入、默认 chunk 8192（2026-11-25 代码，无 profiler）。上一版本在 32,768 输入、chunk 32768 下为 6,261.998 tokens/s（三次均值 6,245.142）。
 
-**已测最大 decode：约 207 tokens/s**，GSQ-RCO-IQ2_XS、原格式 DSpark、默认启动配置（chunk 8192），在 harness 实际使用中测得。LongSWE 16,180 输入、固定 512 输出：进程首个请求 decode 127.2 tokens/s，后续请求 162.2–163.1 tokens/s，prefill 4,481–5,077 tokens/s。
+**已测最大 decode：244 tokens/s**，GSQ-RCO-IQ2_XS、原格式 DSpark、默认启动配置（chunk 8192）。LongSWE 16,180 输入、固定 512 输出，同一进程内从 token 流的 4 个起始位置（0／3000／6000／9000）各取一段输入：prefill 7,430–7,999 tokens/s（进程首个请求 6,420 tokens/s，该次测量通过 `STRATA_DS41_ENGRAM_MIRRORS` 在第二块 NVMe 上放置了 Engram 文件镜像）；同一 prompt 的后续请求 decode 160–244 tokens/s（均值 196.8），新 prompt 首次 decode 119–165 tokens/s（均值 136.5）。decode 速度随生成内容变化：内容决定需要从内存上传的冷专家数量，同一配置在不同进程中某一窗口的后续请求测得过 114–160 tokens/s。
 
 下表为上一版本代码的测量。GSQ-RCO-IQ2_XS 测量保持同一机器、原始 DSpark、1M 上下文容量和累计运行时。每档输入独立启动进程，1 次预热＋3 次正式测量；每次新建 session，不复用前缀，贪心解码忽略 EOS 以固定完整 512 输出。Maya 专家热度在同进程的四次请求间延续。
 
