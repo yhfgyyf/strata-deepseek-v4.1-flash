@@ -1,3 +1,4 @@
+#include <optional>
 #include "runtime_internal.hpp"
 #include "expert_pipeline.hpp"
 #include "bounded_moe.hpp"
@@ -342,6 +343,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         if(route_side_pending)gpu_check(cudaEventSynchronize(route_ready.value));
     }
     route_side_pending=false;
+    std::optional<prefill::LedgerScope> plan_trace;plan_trace.emplace(options.trace,"ds41.moe.plan.observe");
     const int invalid_route=compact?w.host_ids[tokens*6]:-1;
     if(compact&&(invalid_route<-1||invalid_route>=tokens*6))throw std::runtime_error("DeepSeek invalid route status");
     for(int i=0;i<tokens*6;++i)if(w.host_ids[i]<0||w.host_ids[i]>=384||
@@ -360,6 +362,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     if(phase==2)experts->observe_physical_routes(layer,w.host_ids,tokens);
     if(deferred_routes)deferred_routes->insert(deferred_routes->end(),w.host_ids,w.host_ids+tokens*6);
     else experts->observe_routes(layer,w.host_ids,tokens,phase);
+    plan_trace.reset();plan_trace.emplace(options.trace,"ds41.moe.plan.groups");
     struct Group { int expert=0,offset=0; std::vector<int> rows,slots; std::vector<float> weights; };
     std::array<Group,384> groups;
     for(int e=0;e<384;++e)groups[e].expert=e;
@@ -394,6 +397,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
         gpu_check(cudaMemcpyAsync(w.group_slots,w.host_group_slots,metadata_offset*sizeof(int),cudaMemcpyHostToDevice,stream.value));
         gpu_check(cudaMemcpyAsync(w.group_weights,w.host_group_weights,metadata_offset*sizeof(float),cudaMemcpyHostToDevice,stream.value));
     }
+    plan_trace.reset();plan_trace.emplace(options.trace,"ds41.moe.plan.classify");
     std::vector<const Group*> cold,cpu;
     std::vector<std::pair<const Group*,const uint8_t*>> resident;
     const bool cache_active=decode_raw_cache && phase==2 && tokens<=8 && !cpu_misses;
@@ -441,6 +445,7 @@ void Runtime::Impl::moe(int layer,int tokens,Workspace& w,ExecutionStats& stats,
     if(compact&&!cpu.empty())throw std::logic_error("DeepSeek compact route reached CPU experts");
     // Route observation already counted true residency. Demand offload is kept
     // separate and never contributes to that hit counter.
+    plan_trace.reset();
     if(prefetch_active && !prefill)throw std::logic_error("prefill stream reached decode");
     if(prefetch_active){
         std::array<bool,384> selected{};

@@ -164,6 +164,44 @@ __device__ void down_rows(const uint8_t* w,bool shared,int64_t base,const float*
         for(int n=0;n<N;++n)parts[int64_t(j.job(first+n))*5120+row]=y[n];
     }
 }
+template<int N>
+__device__ void gu_rows_halves(const uint8_t* gate,const uint8_t* up,uint8_t* gs,uint8_t* us,const float* x,const Jobs& j,int first,
+                               int row,int lane,float* activation){
+    float g[N]{},u[N]{};const float* xs[N];
+    #pragma unroll
+    for(int n=0;n<N;++n)xs[n]=x+int64_t(j.token(first+n))*5120;
+    constexpr int U=8;
+    #pragma unroll 1
+    for(int half=0;half<2;++half){
+        __syncwarp();
+        {const uint4* gsrc=reinterpret_cast<const uint4*>(gate+half*1360);const uint4* usrc=reinterpret_cast<const uint4*>(up+half*1360);
+         uint4* gd=reinterpret_cast<uint4*>(gs);uint4* ud=reinterpret_cast<uint4*>(us);
+         for(int i=lane;i<1360/16;i+=32){gd[i]=__ldg(gsrc+i);ud[i]=__ldg(usrc+i);}}
+        __syncwarp();
+        #pragma unroll 1
+        for(int col0=half*2560+lane*2;col0<(half+1)*2560;col0+=64*U){
+            float2 gv[U],uv[U];
+            #pragma unroll
+            for(int k=0;k<U;++k){gv[k]=mx_pair(gs,col0-half*2560+64*k);uv[k]=mx_pair(us,col0-half*2560+64*k);}
+            #pragma unroll
+            for(int k=0;k<U;++k){
+                const int col=col0+64*k;
+                #pragma unroll
+                for(int n=0;n<N;++n){
+                    const float2 v=*reinterpret_cast<const float2*>(xs[n]+col);
+                    g[n]=fmaf(gv[k].x,v.x,g[n]);g[n]=fmaf(gv[k].y,v.y,g[n]);u[n]=fmaf(uv[k].x,v.x,u[n]);u[n]=fmaf(uv[k].y,v.y,u[n]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for(int n=0;n<N;++n)for(int delta=16;delta;delta>>=1){g[n]+=__shfl_down_sync(0xffffffff,g[n],delta);u[n]+=__shfl_down_sync(0xffffffff,u[n],delta);}
+    if(!lane){
+        #pragma unroll
+        for(int n=0;n<N;++n){const float gg=fminf(bf16(g[n]),10.f),uu=fminf(fmaxf(bf16(u[n]),-10.f),10.f);
+            activation[int64_t(j.job(first+n))*2304+row]=bf16(gg*sigmoid(gg)*uu*j.weight(first+n));}
+    }
+}
 #define DRAFT_DEDUP_DISPATCH(F,...) do{for(int first=0;first<j.count();first+=kMaxJobs){switch(min(kMaxJobs,j.count()-first)){ \
     case 1:F<1>(__VA_ARGS__);break;case 2:F<2>(__VA_ARGS__);break;case 3:F<3>(__VA_ARGS__);break;case 4:F<4>(__VA_ARGS__);break; \
     case 5:F<5>(__VA_ARGS__);break;case 6:F<6>(__VA_ARGS__);break;default:F<7>(__VA_ARGS__);break;}}}while(0)
@@ -179,13 +217,10 @@ __global__ void __launch_bounds__(128,8) gu(const uint8_t* experts,uint64_t proj
     }
     const uint8_t* gate=experts+uint64_t(j.expert())*3*projection+uint64_t(row)*2720;
     if constexpr(!Stage){DRAFT_DEDUP_DISPATCH(gu_rows,gate,gate+projection,false,0,x,j,first,row,lane,activation);return;}
-    // The warp's two MXFP4 rows into shared memory with 16-byte loads; the products read the same bytes from there.
-    __shared__ __align__(16) uint8_t rows_smem[4][2][2720];
-    {const uint4* gs=reinterpret_cast<const uint4*>(gate);const uint4* us=reinterpret_cast<const uint4*>(gate+projection);
-     uint4* gd=reinterpret_cast<uint4*>(rows_smem[warp][0]);uint4* ud=reinterpret_cast<uint4*>(rows_smem[warp][1]);
-     for(int i=lane;i<2720/16;i+=32){gd[i]=__ldg(gs+i);ud[i]=__ldg(us+i);}
-     __syncwarp();}
-    DRAFT_DEDUP_DISPATCH(gu_rows,rows_smem[warp][0],rows_smem[warp][1],false,0,x,j,first,row,lane,activation);
+    // The warp's two MXFP4 rows into shared memory with 16-byte loads, one column half (1360 B per row) at a time:
+    // half the shared memory per block (twice the resident blocks); each lane still visits its columns in order.
+    __shared__ __align__(16) uint8_t rows_smem[4][2][1360];
+    DRAFT_DEDUP_DISPATCH(gu_rows_halves,gate,gate+projection,rows_smem[warp][0],rows_smem[warp][1],x,j,first,row,lane,activation);
 }
 template<bool Stage>
 __global__ void __launch_bounds__(128,8) down(const uint8_t* experts,uint64_t projection,const uint8_t* sd,const int* ids,
