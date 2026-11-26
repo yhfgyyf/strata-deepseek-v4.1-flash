@@ -138,9 +138,9 @@ def main():
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("STRATA_DS41_ADAPTIVE_POLICY", "maya")
     # Single-GPU default: exact paths plus tensor-core routed MoE (0x8000), q_b (0x40000), Q5_K tensor cores
-    # (0x1000000) and the fused tensor-core prefill MoE (0x20000000); mask 2 0xFEF selects BF16 for the latter.
+    # (0x1000000) and the fused tensor-core prefill MoE (0x20000000); mask 2 0x3FEF selects BF16 for the latter.
     os.environ.setdefault("STRATA_DS41_OPT_MASK", "0xFF7FFFFF")
-    os.environ.setdefault("STRATA_DS41_OPT_MASK2", "0xFEF")
+    os.environ.setdefault("STRATA_DS41_OPT_MASK2", "0x3FEF")
     os.environ["STRATA_DS41_BLOCK_SEGMENTS"] = "40"
     os.environ["STRATA_DS41_BLOCK_HUGE_MIN_PERCENT"] = "100"
     os.environ["STRATA_DS41_DECODE_SEGMENTS"] = "2"

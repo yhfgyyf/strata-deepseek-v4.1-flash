@@ -161,6 +161,121 @@ __global__ void __launch_bounds__(256) draft_chain_kernel(const void* w1,int w1_
         }
     }
 }
+// draft_chain_kernel with one vocabulary row per thread: the thread forms the row's 256 products itself and replays
+// the warp shfl_down trees (per 32-column segment, then over the eight segment sums padded with zeros) as the same
+// float additions in registers, so bias[v] is bitwise equal without shuffles; the greedy selection is unchanged.
+__device__ __forceinline__ float chain_tree32(float (&y)[32]){
+    #pragma unroll
+    for(int delta=16;delta;delta>>=1){
+        #pragma unroll
+        for(int i=0;i<delta;++i)y[i]+=y[i+delta];
+    }
+    return y[0];
+}
+template<bool BF>
+__global__ void __launch_bounds__(256) draft_chain_lane_kernel(const void* w1,int w1_type,const uint8_t* w2,const float* head,
+    const int* ids,const int* input_inverse,const int* inverse,int vocab,const int* history,int history_size,int step,
+    int* chain,int* counts,kernels::SamplerParams p,int* status,float* markov,float* bias,bool round,
+    double* part_values,int* part_tokens,unsigned* counter){
+    __shared__ float m[256];__shared__ double values[256];__shared__ int tokens[256];__shared__ bool last;
+    {
+        const int id=chain[step];const int row=id>=0&&id<129280?input_inverse[id]:-1;
+        float x=0;
+        if(row<0){if(threadIdx.x==0&&blockIdx.x==0)atomicExch(status,1);}
+        else{x=embedding_value(w1,w1_type,int64_t(row)*256+threadIdx.x);if(round)x=__bfloat162float(__float2bfloat16_rn(x));}
+        m[threadIdx.x]=x;if(blockIdx.x==0)markov[threadIdx.x]=x;
+    }
+    __syncthreads();
+    double best=-INFINITY;int token=INT_MAX;
+    const int v=blockIdx.x*256+threadIdx.x;
+    if(v<vocab){
+        float y[32],partial[32];
+        uint32_t row_words[BF?1:68];
+        if constexpr(!BF){
+            const uint4* r=reinterpret_cast<const uint4*>(w2+int64_t(v)*272);
+            #pragma unroll
+            for(int k=0;k<17;++k){const uint4 u=__ldg(r+k);row_words[4*k]=u.x;row_words[4*k+1]=u.y;row_words[4*k+2]=u.z;row_words[4*k+3]=u.w;}
+        }
+        #pragma unroll
+        for(int w=0;w<8;++w){
+            if constexpr(BF){
+                const uint4* r=reinterpret_cast<const uint4*>(w2+int64_t(v)*512+w*64);
+                #pragma unroll
+                for(int k=0;k<4;++k){
+                    const uint4 u=__ldg(r+k);const uint32_t q[4]={u.x,u.y,u.z,u.w};
+                    #pragma unroll
+                    for(int e=0;e<4;++e){
+                        const int c=8*k+2*e;
+                        float s0=0;s0+=__uint_as_float(q[e]<<16)*m[32*w+c];y[c]=s0;
+                        float s1=0;s1+=__uint_as_float(q[e]&0xffff0000u)*m[32*w+c+1];y[c+1]=s1;
+                    }
+                }
+            }else{
+                // The row's 272 bytes as 68 words (16-byte loads); byte offsets are compile-time after unrolling.
+                const int base=w*34;
+                const uint32_t lo=row_words[base>>2]>>(8*(base&3)),hi=row_words[(base+1)>>2]>>(8*((base+1)&3));
+                const float d=__half2float(__ushort_as_half(uint16_t((lo&255)|((hi&255)<<8))));
+                #pragma unroll
+                for(int c=0;c<32;++c){
+                    const int k=base+2+c;
+                    const float weight=d*int(int8_t(uint8_t(row_words[k>>2]>>(8*(k&3)))));
+                    float s0=0;s0+=weight*m[32*w+c];y[c]=s0;
+                }
+            }
+            partial[w]=chain_tree32(y);
+        }
+        #pragma unroll
+        for(int w=8;w<32;++w)partial[w]=0.f;
+        const float s=chain_tree32(partial);
+        bias[v]=s;
+        const float combined=__fadd_rn(head[v],s);
+        if(isnan(combined)||combined==INFINITY)atomicExch(status,2);
+        double value=combined;
+        const int count=counts?counts[v]:0;
+        if(count){
+            value=value<=0?value*double(p.penalty_repeat):value/double(p.penalty_repeat);
+            value-=double(__fadd_rn(__fmul_rn(float(count),p.penalty_freq),p.penalty_present));
+        }
+        best=value;token=ids[v];
+    }
+    values[threadIdx.x]=best;tokens[threadIdx.x]=token;__syncthreads();
+    for(int width=128;width;width/=2){
+        if(threadIdx.x<width){const int peer=threadIdx.x+width;
+            if(chain_better(values[peer],tokens[peer],values[threadIdx.x],tokens[threadIdx.x])){values[threadIdx.x]=values[peer];tokens[threadIdx.x]=tokens[peer];}
+        }__syncthreads();
+    }
+    if(threadIdx.x==0){
+        part_values[blockIdx.x]=values[0];part_tokens[blockIdx.x]=tokens[0];
+        __threadfence();
+        last=atomicAdd(counter,1u)==gridDim.x-1;
+    }
+    __syncthreads();
+    if(!last)return;
+    __threadfence();
+    best=-INFINITY;token=INT_MAX;
+    for(int i=threadIdx.x;i<gridDim.x;i+=blockDim.x){
+        const double pv=static_cast<volatile double*>(part_values)[i];const int t=static_cast<volatile int*>(part_tokens)[i];
+        if(chain_better(pv,t,best,token)){best=pv;token=t;}
+    }
+    values[threadIdx.x]=best;tokens[threadIdx.x]=token;__syncthreads();
+    for(int width=128;width;width/=2){
+        if(threadIdx.x<width){const int peer=threadIdx.x+width;
+            if(chain_better(values[peer],tokens[peer],values[threadIdx.x],tokens[threadIdx.x])){values[threadIdx.x]=values[peer];tokens[threadIdx.x]=tokens[peer];}
+        }__syncthreads();
+    }
+    if(threadIdx.x==0){
+        *counter=0;
+        if(values[0]==-INFINITY||tokens[0]==INT_MAX){atomicExch(status,3);tokens[0]=ids[0];}
+        const int selected=tokens[0];chain[step+1]=selected;
+        if(counts){
+            ++counts[inverse[selected]];
+            const int remove=history_size+step-p.penalty_last_n;
+            if(remove>=0){const int old=remove<history_size?history[remove]:chain[remove-history_size+1];
+                const int row=old>=0&&old<129280?inverse[old]:-1;if(row>=0)--counts[row];}
+        }
+    }
+}
+std::atomic<bool> draft_chain_lane_enabled{true};
 __global__ void init_kernel(const void* w, int type, const int* ids, const float* pixels,
                             const uint8_t* image, float* h, float* pre, int tokens) {
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < int64_t(tokens) * 20480; i += int64_t(gridDim.x) * blockDim.x) {
@@ -267,10 +382,17 @@ cudaError_t draft_chain_gpu(const void* w1,int w1_type,const void* w2,int w2_typ
     if(!w1||!w2||!head||!ids||!input_inverse||!inverse||!chain||!status||!markov||!bias||!part_values||!part_tokens||!counter||
        vocab<1||vocab>129280||blocks>kDraftChainBlocks||step<0||step>6||history_size<0||(history_size&&!history)||
        (w1_type!=0&&w1_type!=2&&w1_type!=8&&w1_type!=30)||(w2_type!=8&&w2_type!=30)||(reinterpret_cast<uintptr_t>(w2)&1))return cudaErrorInvalidValue;
+    if(draft_chain_lane_enabled.load()&&!(reinterpret_cast<uintptr_t>(w2)&15)){
+        (w2_type==30?draft_chain_lane_kernel<true>:draft_chain_lane_kernel<false>)<<<(vocab+255)/256,256,0,stream>>>(w1,w1_type,
+            static_cast<const uint8_t*>(w2),head,ids,input_inverse,inverse,vocab,history,history_size,step,chain,counts,sampling,status,
+            markov,bias,round,part_values,part_tokens,counter);
+        return cudaGetLastError();
+    }
     (w2_type==30?draft_chain_kernel<true>:draft_chain_kernel<false>)<<<blocks,256,0,stream>>>(w1,w1_type,static_cast<const uint8_t*>(w2),head,ids,input_inverse,inverse,vocab,
         history,history_size,step,chain,counts,sampling,status,markov,bias,round,part_values,part_tokens,counter);
     return cudaGetLastError();
 }
+void draft_chain_lane_set_enabled(bool enabled){draft_chain_lane_enabled.store(enabled);}
 cudaError_t mean_residual_gpu(const float* h,float* out,int tokens,cudaStream_t s) {
     mean_kernel<<<grid(int64_t(tokens)*5120),256,0,s>>>(h,out,int64_t(tokens)*5120); return cudaGetLastError();
 }

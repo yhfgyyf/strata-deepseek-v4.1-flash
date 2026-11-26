@@ -31,6 +31,7 @@ cudaError_t draft_greedy_gpu(const float* head,const float* bias,const int* ids,
                             const kernels::SamplerParams& sampling,int* status,cudaStream_t stream);
 // Fused Markov row + Q8_0/BF16 markov_w2 + greedy step (same results as the three kernels); counter starts at 0.
 constexpr int kDraftChainBlocks=4096;
+void draft_chain_lane_set_enabled(bool enabled);
 cudaError_t draft_chain_gpu(const void* w1,int w1_type,const void* w2,int w2_type,const float* head,const int* ids,
                            const int* input_inverse,const int* inverse,int vocab,const int* history,int history_size,
                            int step,int* chain,int* counts,const kernels::SamplerParams& sampling,int* status,

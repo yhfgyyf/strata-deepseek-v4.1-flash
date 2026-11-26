@@ -279,8 +279,9 @@ DraftProposal draft_forward(DraftContext& c,const float* hidden,int window,int64
         gpu_check(rotate_gpu(d.q,64,512,draft_tokens,position,g,false,true,stream));round(d.q,draft_tokens*32768);
         dump(prefix+"attention",d.q,{draft_tokens,64,512});
         const auto& wo=weights.tensor(layer,"attn_output_a");
-        const bool grouped=c.batch_projection&&draft_tokens==5&&(wo.type==0||wo.type==30)&&wo.elements>=uint64_t(8)*1024*4096&&wo.cols==4096&&
-            draft_projection5_grouped_gpu(wo.data,wo.type,d.q,d.o_low,1024,4096,32768,8192,8,int64_t(1024)*4096*(wo.type==0?4:2),4096,1024,
+        const bool grouped=c.batch_projection&&draft_tokens==5&&(wo.type==0||wo.type==30||wo.type==8)&&wo.elements>=uint64_t(8)*1024*4096&&wo.cols==4096&&
+            draft_projection5_grouped_gpu(wo.data,wo.type,d.q,d.o_low,1024,4096,32768,8192,8,
+                wo.type==8?int64_t(1024)*4096/32*34:int64_t(1024)*4096*(wo.type==0?4:2),4096,1024,
                 wo.packed_bf16&&c.arithmetic==Arithmetic::production,c.arithmetic==Arithmetic::production,stream)==cudaSuccess;
         if(grouped){if(c.stats)c.stats->draft_batch_projection_calls+=8;}
         else for(int group=0;group<8;++group)matmul(wo,d.q+group*4096,d.o_low+group*1024,draft_tokens,w,1024,32768,8192,int64_t(group)*1024*4096);

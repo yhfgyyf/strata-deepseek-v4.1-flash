@@ -11,6 +11,7 @@
 
 ## 更新日志
 
+- **2026-11-26**：单卡 RTX PRO 6000 草稿模型提速，输出逐位不变。草稿 q_b／output A／output B 投影保持 Q8_0 存储，在寄存器内舍入为 BF16（与原 BF16 展开取值相同，草稿显存减少约 330 MB），每个 warp 计算两行、共享激活读取；草稿 MoE gate/up 按两半列暂存，共享内存减半；草稿 chain 步改为每行一个线程，规约顺序不变。草稿每步 2.34 → 2.00 ms；LongSWE 同进程对比，生成 token 与接受率完全一致。双 L20 配置不变。
 - **2026-11-25**：单卡 RTX PRO 6000 prefill／decode 提速。prefill routed MoE 改为 BF16 张量核融合 kernel：权重在共享内存中按 BF16 cuBLAS 路径完全相同的方式反量化，与该路径只差累加顺序（LongSWE prefill logits 与 cuBLAS 路径的 KL 从 int8 融合 kernel 的 5.6e-2 降到 2.6e-3）；Q5_K 共享专家 down 投影与 q_b 默认使用张量核；RMSNorm＋Q8_1 量化、RoPE＋BF16 舍入融合；route id 回传改到旁路 stream；Engram 支持多盘镜像并行读取，cuBLAS 在启动时预热。LongSWE 16,180 输入：prefill 7,430–7,999 tokens/s，decode 后续请求均值约 197 tokens/s（峰值 244）。双 L20 配置不变。
 - **2026-11-19**：单卡 RTX PRO 6000 decode 提速。routed MoE 与注意力 q_b 投影默认使用张量核（MATH500 准确率与逐位一致路径相同，均为 91.2%）；新增分组 routed MoE、草稿 MoE 去重与融合、RoPE／超连接边界融合；专家迁移改为零拷贝轮换并优先从显存缓存复制，decode 期间利用空闲 prefill 工作区扩大专家缓存，后台拷贝线程不再与请求线程共用 CPU。decode 峰值约 207 tokens/s。双 L20 配置不变。
 

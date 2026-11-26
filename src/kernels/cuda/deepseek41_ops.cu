@@ -1249,6 +1249,65 @@ __global__ void __launch_bounds__(128) dp_bf16_warp(const uint8_t* __restrict__ 
         for (int t = 0; t < NT; ++t) out[int64_t(t) * ldy + row] = round_output ? __bfloat162float(__float2bfloat16_rn(sums[t])) : sums[t];
     }
 }
+// dp_q8_warp over R rows per warp: one activation load feeds R rows; each row keeps its own per-element values, column
+// order and reduction tree (bitwise equal to dp_q8_warp).
+template<int NT,int R>
+__global__ void __launch_bounds__(128) dp_q8_rows(const uint8_t* __restrict__ weights, const float* __restrict__ x, float* out,
+                                                  int rows, int cols, int64_t ldx, int64_t ldy, bool round_weights, bool round_output,
+                                                  int64_t group_weight_bytes = 0, int64_t group_x = 0, int64_t group_out = 0) {
+    weights += blockIdx.y * group_weight_bytes; x += blockIdx.y * group_x; out += blockIdx.y * group_out;
+    const int row0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * R, lane = threadIdx.x & 31;
+    if (row0 >= rows) return;
+    const int bpr = cols / 32;
+    const uint8_t* p[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) p[r] = weights + (int64_t(min(row0 + r, rows - 1)) * bpr + lane / 4) * 34;
+    const int off = 2 + (lane & 3) * 8;
+    const float* xl = x + lane * 8;
+    float values[R][NT][8]{};
+    const int iters = cols / 256;
+#pragma unroll 2
+    for (int i = 0; i < iters; ++i) {
+        float w[R][8];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* q = p[r] + int64_t(i) * 8 * 34;
+            const float d = __half2float(*reinterpret_cast<const __half*>(q));
+            const uint16_t* q16 = reinterpret_cast<const uint16_t*>(q + off);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint16_t u = __ldg(q16 + k);
+                w[r][2 * k] = d * int(int8_t(u & 255));
+                w[r][2 * k + 1] = d * int(int8_t(u >> 8));
+            }
+            if (round_weights) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) w[r][j] = __bfloat162float(__float2bfloat16_rn(w[r][j]));
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4 a = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256));
+            const float4 b = __ldg(reinterpret_cast<const float4*>(xl + t * ldx + i * 256 + 4));
+            const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) values[r][t][j] += w[r][j] * v[j];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float sums[NT];
+        dp_sum_warp(values[r], sums);
+        if (lane == 0 && row0 + r < rows) {
+#pragma unroll
+            for (int t = 0; t < NT; ++t) out[int64_t(t) * ldy + row0 + r] = round_output ? __bfloat162float(__float2bfloat16_rn(sums[t])) : sums[t];
+        }
+    }
+}
+std::atomic<bool> draft_q8_rows_enabled{true};
+void draft_q8_rows_set_enabled(bool value){draft_q8_rows_enabled.store(value);}
 std::atomic<bool> draft_q8_warp_enabled{true};
 std::atomic<bool> draft_dedup_enabled{true};
 std::atomic<bool> draft_stage_enabled{true};
@@ -1262,7 +1321,9 @@ bool draft_q8_warp(const void* weights,uint32_t type,const float* x,float* out,i
        (reinterpret_cast<uintptr_t>(x)&15)||(reinterpret_cast<uintptr_t>(weights)&(type==30?15:1)))return false;
     // BF16 values are unchanged by the optional weight rounding.
     if(type==30){dp_bf16_warp<NT><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_output);return true;}
-    dp_q8_warp<NT><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);
+    if(draft_q8_rows_enabled.load())
+        dp_q8_rows<NT,2><<<(rows+7)/8,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);
+    else dp_q8_warp<NT><<<(rows+3)/4,128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,round_weights,round_output);
     return true;
 }
 cudaError_t draft_projection5_gpu(const void* weights,uint32_t type,const float* x,float* out,
@@ -1306,6 +1367,12 @@ __global__ void __launch_bounds__(256) draft_projection5_prefetch(const uint8_t*
 cudaError_t draft_projection5_grouped_gpu(const void* weights,uint32_t type,const float* x,float* out,
                                          int rows,int cols,int64_t ldx,int64_t ldy,int groups,int64_t group_weight_bytes,
                                          int64_t group_x,int64_t group_out,bool round_weights,bool round_output,cudaStream_t stream){
+    if(type==8&&draft_group_enabled.load()&&draft_q8_rows_enabled.load()&&weights&&x&&out&&rows>=1&&cols%256==0&&ldx>=cols&&ldy>=rows&&
+       groups>=1&&groups<=65535&&ldx%4==0&&!(reinterpret_cast<uintptr_t>(x)&15)&&!(reinterpret_cast<uintptr_t>(weights)&1)&&group_x%4==0){
+        dp_q8_rows<5,2><<<dim3((rows+7)/8,groups),128,0,stream>>>(static_cast<const uint8_t*>(weights),x,out,rows,cols,ldx,ldy,
+            round_weights,round_output,group_weight_bytes,group_x,group_out);
+        return cudaGetLastError();
+    }
     if(!draft_group_enabled.load()||!weights||!x||!out||rows<1||cols<1||ldx<cols||ldy<rows||groups<1||groups>65535||
        (type!=0&&type!=30)||rows>=4096)return cudaErrorNotSupported;
     if(cols<=4096&&projection_prefetch_enabled.load()&&(type==30||!round_weights)){

@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "runtime_internal.hpp"
 #include "adaptive_cache.hpp"
 #include "strata/kernels/cpu/deepseek41_down.hpp"
@@ -22,8 +23,14 @@ bool packed_projection(const std::string& name) {
            suffix=="attn_output_a.weight" || suffix=="attn_output_b.weight" ||
            suffix=="ffn_gate_shexp.weight" || suffix=="ffn_up_shexp.weight" || suffix=="ffn_down_shexp.weight";
 }
+bool draft_q8_dense(){const char* v=std::getenv("STRATA_DS41_DRAFT_Q8_DENSE");return !(v&&v[0]=='0');}
 int storage_type(const TensorView& v,const std::string& name,Arithmetic arithmetic,const Model& model,bool draft,bool dense_q8) {
     if(draft&&(v.info->type==2||(v.info->type==8&&model.expert(0,0,true).type!=39)))return v.info->type;
+    // The large Q8_0 draft projections stay packed: the draft kernels round d * q to BF16 in registers, the same values
+    // as the BF16 expansion, from half the bytes (STRATA_DS41_DRAFT_Q8_DENSE=0 keeps the expansion).
+    if(draft&&v.info->type==8&&draft_q8_dense()&&(name.find(".attn_q_b.")!=std::string::npos||name.find(".attn_output_a.")!=std::string::npos||
+        name.find(".attn_output_b.")!=std::string::npos))
+        return v.info->type;
     if(dense_q8 && arithmetic==Arithmetic::production && (v.info->type==8||v.info->type==13||v.info->type==14) && packed_projection(name))return v.info->type;
     // Read the large vocabulary heads in native Q8_0/Q6_K with FP32 activations. This preserves their weights and
     // avoids a 2.65 GB FP32 copy; the fixed five-row DSpark head and Markov tables use the same contract.

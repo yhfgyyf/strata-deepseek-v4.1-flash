@@ -189,7 +189,15 @@ Runtime::Impl::Impl(const std::string& path,const RuntimeOptions& o,const std::s
     ring_slot_bytes=*std::max_element(expert_sizes.begin(),expert_sizes.end());
     if (!ring_slot_bytes) throw std::invalid_argument("DeepSeek zero expert ring slot bytes");
     // Use the actual even-slot ring capacity in the fit check, rather than its rounded-up budget.
-    ring_slots=static_cast<int>(std::min<uint64_t>(128,o.ring/ring_slot_bytes/2*2));
+    // Up to 128 slots of the largest expert within the ring budget; STRATA_DS41_RING_SLOTS raises the cap and the
+    // budget together (prefill streams one layer's cold experts ahead while the previous layer still holds slots).
+    uint64_t ring_cap=128,ring_budget=o.ring;
+    if(const char* v=std::getenv("STRATA_DS41_RING_SLOTS")){
+        ring_cap=std::strtoull(v,nullptr,10);
+        if(ring_cap<2||ring_cap>1024)throw std::invalid_argument("STRATA_DS41_RING_SLOTS must be 2..1024");
+        ring_budget=std::max<uint64_t>(ring_budget,ring_cap*ring_slot_bytes);
+    }
+    ring_slots=static_cast<int>(std::min<uint64_t>(ring_cap,ring_budget/ring_slot_bytes/2*2));
     if (ring_slots < 2) throw std::invalid_argument("DeepSeek ring cannot hold two expert blobs");
     const uint64_t ring_bytes=uint64_t(ring_slots)*ring_slot_bytes;
     size_t free=0,total=0;gpu_check(cudaMemGetInfo(&free,&total));

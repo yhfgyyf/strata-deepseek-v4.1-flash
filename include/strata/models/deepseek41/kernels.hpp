@@ -12,6 +12,8 @@ bool expert_dequant_fast_enabled();
 cudaError_t dequant_gpu(const void* packed, uint32_t type, float* output, int64_t elements, cudaStream_t stream);
 // Decode into FP32 storage with the production BF16 rounding boundary preserved.
 cudaError_t dequant_round_bf16_gpu(const void* packed, uint32_t type, float* output, int64_t elements, cudaStream_t stream);
+// Draft Q8_0 projections (rows >= 4096): two rows per warp share the activation loads (bitwise equal).
+void draft_q8_rows_set_enabled(bool enabled);
 cudaError_t dequant_bf16_gpu(const void* packed, uint32_t type, uint16_t* output, int64_t elements, cudaStream_t stream);
 cudaError_t packed_bf16_gemv_gpu(const void* packed, uint32_t type, const float* x, float* out,
                                 int rows, int cols, int tokens, cudaStream_t stream);
@@ -90,6 +92,7 @@ void draft_dedup_set_enabled(bool enabled);
 void draft_group_set_enabled(bool enabled);
 // Drained control: fused Markov row + markov_w2 + greedy draft step.
 void draft_chain_set_enabled(bool enabled);
+void draft_chain_lane_set_enabled(bool enabled);
 // Drained control: register-prefetched FP32/BF16 verify/gemv projections (same order and tree).
 void projection_prefetch_set_enabled(bool enabled);
 // Production glue: optional BF16 input -> rotate_gpu math -> BF16 round (in place) -> optional BF16 copy.

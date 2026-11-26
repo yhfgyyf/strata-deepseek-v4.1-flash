@@ -32,6 +32,7 @@ export STRATA_DS41_SM89_GROUPED_MOE=0
 export STRATA_Q5_OUTPUT_A_BATCH=1
 # Keep the validated mask479 kernels; the single-GPU decode options are not validated on L20.
 export STRATA_DS41_OPT_MASK=0
+export STRATA_DS41_DRAFT_Q8_DENSE=0
 
 unset STRATA_GROUPED_TRACE_DIR STRATA_L20_PROBE_DIR STRATA_L20_REFERENCE_DIR STRATA_L20_TRACE
 exec "${STRATA_PYTHON:-python3}" "$ROOT/tools/deepseek41/serve_experimental.py" "$@"

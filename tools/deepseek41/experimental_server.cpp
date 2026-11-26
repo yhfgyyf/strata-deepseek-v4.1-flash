@@ -108,7 +108,8 @@ int main(int argc, char** argv) {
         // Optional STRATA_DS41_OPT_MASK selects decode paths bit by bit (0x8000 tensor-core routed MoE,
         // 0x40000 tensor-core q_b, 0x1000000 Q5_K tensor cores for the shared-expert down projection and q_b,
         // 0x20000000 fused tensor-core prefill MoE; the other bits are bit-exact). STRATA_DS41_OPT_MASK2 selects the
-        // second set (0x400 BF16 fused prefill MoE instead of int8, 0x800 int8 fused kernel v2, byte-identical).
+        // second set (0x400 BF16 fused prefill MoE instead of int8, 0x800 int8 fused kernel v2, 0x1000 two-row draft Q8
+        // projections, 0x2000 row-per-thread draft chain; the last three byte-identical).
         // Unset keeps the built-in defaults.
         if (const char* mask_text = std::getenv("STRATA_DS41_OPT_MASK")) {
             const unsigned m = unsigned(std::strtoul(mask_text, nullptr, 0));
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
                 d::spec_prefetch_set_enabled(v2 & 16u); d::route_side_set_enabled(v2 & 32u); strata::kernels::native_mmvq_round2_set_enabled(v2 & 64u);
                 d::x_q8_keep_set_enabled(v2 & 128u); d::rms_q8_fused_set_enabled(v2 & 256u); d::rope_shared_fused_set_enabled(v2 & 512u);
                 d::fused_moe_set_bf16(v2 & 1024u); d::fused_moe_set_int8_v2(v2 & 2048u);
+                d::draft_q8_rows_set_enabled(v2 & 4096u); d::draft_chain_lane_set_enabled(v2 & 8192u);
                 std::cerr << "DeepSeek decode-opt mask2=0x" << std::hex << v2 << std::dec << '\n';
             }
             if (m & 0x8000000u) o.shared_q8_reuse = true;
